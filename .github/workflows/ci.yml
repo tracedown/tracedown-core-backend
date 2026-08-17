@@ -12,8 +12,8 @@ on:
       - main
 
 jobs:
-  # Pre-filter: skipped when the PR title starts with 'WIP:'. The build needs
-  # it, so a skipped gate cascades. Pushes to main always run.
+  # Pre-filter: skipped when the PR title starts with 'WIP:'. Every other job
+  # needs it, so a skipped gate cascades. Pushes to main always run.
   wip-gate:
     name: WIP gate
     runs-on: ubuntu-latest
@@ -22,9 +22,57 @@ jobs:
       - name: Not WIP
         run: echo "Running checks."
 
+  # Detects what changed so downstream jobs self-skip. Pushes to main always
+  # run everything. Two flags:
+  #   - code:   any module source, resource, or gradle file → build + tests
+  #   - deploy: docker/ (compose stacks, deploy configs) → compose validation
+  changed-paths:
+    name: Detect changed paths
+    needs: [wip-gate]
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      deploy: ${{ steps.filter.outputs.deploy }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check changed paths
+        id: filter
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Push to main — running everything."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "$BASE"...HEAD)
+          CODE=$(echo "$CHANGED" | grep -E '(^|/)src/|\.kts$|^gradle|^settings' || true)
+          if [ -n "$CODE" ]; then
+            echo "Code changes detected (build + tests will run):"; echo "$CODE"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No source/gradle changes — build + tests skipped."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+          DEPLOY=$(echo "$CHANGED" | grep -E '^docker/' || true)
+          if [ -n "$DEPLOY" ]; then
+            echo "Docker stack changes detected (compose validation will run):"; echo "$DEPLOY"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No docker/ changes — compose validation skipped."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build & test
-    needs: [wip-gate]
+    needs: [wip-gate, changed-paths]
+    if: ${{ needs.changed-paths.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -45,3 +93,28 @@ jobs:
       # needed here (only the Docker image build wants the lace/ tree).
       - name: Build and test
         run: ./gradlew build
+
+  # The compose stacks are shipping artifacts — a stack that no longer parses
+  # is a broken quickstart. Validate both the dev stack (with its example env)
+  # and the deploy stack (with a minimal env).
+  compose-validate:
+    name: Validate compose stacks
+    needs: [wip-gate, changed-paths]
+    if: ${{ needs.changed-paths.outputs.deploy == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dev stack
+        run: |
+          cp docker/.env.example docker/.env
+          docker compose -f docker/docker-compose.yml --env-file docker/.env config -q
+          docker compose -f docker/docker-compose.yml -f docker/docker-compose.limits.yml --env-file docker/.env config -q
+
+      - name: Deploy stack
+        working-directory: docker/deploy
+        run: |
+          cp .env.example .env
+          sed -i 's/^DB_PASSWORD=$/DB_PASSWORD=ci-validate/' .env
+          docker compose config -q
