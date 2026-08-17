@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    # 'edited' fires on PR title/body changes, so removing a 'WIP:' prefix
+    # re-triggers the checks without needing a new push.
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches:
+      - main
+
+jobs:
+  # Pre-filter: skipped when the PR title starts with 'WIP:'. The build needs
+  # it, so a skipped gate cascades. Pushes to main always run.
+  wip-gate:
+    name: WIP gate
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.title, 'WIP:') }}
+    steps:
+      - name: Not WIP
+        run: echo "Running checks."
+
+  build:
+    name: Build & test
+    needs: [wip-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Compiles every module and runs unit + integration tests. The
+      # Testcontainers-based tests use the runner's Docker daemon; the Lace
+      # libraries resolve from Maven Central, so no sibling checkouts are
+      # needed here (only the Docker image build wants the lace/ tree).
+      - name: Build and test
+        run: ./gradlew build
