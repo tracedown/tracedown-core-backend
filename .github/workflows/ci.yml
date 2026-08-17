@@ -75,8 +75,37 @@ jobs:
     if: ${{ needs.changed-paths.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
+      # The scheduler's integration test dispatches probes to a real agent
+      # container (`test-agent`), whose Dockerfile copies the probe agent and
+      # the Python Lace implementations from the monorepo layout — so CI
+      # reconstructs that layout and builds the image before testing. The
+      # Gradle build itself needs none of this (Lace resolves from Maven
+      # Central); it is purely the test container's build context.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          path: core/tracedown-core-backend
+
+      - name: Checkout probe agent
+        uses: actions/checkout@v4
+        with:
+          repository: tracedown/tracedown-probe-agent
+          path: core/tracedown-probe-agent
+
+      - name: Checkout Lace Python validator
+        uses: actions/checkout@v4
+        with:
+          repository: tracedown/lacelang-python-validator
+          path: lace/lacelang-python-validator
+
+      - name: Checkout Lace Python executor
+        uses: actions/checkout@v4
+        with:
+          repository: tracedown/lacelang-python-executor
+          path: lace/lacelang-python-executor
+
+      - name: Build test-agent image
+        run: docker build -f core/tracedown-core-backend/probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent .
 
       - name: Setup JDK
         uses: actions/setup-java@v4
@@ -88,10 +117,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       # Compiles every module and runs unit + integration tests. The
-      # Testcontainers-based tests use the runner's Docker daemon; the Lace
-      # libraries resolve from Maven Central, so no sibling checkouts are
-      # needed here (only the Docker image build wants the lace/ tree).
+      # Testcontainers-based tests use the runner's Docker daemon.
       - name: Build and test
+        working-directory: core/tracedown-core-backend
         run: ./gradlew build
 
   # The compose stacks are shipping artifacts — a stack that no longer parses

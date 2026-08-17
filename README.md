@@ -141,6 +141,13 @@ its README.
 ./test-all.sh         # both
 ```
 
+The scheduler's integration test dispatches to a real agent container; build
+its image once (from the monorepo root, with the sibling repos cloned):
+
+```bash
+docker build -f probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent ../..
+```
+
 ## Lace
 
 Probes are written in Lace, an independently specified language with a public

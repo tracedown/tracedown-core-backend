@@ -20,10 +20,34 @@ jobs:
     if: github.repository == 'tracedown/tracedown-core-backend'
     runs-on: ubuntu-latest
     steps:
+      # Same monorepo-layout reconstruction as CI: the scheduler's integration
+      # test runs a real agent container whose image builds from the sibling
+      # repos.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          path: core/tracedown-core-backend
+
+      - name: Checkout probe agent
+        uses: actions/checkout@v4
+        with:
+          repository: tracedown/tracedown-probe-agent
+          path: core/tracedown-probe-agent
+
+      - name: Checkout Lace Python validator
+        uses: actions/checkout@v4
+        with:
+          repository: tracedown/lacelang-python-validator
+          path: lace/lacelang-python-validator
+
+      - name: Checkout Lace Python executor
+        uses: actions/checkout@v4
+        with:
+          repository: tracedown/lacelang-python-executor
+          path: lace/lacelang-python-executor
 
       - name: Check tag matches build version
+        working-directory: core/tracedown-core-backend
         run: |
           VERSION=$(sed -n 's/^\s*version = "\(.*\)"/\1/p' build.gradle.kts | head -1)
           TAG="${GITHUB_REF_NAME#v}"
@@ -31,6 +55,9 @@ jobs:
             echo "Tag v$TAG does not match build version $VERSION" >&2
             exit 1
           fi
+
+      - name: Build test-agent image
+        run: docker build -f core/tracedown-core-backend/probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent .
 
       - name: Setup JDK
         uses: actions/setup-java@v4
@@ -42,12 +69,15 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build and test
+        working-directory: core/tracedown-core-backend
         run: ./gradlew build
 
       - name: Package service jars and migrator dist
+        working-directory: core/tracedown-core-backend
         run: ./gradlew fatJar :schema-migrator:distZip
 
       - name: Create GitHub release
+        working-directory: core/tracedown-core-backend
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
