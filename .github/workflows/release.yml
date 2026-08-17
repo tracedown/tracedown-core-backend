@@ -6,10 +6,11 @@ name: Release
 # creates the vX.Y.Z tag and the GitHub release itself. main is PR-protected,
 # so every commit here already passed the PR checks; nothing is re-tested.
 #
-# Artifacts: every runnable service as a self-contained jar, plus the
-# schema-migrator as a distZip (Flyway 11 cannot scan migrations inside a
-# merged jar, so the migrator ships as a distribution and runs from its bin/
-# launcher).
+# Artifacts: every runnable service as a self-contained jar, the monolith
+# (whole platform in one jar, latest frontend release baked in, embedded Lace
+# executor), plus the schema-migrator as a distZip (Flyway 11 cannot scan
+# migrations inside a merged jar, so the migrator ships as a distribution and
+# runs from its bin/ launcher).
 
 on:
   push:
@@ -61,7 +62,7 @@ jobs:
 
       - name: Package service jars and migrator dist
         if: steps.check.outputs.exists == 'false'
-        run: ./gradlew fatJar :schema-migrator:distZip
+        run: ./gradlew fatJar :schema-migrator:distZip -PmonolithFrontend=latest
 
       - name: Create GitHub release
         if: steps.check.outputs.exists == 'false'
@@ -71,6 +72,6 @@ jobs:
           gh release create "${{ steps.version.outputs.tag }}" \
             --target "$GITHUB_SHA" \
             --title "Tracedown Core Backend ${{ steps.version.outputs.tag }}" \
-            --notes "Each service is a self-contained jar (\`java -jar\`). The schema-migrator ships as a zip — unpack and run \`bin/schema-migrator\` (it must not be merged into a fat jar; Flyway would find no migrations). See the deploy compose in \`docker/deploy/\` for running the whole stack from these artifacts." \
+            --notes "Each service is a self-contained jar (\`java -jar\`). \`tracedown-monolith\` is the whole platform in one jar — every service in one JVM, the dashboard served from the gateway port, probes executed in-process (no agents needed); it only needs Postgres and Redis. The schema-migrator ships as a zip — unpack and run \`bin/schema-migrator\` (it must not be merged into a fat jar; Flyway would find no migrations; the monolith migrates on boot by itself). See the deploy compose in \`docker/deploy/\` for running the per-service stack from these artifacts." \
             */build/libs/*-all.jar \
             schema-migrator/build/distributions/schema-migrator-*.zip

@@ -44,8 +44,7 @@ class DispatchQueue(
     private val capacity: Int,
     private val workers: Int,
     private val quartzManager: QuartzManager,
-    private val agentSelector: AgentSelector,
-    private val agentDispatch: AgentDispatchService,
+    private val executionBackend: ProbeExecutionBackend,
     private val queuePolicy: QueuePolicyManager,
     private val resultPublisher: ResultPublisher,
     private val probeConfig: SchedulerConfig.ProbeConfig,
@@ -224,56 +223,53 @@ class DispatchQueue(
                 }
             }
 
-            // Select agents
-            val agents = agentSelector.select(serviceId, service[Services.probeMode])
-            if (agents.isEmpty()) {
-                log.warn("service {} has no eligible agents", serviceId)
+            // Execute — via registered agents by default, or whatever backend
+            // the host substituted. A run may fan out to several executions
+            // (simultaneous mode); each carries the bytes it sent, so the
+            // usage buckets sum them into the run total.
+            val jobId = UUID.randomUUID()
+            val executions = executionBackend.execute(
+                ProbeExecutionBackend.Request(
+                    serviceId = serviceId,
+                    orgId = ctx.orgId,
+                    projectId = ctx.projectId,
+                    workspaceId = ctx.workspaceId,
+                    probeMode = service[Services.probeMode],
+                    script = script,
+                    variables = variables,
+                    timeoutMs = probeConfig.defaultTimeoutMs,
+                    prev = prev,
+                    allowBodySave = allowBodySave,
+                    // The executor masks these out of saved body bytes before
+                    // storage; ResultRedactor (below) masks the same values in
+                    // the echoed request that comes back.
+                    secretValues = secretValues,
+                ),
+            )
+            if (executions.isEmpty()) {
+                log.warn("service {} has no eligible probe executor", serviceId)
                 return
             }
 
-            // Dispatch to agents (parallel if multiple, e.g. simultaneous mode)
-            val jobId = UUID.randomUUID()
-
-            // A run may fan out to several agents (simultaneous mode). Each
-            // dispatch carries the bytes it sent; those land on that dispatch's
-            // envelope, so the usage buckets sum them into the run total.
-            coroutineScope {
-                val results = agents.map { agent ->
-                    async {
-                        val dispatched = agentDispatch.dispatch(
-                            agentUri = agent.uri,
-                            expectedSlug = agent.slug,
-                            script = script,
-                            variables = variables,
-                            timeoutMs = probeConfig.defaultTimeoutMs,
-                            prev = prev,
-                            allowBodySave = allowBodySave,
-                            // Agent masks these out of saved body bytes before upload;
-                            // ResultRedactor (below) masks the same values in the echoed
-                            // request that comes back.
-                            secretValues = secretValues,
-                        )
-                        val result = dispatched.result
-                            ?: return@async // dispatch failed — logged, no result to publish
-                        // Strip any secret plaintext the executor echoed back (e.g. a
-                        // secret placed in a request URL/header) before it is persisted.
-                        val redacted = ResultRedactor.redact(result, secretValues)
-                        resultPublisher.publish(
-                            jobId = jobId,
-                            serviceId = serviceId,
-                            agentId = agent.id,
-                            projectId = ctx.projectId,
-                            workspaceId = ctx.workspaceId,
-                            organizationId = ctx.orgId,
-                            rawResult = redacted,
-                            agentEgressBytes = dispatched.agentEgressBytes,
-                        )
-                    }
-                }
-                results.awaitAll()
+            for (execution in executions) {
+                // Executor unreachable — logged by the backend, nothing to persist.
+                val result = execution.result ?: continue
+                // Strip any secret plaintext the executor echoed back (e.g. a
+                // secret placed in a request URL/header) before it is persisted.
+                val redacted = ResultRedactor.redact(result, secretValues)
+                resultPublisher.publish(
+                    jobId = jobId,
+                    serviceId = serviceId,
+                    agentId = execution.agentId,
+                    projectId = ctx.projectId,
+                    workspaceId = ctx.workspaceId,
+                    organizationId = ctx.orgId,
+                    rawResult = redacted,
+                    agentEgressBytes = execution.egressBytes,
+                )
             }
 
-            log.info("dispatched service {} to {} agent(s)", serviceId, agents.size)
+            log.info("dispatched service {} ({} execution(s))", serviceId, executions.size)
         } finally {
             val hasPending = queuePolicy.release(serviceId, lockToken)
             if (hasPending) {

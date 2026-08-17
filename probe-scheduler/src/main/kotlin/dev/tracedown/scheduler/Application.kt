@@ -8,6 +8,8 @@ import dev.tracedown.scheduler.crypto.AgentMtlsClientFactory
 import dev.tracedown.scheduler.crypto.RevocationChecker
 import dev.tracedown.scheduler.crypto.SchedulerCertService
 import dev.tracedown.scheduler.dispatch.AgentDispatchService
+import dev.tracedown.scheduler.dispatch.AgentExecutionBackend
+import dev.tracedown.scheduler.dispatch.ProbeExecutionBackends
 import dev.tracedown.scheduler.dispatch.AgentSelector
 import dev.tracedown.scheduler.dispatch.DispatchQueue
 import dev.tracedown.scheduler.dispatch.QueuePolicyManager
@@ -72,11 +74,10 @@ fun Application.module() {
         revocationChecker = revocationChecker,
     )
 
-    // Agent dispatch (mTLS)
-    val agentDispatch = AgentDispatchService(agentClientFactory)
-
-    // Agent selection
-    val agentSelector = AgentSelector(redis)
+    // Probe execution: the agent backend (slug-pinned mTLS dispatch) by
+    // default, or whatever backend the host registered.
+    val executionBackend = ProbeExecutionBackends.provider?.invoke()
+        ?: AgentExecutionBackend(AgentSelector(redis), AgentDispatchService(agentClientFactory))
 
     // Queue policy
     val queuePolicy = QueuePolicyManager(redis)
@@ -96,8 +97,7 @@ fun Application.module() {
         capacity = config.dispatchQueueSize,
         workers = config.dispatchWorkers,
         quartzManager = quartzManager,
-        agentSelector = agentSelector,
-        agentDispatch = agentDispatch,
+        executionBackend = executionBackend,
         queuePolicy = queuePolicy,
         resultPublisher = resultPublisher,
         probeConfig = config.probe,
@@ -140,6 +140,7 @@ fun Application.module() {
     // Shutdown hooks
     monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
         dispatchQueue.close()
+        executionBackend.close()
         syncService.stop()
         quartzManager.shutdown()
         // Closes every per-agent client the factory built (shared by dispatch

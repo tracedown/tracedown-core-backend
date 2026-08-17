@@ -19,5 +19,6 @@ include(
     "email-service",
     "metrics-service",
     "aggregate-worker",
-    "realtime-service"
+    "realtime-service",
+    "tracedown-monolith"
 )

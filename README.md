@@ -119,6 +119,44 @@ probes without one:
 
 Full walkthrough: **[Quickstart](https://tracedown.dev/install/quickstart/)**.
 
+## The monolith
+
+For minimal installs there is `tracedown-monolith`: the entire platform in a
+single jar. It is a deliberate trade — ease of deployment for the loss of the
+microservice properties. One process to run, watch and restart instead of
+eight, but no independent scaling (you can't add scheduler replicas or move
+ingestion elsewhere), no isolation (one service's failure or memory pressure
+is everyone's), and no rolling updates of a single piece. For a small install
+probing a handful of services none of that matters, and the operational
+simplicity wins; when it starts to matter, the per-service deployment is the
+same code — point it at the same database and switch.
+
+Every service runs in one JVM, the dashboard is served from the gateway port,
+and probes execute on an embedded Lace executor — no agents to enrol (the
+Agents UI is hidden accordingly, and with it the ability to probe from
+multiple vantage points). It needs only Postgres and Redis, and migrates its
+own schema on boot:
+
+```bash
+DATABASE_URL=jdbc:postgresql://localhost:5432/tracedown \
+DATABASE_USER=tracedown DATABASE_PASSWORD=... \
+REDIS_A_URL=redis://localhost:6379 \
+java -jar tracedown-monolith-<version>-all.jar
+```
+
+Grab the jar from the releases page (it ships with the frontend baked in), or
+build it yourself — pass `-PmonolithFrontend=latest` (or a `vX.Y.Z` tag, or a
+path to a frontend `dist.tar.gz`) to bundle the dashboard:
+
+```bash
+./gradlew :tracedown-monolith:fatJar -PmonolithFrontend=latest
+```
+
+The gateway CLI tools ride along (`java -jar ... --create-org`, etc.). Ports
+follow the standard per-service defaults; `GATEWAY_PORT`, `METRICS_PORT` and
+`REALTIME_PORT` override the exposed ones. Distributed agents remain available
+in the per-service deployment — the monolith trades them for simplicity.
+
 ## Deploying
 
 `docker/deploy/` runs the platform — backend and frontend — from published
