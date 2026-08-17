@@ -81,13 +81,5 @@ tasks.test {
     environment("PLATFORM_AES_KEY", "0000000000000000000000000000000000000000000000000000000000000000")
 }
 
-tasks.register<Jar>("fatJar") {
-    archiveClassifier.set("all")
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    manifest {
-        attributes["Main-Class"] = application.mainClass.get()
-    }
-    from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
-    with(tasks.jar.get())
-}
+// The fatJar task is registered for every service module by the root build.
 

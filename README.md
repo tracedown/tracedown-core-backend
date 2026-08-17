@@ -109,7 +109,8 @@ docker compose up --build
 ```
 
 The stack brings up Postgres, Redis, the migrator, the CA bootstrap, every
-service, and an nginx entry point on port 20714. Then enrol an agent — nothing
+service. The gateway publishes on 127.0.0.1:20714 (a host web server exposes it —
+see `docker/deploy/`). Then enrol an agent — nothing
 probes without one:
 
 ```bash
@@ -117,6 +118,13 @@ probes without one:
 ```
 
 Full walkthrough: **[Quickstart](https://tracedown.dev/install/quickstart/)**.
+
+## Deploying
+
+`docker/deploy/` runs the platform — backend and frontend — from published
+GitHub release artifacts instead of building from source, with a full-scope
+`.env.example` and host `nginx.conf`/`apache.conf` for the public side. See
+its README.
 
 > [!WARNING]
 > `docker/.env.example` holds development secrets — a placeholder encryption

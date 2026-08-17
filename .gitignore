@@ -20,3 +20,7 @@ e2e/.venv/
 docker/email-attachments/
 
 !docker/.env.example
+
+# Deploy stack: operator-created files
+docker/deploy/.env
+docker/deploy/frontend-dist/

@@ -1,0 +1,58 @@
+name: Release
+
+# Tag vX.Y.Z → GitHub release carrying every runnable service as a
+# self-contained jar, plus the schema-migrator as a distZip (Flyway 11 cannot
+# scan migrations inside a merged jar, so the migrator ships as a distribution
+# and must be run from its bin/ launcher).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish release
+    # Upstream-only: forks never release.
+    if: github.repository == 'tracedown/tracedown-core-backend'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check tag matches build version
+        run: |
+          VERSION=$(sed -n 's/^\s*version = "\(.*\)"/\1/p' build.gradle.kts | head -1)
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "Tag v$TAG does not match build version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and test
+        run: ./gradlew build
+
+      - name: Package service jars and migrator dist
+        run: ./gradlew fatJar :schema-migrator:distZip
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Tracedown Core Backend $GITHUB_REF_NAME" \
+            --notes "Each service is a self-contained jar (\`java -jar\`). The schema-migrator ships as a zip — unpack and run \`bin/schema-migrator\` (it must not be merged into a fat jar; Flyway would find no migrations). See the deploy compose in \`docker/deploy/\` for running the whole stack from these artifacts." \
+            */build/libs/*-all.jar \
+            schema-migrator/build/distributions/schema-migrator-*.zip

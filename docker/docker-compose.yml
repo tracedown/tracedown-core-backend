@@ -3,8 +3,9 @@
 # Usage:
 #   docker compose up --build
 #
-# Nginx exposes ${NGINX_PORT} (default 20714, the t7n branded port) - the
-# single entry point for the frontend.
+# No reverse proxy in the stack: the gateway (20714), metrics (20850) and
+# realtime (20870) services publish on 127.0.0.1, and a host web server (see
+# docker/deploy/nginx.conf or apache.conf) exposes them plus the frontend.
 
 name: tracedown
 
@@ -137,6 +138,8 @@ services:
       target: gateway
     container_name: tracedown-gateway
     networks: [tracedown-net]
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-20714}:20714"
     volumes:
       - tracedown-bodies:/data/bodies
     environment:
@@ -250,6 +253,8 @@ services:
       target: metrics
     container_name: tracedown-metrics
     networks: [tracedown-net]
+    ports:
+      - "127.0.0.1:${METRICS_PORT:-20850}:20850"
     environment:
       <<: [*db-env, *redis-env]
       PORT: 20850
@@ -292,6 +297,8 @@ services:
       target: realtime
     container_name: tracedown-realtime
     networks: [tracedown-net]
+    ports:
+      - "127.0.0.1:${REALTIME_PORT:-20870}:20870"
     environment:
       <<: *db-env
       REDIS_A_URL: ${REDIS_A_URL}
@@ -300,20 +307,6 @@ services:
       tracedown-migrator:
         condition: service_completed_successfully
       tracedown-redis-a:
-        condition: service_healthy
-
-  # ── Nginx reverse proxy ──
-
-  tracedown-nginx:
-    image: nginx:alpine
-    container_name: tracedown-nginx
-    networks: [tracedown-net]
-    ports:
-      - "${NGINX_PORT}:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    depends_on:
-      tracedown-gateway:
         condition: service_healthy
 
 volumes:

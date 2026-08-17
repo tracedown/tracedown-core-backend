@@ -43,6 +43,25 @@ subprojects {
         targetCompatibility = "17"
     }
 
+    // Every runnable service ships as a single self-contained jar (GitHub
+    // release artifacts). schema-migrator is deliberately excluded: Flyway 11's
+    // classpath scanning cannot find migration resources inside a merged jar —
+    // it would connect, apply nothing, and report success — so the migrator
+    // ships as its installDist-based distZip instead.
+    plugins.withId("application") {
+        if (name != "schema-migrator") {
+            tasks.register<Jar>("fatJar") {
+                archiveClassifier.set("all")
+                duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+                manifest {
+                    attributes["Main-Class"] = project.extensions.getByType<JavaApplication>().mainClass.get()
+                }
+                from(project.configurations.getByName("runtimeClasspath").map { if (it.isDirectory) it else zipTree(it) })
+                with(tasks.named<Jar>("jar").get())
+            }
+        }
+    }
+
     tasks.withType<Test> {
         useJUnitPlatform()
         // Testcontainers' bundled docker-java defaults to Docker API v1.32, which

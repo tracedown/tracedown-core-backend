@@ -85,6 +85,3 @@ services:
       <<: *jvm-env
       DB_POOL_SIZE: "2"
 
-  tracedown-nginx:
-    cpus: 0.5
-    mem_limit: 128m

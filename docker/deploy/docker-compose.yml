@@ -1,0 +1,176 @@
+# Tracedown deploy stack — runs the platform from published GitHub release
+# artifacts instead of building from source. Copy .env.example to .env, work
+# through its sections (the production guard refuses placeholder secrets),
+# then: docker compose up -d
+#
+# Nothing here terminates TLS and no ports are public: the API, WebSocket and
+# metrics endpoints bind to 127.0.0.1 only, and the frontend bundle is
+# unpacked to ./frontend-dist. Your host web server exposes the stack — see
+# nginx.conf / apache.conf alongside this file.
+
+name: tracedown
+
+x-service: &service
+  image: eclipse-temurin:17-jre
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    # env_file values are literal — this indirection is resolved here instead.
+    DATABASE_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+  networks: [tracedown-net]
+  volumes:
+    - tracedown-artifacts:/artifacts:ro
+  depends_on:
+    tracedown-artifacts:
+      condition: service_completed_successfully
+    tracedown-migrator:
+      condition: service_completed_successfully
+    tracedown-redis-a:
+      condition: service_healthy
+
+services:
+  # One-shot: downloads the pinned (or latest) release artifacts.
+  tracedown-artifacts:
+    image: alpine:3.20
+    environment:
+      BACKEND_VERSION: ${BACKEND_VERSION:-latest}
+      FRONTEND_VERSION: ${FRONTEND_VERSION:-latest}
+    volumes:
+      - tracedown-artifacts:/artifacts
+      - ./frontend-dist:/frontend-dist
+      - ./fetch-artifacts.sh:/fetch-artifacts.sh:ro
+    command: /bin/sh /fetch-artifacts.sh
+    networks: [tracedown-net]
+
+  tracedown-postgres:
+    # The schema is plain PostgreSQL — no extensions, no hypertables.
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-tracedown}
+      POSTGRES_USER: ${DB_USER:-tracedown}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes:
+      - tracedown-pgdata:/var/lib/postgresql/data
+    networks: [tracedown-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-tracedown} -d ${DB_NAME:-tracedown}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  tracedown-redis-a:
+    # Operational Redis (AOF): queues, outbox nudges, pub/sub, locks.
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - tracedown-redis-a-data:/data
+    networks: [tracedown-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Uncomment to split the cache roles onto their own instances and repoint
+  # REDIS_B_URL / REDIS_C_URL in .env. A single instance is fine to start.
+  #
+  # tracedown-redis-b:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   command: ["redis-server", "--save", "", "--maxmemory-policy", "allkeys-lru"]
+  #   networks: [tracedown-net]
+  #
+  # tracedown-redis-c:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   command: ["redis-server", "--save", "", "--maxmemory-policy", "allkeys-lru"]
+  #   networks: [tracedown-net]
+
+  # One-shot: applies the schema. Runs from the installDist layout — the
+  # migrator must not run as a merged jar (Flyway would find no migrations).
+  tracedown-migrator:
+    image: eclipse-temurin:17-jre
+    env_file: .env
+    environment:
+      DATABASE_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes:
+      - tracedown-artifacts:/artifacts:ro
+    command: /artifacts/schema-migrator-dist/bin/schema-migrator
+    networks: [tracedown-net]
+    depends_on:
+      tracedown-artifacts:
+        condition: service_completed_successfully
+      tracedown-postgres:
+        condition: service_healthy
+
+  tracedown-gateway:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/api-gateway.jar"]
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-20714}:20714"
+    volumes:
+      - tracedown-artifacts:/artifacts:ro
+      - tracedown-bodies:/data/bodies
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:20714/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  tracedown-scheduler:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/probe-scheduler.jar"]
+    depends_on:
+      tracedown-artifacts:
+        condition: service_completed_successfully
+      tracedown-migrator:
+        condition: service_completed_successfully
+      tracedown-redis-a:
+        condition: service_healthy
+      tracedown-gateway:
+        condition: service_healthy
+
+  tracedown-ingestor:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/result-ingestor.jar"]
+    volumes:
+      - tracedown-artifacts:/artifacts:ro
+      # Same bodies volume as the gateway and your agents — the ingestor
+      # relocates agent-written bodies under this root as results land.
+      - tracedown-bodies:/data/bodies
+
+  tracedown-dispatcher:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/notification-dispatcher.jar"]
+
+  tracedown-email:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/email-service.jar"]
+
+  tracedown-metrics:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/metrics-service.jar"]
+    ports:
+      - "127.0.0.1:${METRICS_PORT:-20850}:20850"
+
+  tracedown-worker:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/aggregate-worker.jar"]
+
+  tracedown-realtime:
+    <<: *service
+    command: ["java", "-jar", "/artifacts/realtime-service.jar"]
+    ports:
+      - "127.0.0.1:${REALTIME_PORT:-20870}:20870"
+
+networks:
+  tracedown-net:
+    name: tracedown_tracedown-net
+
+volumes:
+  tracedown-artifacts:
+  tracedown-pgdata:
+  tracedown-redis-a-data:
+  tracedown-bodies:
