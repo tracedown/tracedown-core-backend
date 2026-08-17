@@ -1,14 +1,19 @@
 name: Release
 
-# Tag vX.Y.Z → GitHub release carrying every runnable service as a
-# self-contained jar, plus the schema-migrator as a distZip (Flyway 11 cannot
-# scan migrations inside a merged jar, so the migrator ships as a distribution
-# and must be run from its bin/ launcher).
+# Version-bump-driven, like the rest of the stack: runs on every push to main,
+# and publishes only when the version in build.gradle.kts has no release yet.
+# Merging a PR that bumps the version IS the release trigger — the workflow
+# creates the vX.Y.Z tag and the GitHub release itself.
+#
+# Artifacts: every runnable service as a self-contained jar, plus the
+# schema-migrator as a distZip (Flyway 11 cannot scan migrations inside a
+# merged jar, so the migrator ships as a distribution and runs from its bin/
+# launcher). Tests are covered by the CI workflow on the same push.
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -20,69 +25,51 @@ jobs:
     if: github.repository == 'tracedown/tracedown-core-backend'
     runs-on: ubuntu-latest
     steps:
-      # Same monorepo-layout reconstruction as CI: the scheduler's integration
-      # test runs a real agent container whose image builds from the sibling
-      # repos.
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: core/tracedown-core-backend
 
-      - name: Checkout probe agent
-        uses: actions/checkout@v4
-        with:
-          repository: tracedown/tracedown-probe-agent
-          path: core/tracedown-probe-agent
-
-      - name: Checkout Lace Python validator
-        uses: actions/checkout@v4
-        with:
-          repository: tracedown/lacelang-python-validator
-          path: lace/lacelang-python-validator
-
-      - name: Checkout Lace Python executor
-        uses: actions/checkout@v4
-        with:
-          repository: tracedown/lacelang-python-executor
-          path: lace/lacelang-python-executor
-
-      - name: Check tag matches build version
-        working-directory: core/tracedown-core-backend
+      - name: Read version
+        id: version
         run: |
           VERSION=$(sed -n 's/^\s*version = "\(.*\)"/\1/p' build.gradle.kts | head -1)
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$VERSION" != "$TAG" ]; then
-            echo "Tag v$TAG does not match build version $VERSION" >&2
-            exit 1
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.version.outputs.tag }} already exists — nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build test-agent image
-        run: docker build -f core/tracedown-core-backend/probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent .
-
       - name: Setup JDK
+        if: steps.check.outputs.exists == 'false'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Setup Gradle
+        if: steps.check.outputs.exists == 'false'
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build and test
-        working-directory: core/tracedown-core-backend
-        run: ./gradlew build
-
       - name: Package service jars and migrator dist
-        working-directory: core/tracedown-core-backend
+        if: steps.check.outputs.exists == 'false'
         run: ./gradlew fatJar :schema-migrator:distZip
 
       - name: Create GitHub release
-        working-directory: core/tracedown-core-backend
+        if: steps.check.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "Tracedown Core Backend $GITHUB_REF_NAME" \
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --title "Tracedown Core Backend ${{ steps.version.outputs.tag }}" \
             --notes "Each service is a self-contained jar (\`java -jar\`). The schema-migrator ships as a zip — unpack and run \`bin/schema-migrator\` (it must not be merged into a fat jar; Flyway would find no migrations). See the deploy compose in \`docker/deploy/\` for running the whole stack from these artifacts." \
             */build/libs/*-all.jar \
             schema-migrator/build/distributions/schema-migrator-*.zip
