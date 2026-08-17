@@ -52,7 +52,7 @@ jobs:
           fi
           git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
           CHANGED=$(git diff --name-only "$BASE"...HEAD)
-          CODE=$(echo "$CHANGED" | grep -E '(^|/)src/|\.kts$|^gradle|^settings' || true)
+          CODE=$(echo "$CHANGED" | grep -E '(^|/)src/|\.kts$|^gradle|^settings|^\.github/workflows/' || true)
           if [ -n "$CODE" ]; then
             echo "Code changes detected (build + tests will run):"; echo "$CODE"
             echo "code=true" >> "$GITHUB_OUTPUT"
