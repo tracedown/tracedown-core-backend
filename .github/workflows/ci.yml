@@ -7,23 +7,19 @@ on:
     # 'edited' fires on PR title/body changes, so removing a 'WIP:' prefix
     # re-triggers the checks without needing a new push.
     types: [opened, synchronize, reopened, edited]
-  push:
-    branches:
-      - main
 
 jobs:
   # Pre-filter: skipped when the PR title starts with 'WIP:'. Every other job
-  # needs it, so a skipped gate cascades. Pushes to main always run.
+  # needs it, so a skipped gate cascades.
   wip-gate:
     name: WIP gate
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.event.pull_request.title, 'WIP:') }}
+    if: ${{ !startsWith(github.event.pull_request.title, 'WIP:') }}
     steps:
       - name: Not WIP
         run: echo "Running checks."
 
-  # Detects what changed so downstream jobs self-skip. Pushes to main always
-  # run everything. Two flags:
+  # Detects what changed so downstream jobs self-skip. Two flags:
   #   - code:   any module source, resource, or gradle file → build + tests
   #   - deploy: docker/ (compose stacks, deploy configs) → compose validation
   changed-paths:
@@ -44,12 +40,6 @@ jobs:
         env:
           BASE: origin/${{ github.base_ref }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "Push to main — running everything."
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
           CHANGED=$(git diff --name-only "$BASE"...HEAD)
           CODE=$(echo "$CHANGED" | grep -E '(^|/)src/|\.kts$|^gradle|^settings|^\.github/workflows/' || true)
