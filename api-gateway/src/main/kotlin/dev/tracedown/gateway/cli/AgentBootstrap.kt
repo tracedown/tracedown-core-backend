@@ -4,6 +4,9 @@ import at.favre.lib.crypto.bcrypt.BCrypt
 import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.AgentBootstrapTokens
 import dev.tracedown.gateway.controllers.agents.CaService
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.security.SecureRandom
@@ -65,6 +68,12 @@ object AgentBootstrap {
                 // Ensure CA root exists (generated on first bootstrap).
                 CaService.ensureCaRoot()
 
+                // A fresh token supersedes any outstanding one for the slug
+                // (the one-outstanding invariant is index-enforced; the CLI is
+                // also re-run on every dev-stack boot).
+                AgentBootstrapTokens.deleteWhere {
+                    (AgentBootstrapTokens.slug eq slug) and (AgentBootstrapTokens.used eq false)
+                }
                 AgentBootstrapTokens.insert {
                     it[id] = UUID.randomUUID()
                     it[AgentBootstrapTokens.slug] = slug

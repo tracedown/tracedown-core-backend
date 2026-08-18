@@ -85,7 +85,9 @@ object InviteController {
     ): InviteResponse {
         if (email.isBlank()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
 
-        return Interceptors.injectable("invite.create", InterceptorContext(orgId = orgId, userId = invitedByUserId)) {
+        // In-transaction so a before-hook's read (e.g. a member count) is atomic
+        // with the membership/invite write it guards.
+        return Interceptors.injectableInTx("invite.create", InterceptorContext(orgId = orgId, userId = invitedByUserId)) {
             doInviteInner(orgId, email, invitedByUserId, appConfig, emailPublisher, groupIds)
         }
     }
@@ -101,7 +103,8 @@ object InviteController {
         val inviteTtlSeconds = appConfig.platform.inviteTtlDays * 86400L
         val cooldownSeconds = appConfig.platform.inviteResendCooldownMinutes * 60L
 
-        return transaction {
+        // Runs inside the caller's injectableInTx transaction.
+        return run {
             val org = Organizations.selectAll()
                 .where { (Organizations.id eq orgId) and (Organizations.deleted eq false) }
                 .firstOrNull()
@@ -171,7 +174,7 @@ object InviteController {
                         entityDisplayName = email,
                     )
                     RealtimePublisher.publish("org:$orgId", orgId, "invite.created")
-                    return@transaction InviteResponse(ok = true)
+                    return@run InviteResponse(ok = true)
                 }
 
                 if (existingMembership != null) {
@@ -200,7 +203,7 @@ object InviteController {
                             inviterUser[Users.displayName], newToken,
                             appConfig, emailPublisher,
                         )
-                        return@transaction InviteResponse(ok = true)
+                        return@run InviteResponse(ok = true)
                     }
                 }
             }

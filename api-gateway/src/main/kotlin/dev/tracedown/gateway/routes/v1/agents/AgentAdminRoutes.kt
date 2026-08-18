@@ -148,16 +148,28 @@ fun Route.agentAdminRoutes() {
         // An external module intercepts the request to connect a new agent via
         // this key; a before-hook (with the requesting org/user in context) may
         // deny it, atomically with the token insert.
+        val tokenId = UUID.randomUUID()
         Interceptors.injectableInTx(
             "agent.bootstrap.create",
-            // Carry the new agent's slug so a hook can act on the created token.
-            InterceptorContext(orgId = orgId, userId = principal.userId, extra = mutableMapOf("slug" to slug)),
+            // Carry the slug and the created token's id so a hook can act on
+            // exactly this token, never on another row that shares the slug.
+            InterceptorContext(
+                orgId = orgId, userId = principal.userId,
+                extra = mutableMapOf("slug" to slug, "tokenId" to tokenId),
+            ),
         ) {
             requireOrgWrite(orgId, principal.userId) { it.settings }
             // The signing CA is created lazily on the very first bootstrap.
             CaService.ensureCaRoot()
+            // A fresh token supersedes any outstanding one for the slug — the
+            // token is shown once, so a lost one is re-issued, never reused.
+            // The partial unique index (slug WHERE used = false) enforces the
+            // one-outstanding invariant against concurrent creation.
+            AgentBootstrapTokens.deleteWhere {
+                (AgentBootstrapTokens.slug eq slug) and (AgentBootstrapTokens.used eq false)
+            }
             AgentBootstrapTokens.insert {
-                it[id] = UUID.randomUUID()
+                it[id] = tokenId
                 it[AgentBootstrapTokens.slug] = slug
                 it[AgentBootstrapTokens.label] = label
                 it[AgentBootstrapTokens.tokenHash] = tokenHash

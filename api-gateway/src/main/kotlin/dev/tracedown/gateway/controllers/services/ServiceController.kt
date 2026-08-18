@@ -460,10 +460,22 @@ object ServiceController {
 
     /**
      * Enables or disables a service. Enabling requires a valid non-empty script.
+     *
+     * Injectable so a host can gate the transition — e.g. cap how many services
+     * may be enabled at once — atomically with the flip (`extra["isActive"]`
+     * carries the requested direction).
      */
+    @Injectable("service.toggle")
     fun toggle(orgId: UUID, serviceId: UUID, request: ToggleServiceRequest, userId: UUID): ServiceSummary {
         val ctx = ResourceResolver.resolveService(serviceId, orgId)
-        return transaction {
+        return Interceptors.injectableInTx(
+            "service.toggle",
+            InterceptorContext(
+                orgId = orgId, userId = userId, workspaceId = ctx.workspaceId,
+                projectId = ctx.projectId, serviceId = serviceId,
+                extra = mutableMapOf("isActive" to request.isActive),
+            ),
+        ) {
             val cached = requireCachedPermissions(orgId, userId)
             requireServiceWriteAccess(ctx.serviceId, ctx.projectId, ctx.workspaceId, cached)
 

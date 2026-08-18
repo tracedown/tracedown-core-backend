@@ -81,7 +81,13 @@ object DomainPolicy {
         }
     }
 
-    private fun covers(host: String, domain: String, wildcard: Boolean, exceptions: List<String>): Boolean {
+    /**
+     * Whether a verified [domain] row covers [host]: an exact match, or — with
+     * [wildcard] — any subdomain not carved out by [exceptions] (each exception
+     * excludes itself and its subdomains). Public because host-classification
+     * consumers outside this policy must match its semantics exactly.
+     */
+    fun covers(host: String, domain: String, wildcard: Boolean, exceptions: List<String>): Boolean {
         val d = domain.lowercase()
         if (host == d) return true
         if (!wildcard || !host.endsWith(".$d")) return false

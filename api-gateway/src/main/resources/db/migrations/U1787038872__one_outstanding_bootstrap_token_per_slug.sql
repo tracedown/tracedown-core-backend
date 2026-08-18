@@ -1,0 +1,1 @@
+DROP INDEX ux_agent_bootstrap_tokens_outstanding;
