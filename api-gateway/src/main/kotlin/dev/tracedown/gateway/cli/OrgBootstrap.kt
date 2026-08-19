@@ -34,9 +34,9 @@ object OrgBootstrap {
     // columns: name, users, settings, domains, webhooks, notifications, admin, workspaces
     private val DEFAULT_GROUPS = listOf(
         DefaultGroupConfig("Admins",  2, 2, 2, 2, 2, 2, 2),
-        DefaultGroupConfig("Users",   1, 1, 0, 0, 1, 0, 1),
-        DefaultGroupConfig("Viewers", 0, 0, 0, 0, 0, 0, 0),
-        DefaultGroupConfig("DevOps",  0, 0, 2, 2, 0, 0, 1),
+        DefaultGroupConfig("Users",   0, 0, 0, 0, 0, 0, 0),
+        DefaultGroupConfig("Viewers", 1, 1, 1, 1, 1, 0, 1),
+        DefaultGroupConfig("DevOps",  2, 2, 2, 2, 2, 0, 2),
     )
 
     /** Parses CLI args and runs the bootstrap. Returns true if handled. */
