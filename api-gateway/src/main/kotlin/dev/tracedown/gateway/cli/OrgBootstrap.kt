@@ -35,7 +35,9 @@ object OrgBootstrap {
     private val DEFAULT_GROUPS = listOf(
         DefaultGroupConfig("Admins",  2, 2, 2, 2, 2, 2, 2),
         DefaultGroupConfig("Users",   0, 0, 0, 0, 0, 0, 0),
-        DefaultGroupConfig("Viewers", 1, 1, 1, 1, 1, 0, 1),
+        // settings stays 0: settings read exposes the audit log, agents and
+        // org variables — none of which are for read-only members.
+        DefaultGroupConfig("Viewers", 1, 0, 1, 1, 1, 0, 1),
         DefaultGroupConfig("DevOps",  2, 2, 2, 2, 2, 0, 2),
     )
 
