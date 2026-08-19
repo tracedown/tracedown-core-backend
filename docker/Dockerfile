@@ -16,12 +16,7 @@ WORKDIR /app
 COPY core/tracedown-core-backend/gradle ./core/tracedown-core-backend/gradle
 COPY core/tracedown-core-backend/gradlew core/tracedown-core-backend/build.gradle.kts core/tracedown-core-backend/settings.gradle.kts core/tracedown-core-backend/gradle.properties ./core/tracedown-core-backend/
 
-# ── 2. Lace composite builds (change infrequently) ──
-COPY lace/lacelang-kotlin-validator ./lace/lacelang-kotlin-validator
-COPY lace/lacelang-kotlin-executor ./lace/lacelang-kotlin-executor
-COPY lace/kotlin-lacetest ./lace/kotlin-lacetest
-
-# ── 3. Per-module build scripts only (change when dependencies change) ──
+# ── 2. Per-module build scripts only (change when dependencies change) ──
 COPY core/tracedown-core-backend/tracedown-core-common/build.gradle.kts ./core/tracedown-core-backend/tracedown-core-common/build.gradle.kts
 COPY core/tracedown-core-backend/schema-migrator/build.gradle.kts ./core/tracedown-core-backend/schema-migrator/build.gradle.kts
 COPY core/tracedown-core-backend/api-gateway/build.gradle.kts ./core/tracedown-core-backend/api-gateway/build.gradle.kts
@@ -33,7 +28,7 @@ COPY core/tracedown-core-backend/metrics-service/build.gradle.kts ./core/tracedo
 COPY core/tracedown-core-backend/aggregate-worker/build.gradle.kts ./core/tracedown-core-backend/aggregate-worker/build.gradle.kts
 COPY core/tracedown-core-backend/realtime-service/build.gradle.kts ./core/tracedown-core-backend/realtime-service/build.gradle.kts
 
-# ── 4. Warm dependency cache (layer cached until build scripts change) ──
+# ── 3. Warm dependency cache (layer cached until build scripts change) ──
 WORKDIR /app/core/tracedown-core-backend
 # sharing=locked: compose builds every service target in parallel from this
 # same Dockerfile; concurrent Gradle runs over one shared cache mount corrupt
@@ -42,7 +37,7 @@ WORKDIR /app/core/tracedown-core-backend
 RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
     chmod +x gradlew && ./gradlew dependencies --no-daemon > /dev/null 2>&1 || true
 
-# ── 5. Copy all source code (changes frequently) ──
+# ── 4. Copy all source code (changes frequently) ──
 WORKDIR /app
 COPY core/tracedown-core-backend/tracedown-core-common ./core/tracedown-core-backend/tracedown-core-common
 COPY core/tracedown-core-backend/schema-migrator ./core/tracedown-core-backend/schema-migrator
@@ -55,7 +50,7 @@ COPY core/tracedown-core-backend/metrics-service ./core/tracedown-core-backend/m
 COPY core/tracedown-core-backend/aggregate-worker ./core/tracedown-core-backend/aggregate-worker
 COPY core/tracedown-core-backend/realtime-service ./core/tracedown-core-backend/realtime-service
 
-# ── 6. Build (dependencies already cached via mount) ──
+# ── 5. Build (dependencies already cached via mount) ──
 WORKDIR /app/core/tracedown-core-backend
 RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
     ./gradlew installDist --no-daemon -x test
