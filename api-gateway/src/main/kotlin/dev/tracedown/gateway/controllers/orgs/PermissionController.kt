@@ -348,6 +348,18 @@ object PermissionController {
             AuditService.log(
                 orgId, requestingUserId, "update.permissions", "group", groupId.toString(),
                 entityDisplayName = group[OrgGroups.name],
+                diff = request.org?.let {
+                    auditDiff(
+                        Triple("users", group[OrgGroups.orgUserList], it.users),
+                        Triple("settings", group[OrgGroups.orgSettings], it.settings),
+                        Triple("domains", group[OrgGroups.orgDomains], it.domains),
+                        Triple("webhooks", group[OrgGroups.orgWebhooks], it.webhooks),
+                        Triple("notifications", group[OrgGroups.orgNotifications], it.notifications),
+                        Triple("admin", group[OrgGroups.orgAdmin], it.admin),
+                        Triple("workspaces", group[OrgGroups.orgWorkspaces], it.workspaces),
+                    )
+                },
+                comment = if (request.resources != null) "resource grants replaced" else null,
             )
             RealtimePublisher.publish("org:$orgId", orgId, "group.updated", buildJsonObject { put("groupId", groupId.toString()) })
 
