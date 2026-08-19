@@ -161,8 +161,31 @@ fun Application.module() {
 
     dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.init { redisB }
     dev.tracedown.gateway.controllers.metrics.UsageController.init({ redisB }, appConfig.systemLimits.resultRetentionDays)
+    // Body storage, same root/bucket the agent writes and the ingestor
+    // relocates in. Without the S3 config an s3:// body URI cannot be
+    // presigned, so "view body" would fail for object-storage deployments;
+    // confinement rejects any URI outside the configured location.
+    val storageConf = environment.config
+    val storageS3 = storageConf.propertyOrNull("storage.s3.endpoint")?.getString()
+        ?.takeIf { it.isNotBlank() }
+        ?.let { endpoint ->
+            dev.tracedown.common.storage.S3Config(
+                endpoint = endpoint,
+                accessKey = storageConf.property("storage.s3.accessKey").getString(),
+                secretKey = storageConf.property("storage.s3.secretKey").getString(),
+            )
+        }
     dev.tracedown.gateway.controllers.results.ProbeResultController.init(
-        dev.tracedown.common.storage.BodyStorageClient()
+        dev.tracedown.common.storage.BodyStorageClient(
+            s3Config = storageS3,
+            confinement = dev.tracedown.common.storage.BodyConfinement(
+                filesystemRoot = java.nio.file.Path.of(
+                    storageConf.propertyOrNull("storage.filesystemRoot")?.getString() ?: "/data/bodies",
+                ),
+                s3Bucket = storageConf.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() },
+                s3KeyPrefix = storageConf.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+            ),
+        )
     )
 
     val emailPublisher = EmailPublisher(redisA)
