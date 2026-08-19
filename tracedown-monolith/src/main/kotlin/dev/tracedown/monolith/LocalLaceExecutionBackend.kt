@@ -64,12 +64,17 @@ class LocalLaceExecutionBackend(
 
         val config = mutableMapOf<String, Any?>()
         if ("laceEmitRecovery" in extensions) {
-            config["extensions"] = mapOf(
-                "laceEmitRecovery" to mapOf(
-                    // The recovery text doubles as the dispatcher-side template.
-                    "recovery_message" to "\${s.name} in \${w.name}.\${p.name} recovered",
-                ),
+            val recoveryCfg = mutableMapOf<String, Any?>(
+                // The recovery text doubles as the dispatcher-side template.
+                "recovery_message" to "\${s.name} in \${w.name}.\${p.name} recovered",
             )
+            // A recoveryTemplate config variable names an org notification
+            // template instead — the tagged value template(<name>) builds; a
+            // named template wins over the platform default at the dispatcher.
+            variables["recoveryTemplate"]?.takeIf { it.isNotBlank() }?.let {
+                recoveryCfg["notification"] = mapOf("tag" to "template", "name" to it)
+            }
+            config["extensions"] = mapOf("laceEmitRecovery" to recoveryCfg)
         }
 
         val bodiesDir = if (request.allowBodySave) {
