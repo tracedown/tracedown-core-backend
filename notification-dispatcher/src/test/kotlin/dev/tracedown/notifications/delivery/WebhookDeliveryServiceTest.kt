@@ -137,4 +137,37 @@ class WebhookDeliveryServiceTest {
         val url = service.resolveUrl("https://h.example.com/\$o.missing/x", emptyMap())
         assertEquals("https://h.example.com/\$o.missing/x", url)
     }
+
+    // ── URL webhook-variable resolution ($h.key) ──
+
+    @Test
+    fun `resolves webhook variable in webhook url`() {
+        val url = service.resolveUrl(
+            "https://api.telegram.org/bot\$h.botToken/sendMessage",
+            emptyMap(),
+            mapOf("botToken" to "123456:AA-Ff1234567890"),
+        )
+        assertEquals("https://api.telegram.org/bot123456:AA-Ff1234567890/sendMessage", url)
+    }
+
+    @Test
+    fun `resolves org and webhook refs together from their own scopes`() {
+        val url = service.resolveUrl(
+            "https://h.example.com/\$o.a/x/\$h.b",
+            mapOf("a" to "ORG"),
+            mapOf("b" to "HOOK"),
+        )
+        assertEquals("https://h.example.com/ORG/x/HOOK", url)
+    }
+
+    @Test
+    fun `webhook ref never resolves from org variables and vice versa`() {
+        // The same key in the wrong scope's map must not leak across.
+        val url = service.resolveUrl(
+            "https://h.example.com/\$h.token/\$o.token",
+            mapOf("token" to "ORG"),
+            emptyMap(),
+        )
+        assertEquals("https://h.example.com/\$h.token/ORG", url)
+    }
 }

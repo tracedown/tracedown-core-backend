@@ -10,8 +10,8 @@ import java.net.URI
  * Two layers:
  * - [validateUrlSyntax] runs at write-time (DTO validation, no DNS): enforces
  *   an https scheme and rejects hosts that are literal private/loopback IPs or
- *   internal names. It is intentionally lenient about templated hosts (`$o.…`),
- *   which cannot be resolved until delivery.
+ *   internal names. It is intentionally lenient about templated hosts
+ *   (`$o.…` / `$h.…`), which cannot be resolved until delivery.
  * - [assertAllowed] runs at delivery-time on the fully-resolved URL: re-checks
  *   the scheme, resolves the host, and rejects if ANY resolved address is
  *   loopback / link-local / private / unique-local / CGNAT / wildcard, or the
@@ -40,7 +40,7 @@ object SsrfGuard {
         // the URI parser can't fully model.
         if (!url.trimStart().lowercase().startsWith("https://")) return "invalid_$field"
 
-        // A URL carrying an org-variable ref (`$o.key`) can't be fully judged
+        // A URL carrying a variable ref (`$o.key` / `$h.key`) can't be fully judged
         // until delivery resolves it — the authoritative DNS-based check runs
         // then (assertAllowed). Here we only guarantee the https scheme.
         val templated = url.contains('$')

@@ -4,6 +4,7 @@ import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.ResourceWebhookAccess
 import dev.tracedown.common.models.WebhookDeliveries
+import dev.tracedown.common.models.WebhookVariables
 import dev.tracedown.common.util.VariableCrypto
 import dev.tracedown.notifications.templates.TemplateRenderer
 import kotlinx.coroutines.Dispatchers
@@ -49,8 +50,11 @@ import java.util.concurrent.TimeUnit
  * ```
  * `headers` are added to the outgoing request (typically auth), `query` entries are
  * appended to the URL's query string. Both keys are optional and both header/query
- * values may embed `$o.<key>` org-variable references, resolved the same way as the
- * URL so secrets stay encrypted in org variables rather than plaintext in config.
+ * values may embed `$o.<key>` org-variable and `$h.<key>` webhook-variable
+ * references, resolved the same way as the URL so secrets stay encrypted in
+ * variables rather than plaintext in config. `$h.` variables belong to the one
+ * webhook that carries them and are resolved only here — probe scripts can
+ * never reference them.
  */
 class WebhookDeliveryService(
     /** Base backoff in seconds; the wait before retry N is base × 4^(N-1). */
@@ -93,19 +97,15 @@ class WebhookDeliveryService(
         }
 
         // Webhook URLs (and config header/query values) may embed org-variable
-        // references ($o.key) so secrets like a bot token live encrypted in an
-        // org variable, not plaintext. Resolve only the referenced keys once per
-        // delivery; the decrypted values are used only for the request, never
-        // logged. A variable that can't be decrypted (e.g. key mismatch) is
-        // skipped — the ref stays unresolved and only that webhook fails, rather
-        // than taking down every notification for this result.
+        // ($o.key) and webhook-variable ($h.key) references so secrets like a
+        // bot token live encrypted in a variable, not plaintext. Resolve only
+        // the referenced keys once per delivery; the decrypted values are used
+        // only for the request, never logged. A variable that can't be
+        // decrypted (e.g. key mismatch) is skipped — the ref stays unresolved
+        // and only that webhook fails, rather than taking down every
+        // notification for this result.
         val referencedKeys = webhooks
-            .flatMap { webhook ->
-                (ORG_VAR_RE.findAll(webhook.url) +
-                    webhook.config.headers.values.flatMap { ORG_VAR_RE.findAll(it) } +
-                    webhook.config.query.values.flatMap { ORG_VAR_RE.findAll(it) })
-                    .map { it.groupValues[1] }
-            }
+            .flatMap { webhook -> webhook.referencedKeys(ORG_VAR_RE) }
             .toSet()
         val orgVars = if (referencedKeys.isNotEmpty()) {
             newSuspendedTransaction(Dispatchers.IO) { loadOrgVars(orgId, referencedKeys) }
@@ -114,12 +114,22 @@ class WebhookDeliveryService(
         }
 
         for (webhook in webhooks) {
+            // $h. variables are scoped to the single webhook, so their map is
+            // loaded per webhook (AAD-bound to webhook:<id> — a ciphertext
+            // copied to another webhook's row will not decrypt).
+            val hookKeys = webhook.referencedKeys(WEBHOOK_VAR_RE)
+            val hookVars = if (hookKeys.isNotEmpty()) {
+                newSuspendedTransaction(Dispatchers.IO) { loadWebhookVars(orgId, webhook.webhookId, hookKeys) }
+            } else {
+                emptyMap()
+            }
+
             // JSON-escaped substitution — raw text with quotes/newlines must
             // not corrupt the body document.
             val renderedBody = TemplateRenderer.renderJson(webhook.bodyTemplate, vars)
-            val resolvedUrl = resolveUrl(webhook.url, orgVars)
+            val resolvedUrl = resolveUrl(webhook.url, orgVars, hookVars)
 
-            val outcome = dispatchWithRetry(webhook, resolvedUrl, renderedBody, orgVars, probeResultId)
+            val outcome = dispatchWithRetry(webhook, resolvedUrl, renderedBody, orgVars, hookVars, probeResultId)
 
             // `attempt_count` is the operator-configured retry ceiling, not a
             // counter — the per-delivery outcome (including attempts consumed) is
@@ -152,6 +162,7 @@ class WebhookDeliveryService(
         resolvedUrl: String,
         renderedBody: String,
         orgVars: Map<String, String>,
+        hookVars: Map<String, String>,
         probeResultId: UUID,
     ): DeliveryOutcome {
         val maxAttempts = webhook.maxAttempts
@@ -166,7 +177,7 @@ class WebhookDeliveryService(
             }
             attempt++
 
-            val request = buildRequest(webhook, resolvedUrl, renderedBody, orgVars)
+            val request = buildRequest(webhook, resolvedUrl, renderedBody, orgVars, hookVars)
 
             // Authoritative SSRF gate on the fully-resolved URL: https only, and
             // no host that resolves to a private/loopback/internal address. A
@@ -218,11 +229,12 @@ class WebhookDeliveryService(
         resolvedUrl: String,
         renderedBody: String,
         orgVars: Map<String, String>,
+        hookVars: Map<String, String>,
     ): Request {
-        // Append config query params (org-var references resolved).
+        // Append config query params (variable references resolved).
         val urlBuilder = resolvedUrl.toHttpUrlOrNull()?.newBuilder()
         val finalUrl = if (urlBuilder != null && webhook.config.query.isNotEmpty()) {
-            webhook.config.query.forEach { (k, v) -> urlBuilder.addQueryParameter(k, resolveUrl(v, orgVars)) }
+            webhook.config.query.forEach { (k, v) -> urlBuilder.addQueryParameter(k, resolveUrl(v, orgVars, hookVars)) }
             urlBuilder.build().toString()
         } else {
             resolvedUrl
@@ -237,7 +249,7 @@ class WebhookDeliveryService(
             .url(finalUrl)
             .method(webhook.method, requestBody)
 
-        webhook.config.headers.forEach { (k, v) -> builder.header(k, resolveUrl(v, orgVars)) }
+        webhook.config.headers.forEach { (k, v) -> builder.header(k, resolveUrl(v, orgVars, hookVars)) }
 
         return builder.build()
     }
@@ -275,7 +287,15 @@ class WebhookDeliveryService(
         val config: WebhookConfig,
         /** Max total HTTP attempts for this webhook, from its `attempt_count`. */
         val maxAttempts: Int,
-    )
+    ) {
+        /** Variable keys the URL and config header/query values reference via [re]. */
+        fun referencedKeys(re: Regex): Set<String> =
+            (re.findAll(url) +
+                config.headers.values.flatMap { re.findAll(it) } +
+                config.query.values.flatMap { re.findAll(it) })
+                .map { it.groupValues[1] }
+                .toSet()
+    }
 
     private fun findBoundWebhooks(
         orgId: UUID,
@@ -310,16 +330,25 @@ class WebhookDeliveryService(
     }
 
     /**
-     * Substitutes `$o.<key>` references in a string with the org variable's
-     * value. Unknown references are left intact (the request then fails as a
-     * misconfiguration rather than silently dropping the token).
+     * Substitutes `$o.<key>` (org variable) and `$h.<key>` (webhook variable)
+     * references in a string with their values. Unknown references are left
+     * intact (the request then fails as a misconfiguration rather than
+     * silently dropping the token).
      */
-    internal fun resolveUrl(template: String, orgVars: Map<String, String>): String =
-        if (!template.contains("\$o.")) {
-            template
-        } else {
-            ORG_VAR_RE.replace(template) { m -> orgVars[m.groupValues[1]] ?: m.value }
+    internal fun resolveUrl(
+        template: String,
+        orgVars: Map<String, String>,
+        hookVars: Map<String, String> = emptyMap(),
+    ): String {
+        var resolved = template
+        if (resolved.contains("\$o.")) {
+            resolved = ORG_VAR_RE.replace(resolved) { m -> orgVars[m.groupValues[1]] ?: m.value }
         }
+        if (resolved.contains("\$h.")) {
+            resolved = WEBHOOK_VAR_RE.replace(resolved) { m -> hookVars[m.groupValues[1]] ?: m.value }
+        }
+        return resolved
+    }
 
     /**
      * Loads the requested org variables into a key → decrypted-value map. A
@@ -351,9 +380,44 @@ class WebhookDeliveryService(
         return result
     }
 
+    /**
+     * Loads the requested webhook variables into a key → decrypted-value map.
+     * Same failure posture as [loadOrgVars]: an undecryptable variable is
+     * logged and skipped, leaving its refs unresolved.
+     */
+    private fun loadWebhookVars(orgId: UUID, webhookId: UUID, keys: Set<String>): Map<String, String> {
+        val result = mutableMapOf<String, String>()
+        WebhookVariables.selectAll()
+            .where {
+                (WebhookVariables.webhookId eq webhookId) and
+                    (WebhookVariables.organizationId eq orgId) and
+                    (WebhookVariables.deleted eq false) and
+                    (WebhookVariables.key inList keys)
+            }
+            .forEach { row ->
+                val key = row[WebhookVariables.key]
+                val value = row[WebhookVariables.value]
+                val iv = row[WebhookVariables.valueIv]
+                val encrypted = row[WebhookVariables.encrypted]
+                try {
+                    // AAD scope must match the gateway's write side exactly.
+                    result[key] = if (encrypted) VariableCrypto.decrypt(orgId, value, iv, "webhook:$webhookId", key) else value
+                } catch (e: Exception) {
+                    log.warn(
+                        "could not decrypt webhook variable '{}' for webhook {} — leaving its refs unresolved (check PLATFORM_AES_KEY matches the gateway): {}",
+                        key, webhookId, e.message,
+                    )
+                }
+            }
+        return result
+    }
+
     private companion object {
         /** Org-scoped variable reference: `$o.key`. */
         val ORG_VAR_RE = Regex("\\\$o\\.([a-zA-Z_][a-zA-Z0-9_]*)")
+
+        /** Webhook-scoped variable reference: `$h.key`. */
+        val WEBHOOK_VAR_RE = Regex("\\\$h\\.([a-zA-Z_][a-zA-Z0-9_]*)")
 
         /** HTTP methods that must never carry a request body. */
         val BODILESS_METHODS = setOf("GET", "HEAD")

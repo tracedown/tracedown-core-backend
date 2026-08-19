@@ -1,6 +1,9 @@
 package dev.tracedown.gateway.routes.v1.webhooks
 
 import dev.tracedown.gateway.controllers.webhooks.WebhookController
+import dev.tracedown.gateway.controllers.webhooks.WebhookVariableController
+import dev.tracedown.gateway.data.CreateVariableRequest
+import dev.tracedown.gateway.data.UpdateVariableRequest
 import dev.tracedown.gateway.data.webhooks.CreateWebhookRequest
 import dev.tracedown.gateway.data.webhooks.UpdateWebhookRequest
 import dev.tracedown.gateway.data.webhooks.WebhookBindingRequest
@@ -26,7 +29,13 @@ import io.ktor.server.resources.post
 @Resource("/api/v1/webhooks")
 class Webhooks {
     @Resource("{webhookId}")
-    class ById(val parent: Webhooks = Webhooks(), val webhookId: String)
+    class ById(val parent: Webhooks = Webhooks(), val webhookId: String) {
+        @Resource("variables")
+        class Variables(val parent: ById) {
+            @Resource("{varId}")
+            class ByVarId(val parent: Variables, val varId: String)
+        }
+    }
 
     @Resource("bindings/{resourceType}/{resourceId}")
     class Bindings(val parent: Webhooks = Webhooks(), val resourceType: String, val resourceId: String)
@@ -70,6 +79,49 @@ fun Route.webhookRoutes() {
         val (principal, orgId) = requireAuthWithOrg(call)
         val webhookId = parseUuid(resource.webhookId, "webhook ID")
         WebhookController.delete(orgId, webhookId, principal.userId)
+        call.respond(mapOf("ok" to true))
+    }
+
+    // ── Per-webhook variables ($h.key, resolved at delivery only) ──
+
+    /** Lists a webhook's variables (encrypted values masked). */
+    get<Webhooks.ById.Variables> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val webhookId = parseUuid(resource.parent.webhookId, "webhook ID")
+        call.respond(WebhookVariableController.list(orgId, webhookId, principal.userId))
+    }
+
+    /** Creates a variable on a webhook. */
+    post<Webhooks.ById.Variables> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val webhookId = parseUuid(resource.parent.webhookId, "webhook ID")
+        val body = tryReceive<CreateVariableRequest>(call)
+        call.respond(WebhookVariableController.create(orgId, webhookId, body, principal.userId))
+    }
+
+    /** Reveals a variable's decrypted value (secrets cannot be revealed). */
+    get<Webhooks.ById.Variables.ByVarId> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val webhookId = parseUuid(resource.parent.parent.webhookId, "webhook ID")
+        val varId = parseUuid(resource.varId, "variable ID")
+        call.respond(WebhookVariableController.reveal(orgId, webhookId, varId, principal.userId))
+    }
+
+    /** Updates a variable's value. */
+    patch<Webhooks.ById.Variables.ByVarId> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val webhookId = parseUuid(resource.parent.parent.webhookId, "webhook ID")
+        val varId = parseUuid(resource.varId, "variable ID")
+        val body = tryReceive<UpdateVariableRequest>(call)
+        call.respond(WebhookVariableController.update(orgId, webhookId, varId, body, principal.userId))
+    }
+
+    /** Soft-deletes a variable. */
+    delete<Webhooks.ById.Variables.ByVarId> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val webhookId = parseUuid(resource.parent.parent.webhookId, "webhook ID")
+        val varId = parseUuid(resource.varId, "variable ID")
+        WebhookVariableController.delete(orgId, webhookId, varId, principal.userId)
         call.respond(mapOf("ok" to true))
     }
 
