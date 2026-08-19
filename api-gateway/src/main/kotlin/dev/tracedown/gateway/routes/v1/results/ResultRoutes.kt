@@ -9,10 +9,9 @@ import dev.tracedown.gateway.util.parseUuid
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
 import io.ktor.server.response.respond
-import io.ktor.server.response.respondRedirect
-import io.ktor.server.response.respondText
 import io.ktor.server.routing.Route
 import io.ktor.server.resources.get
+import kotlinx.serialization.Serializable
 
 /**
  * @OpenAPITag Probe Results
@@ -26,6 +25,17 @@ class Results(val serviceId: String) {
         class StepBody(val parent: ById, val stepId: String)
     }
 }
+
+/**
+ * A stored response body: exactly one of [content] (small/filesystem bodies,
+ * inlined) or [url] (object storage — a short-lived presigned URL the client
+ * fetches directly). Deliberately NOT an HTTP redirect: a fetch that follows a
+ * cross-origin redirect is sent with `Origin: null`, which no origin-scoped
+ * bucket CORS policy can match — fetching the URL directly preserves the
+ * page's origin, so the bucket policy can stay restricted to the dashboard.
+ */
+@Serializable
+data class StepBodyResponse(val content: String? = null, val url: String? = null)
 
 /** Registers routes for querying probe results. */
 fun Route.resultRoutes() {
@@ -54,8 +64,8 @@ fun Route.resultRoutes() {
         val resultId = parseUuid(resource.parent.resultId, "result ID")
         val stepId = parseUuid(resource.stepId, "step ID")
         when (val body = ProbeResultController.getStepBody(orgId, svcId, resultId, stepId, principal.userId)) {
-            is BodyStorageClient.BodyContent.Inline -> call.respondText(body.content)
-            is BodyStorageClient.BodyContent.Redirect -> call.respondRedirect(body.url)
+            is BodyStorageClient.BodyContent.Inline -> call.respond(StepBodyResponse(content = body.content))
+            is BodyStorageClient.BodyContent.Redirect -> call.respond(StepBodyResponse(url = body.url))
             is BodyStorageClient.BodyContent.NotFound -> call.respond(HttpStatusCode.NoContent, "")
         }
     }
