@@ -36,8 +36,14 @@ object SystemAlertService {
     const val AGENT_DOWN = "agent_down"
     const val AGENT_DEGRADED = "agent_degraded"
 
-    /** Agent challenge round-trips above this raise [AGENT_DEGRADED]. */
-    const val DEGRADED_RTT_MS = 500
+    /**
+     * Agent challenge round-trips above this raise [AGENT_DEGRADED]. The
+     * challenge is a cold mTLS handshake plus the agent's callback to the
+     * gateway (~5 round trips), so a healthy agent on another continent
+     * legitimately takes ~1–1.2 s — the boundary sits at the top of that,
+     * flagging only what geography can't explain.
+     */
+    const val DEGRADED_RTT_MS = 1200
 
     private const val RAISE_THROTTLE_SECONDS = 60L
 
