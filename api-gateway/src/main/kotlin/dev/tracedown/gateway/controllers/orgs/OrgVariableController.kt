@@ -13,6 +13,7 @@ import dev.tracedown.gateway.data.VariableSummary
 import dev.tracedown.gateway.data.parseVariableType
 import dev.tracedown.gateway.data.variableTypeName
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
@@ -75,6 +76,14 @@ object OrgVariableController {
                 }
                 .any()
             if (exists) throw ConflictException()
+
+            // One resource, one cap. Counted live so deleting a variable frees
+            // the slot; system-managed rows are created elsewhere and are not
+            // subject to it.
+            val held = OrgVariables.selectAll()
+                .where { (OrgVariables.organizationId eq orgId) and (OrgVariables.deleted eq false) }
+                .count()
+            if (VariableLimits.isFull(held)) throw BadRequestException(ErrorCodes.VARIABLE_LIMIT_REACHED)
 
             val id = UUID.randomUUID()
             val now = Instant.now()

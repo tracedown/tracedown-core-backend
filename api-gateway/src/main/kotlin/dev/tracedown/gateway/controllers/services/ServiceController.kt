@@ -48,6 +48,7 @@ import dev.tracedown.gateway.data.services.UpdateScriptRequest
 import dev.tracedown.gateway.data.services.UpdateServiceRequest
 import dev.tracedown.gateway.data.variableTypeName
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.common.variables.SystemVariables
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.common.variables.SystemVariableSeeder
@@ -751,6 +752,14 @@ object ServiceController {
                 }
                 .any()
             if (exists) throw ConflictException()
+
+            // One resource, one cap. Counted live so deleting a variable frees
+            // the slot; system-managed rows are created elsewhere and are not
+            // subject to it.
+            val held = ServiceVariables.selectAll()
+                .where { (ServiceVariables.serviceId eq serviceId) and (ServiceVariables.deleted eq false) }
+                .count()
+            if (VariableLimits.isFull(held)) throw BadRequestException(ErrorCodes.VARIABLE_LIMIT_REACHED)
 
             val id = UUID.randomUUID()
             val now = Instant.now()

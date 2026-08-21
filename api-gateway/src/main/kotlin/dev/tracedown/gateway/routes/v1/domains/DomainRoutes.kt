@@ -26,6 +26,7 @@ class Domains {
     class ById(val parent: Domains = Domains(), val domainId: String) {
         @Resource("verify")
         class Verify(val parent: ById)
+
     }
 }
 

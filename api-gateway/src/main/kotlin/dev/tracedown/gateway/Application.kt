@@ -8,6 +8,7 @@ import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.redis.RedisFactory
+import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.controllers.auth.AuthController
 import dev.tracedown.gateway.controllers.domains.DomainController
 import dev.tracedown.gateway.controllers.integrations.GrafanaIntegrationController
@@ -124,6 +125,10 @@ fun Application.module() {
         HttpDnsDomainVerifier()
     }
     DomainController.init(appConfig.platform.aesKey, domainVerifier)
+    // How many variables one resource may hold — an operator-set guard against
+    // runaway creation, identical for every organization.
+    VariableLimits.init(appConfig.systemLimits.maxVarsPerResource)
+
     ServiceController.init(trustedDomainMode = appConfig.platform.trustedDomainMode)
     AuthController.init(trustedDomainMode = appConfig.platform.trustedDomainMode)
     GrafanaIntegrationController.init(appConfig.platform.metricsPublicUrl)

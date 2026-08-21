@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.controllers.webhooks
 
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.WebhookDeliveries
 import dev.tracedown.common.models.WebhookVariables
@@ -83,6 +84,14 @@ object WebhookVariableController {
                 }
                 .any()
             if (exists) throw ConflictException()
+
+            // One resource, one cap. Counted live so deleting a variable frees
+            // the slot; system-managed rows are created elsewhere and are not
+            // subject to it.
+            val held = WebhookVariables.selectAll()
+                .where { (WebhookVariables.webhookId eq webhookId) and (WebhookVariables.deleted eq false) }
+                .count()
+            if (VariableLimits.isFull(held)) throw BadRequestException(ErrorCodes.VARIABLE_LIMIT_REACHED)
 
             val id = UUID.randomUUID()
             val now = Instant.now()

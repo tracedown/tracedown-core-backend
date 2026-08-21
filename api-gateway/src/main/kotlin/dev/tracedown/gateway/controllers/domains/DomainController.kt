@@ -271,5 +271,7 @@ object DomainController {
         exceptions = row[OrgDomains.exceptions] ?: emptyList(),
         lastCheckedAt = row[OrgDomains.lastCheckedAt]?.toString(),
         lapsed = row[OrgDomains.lapsed],
+        dnsSetupMethod = row[OrgDomains.dnsSetupMethod],
+        dnsSetupAt = row[OrgDomains.dnsSetupAt]?.toString(),
     )
 }

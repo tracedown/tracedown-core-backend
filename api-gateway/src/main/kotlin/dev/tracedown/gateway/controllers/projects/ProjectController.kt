@@ -34,6 +34,7 @@ import dev.tracedown.gateway.data.projects.CreateProjectRequest
 import dev.tracedown.gateway.data.projects.ProjectSummary
 import dev.tracedown.gateway.data.projects.UpdateProjectRequest
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.gateway.util.ConflictException
@@ -276,6 +277,14 @@ object ProjectController {
                 }
                 .any()
             if (exists) throw ConflictException()
+
+            // One resource, one cap. Counted live so deleting a variable frees
+            // the slot; system-managed rows are created elsewhere and are not
+            // subject to it.
+            val held = ProjectVariables.selectAll()
+                .where { (ProjectVariables.projectId eq projectId) and (ProjectVariables.deleted eq false) }
+                .count()
+            if (VariableLimits.isFull(held)) throw BadRequestException(ErrorCodes.VARIABLE_LIMIT_REACHED)
 
             val id = UUID.randomUUID()
             val now = Instant.now()

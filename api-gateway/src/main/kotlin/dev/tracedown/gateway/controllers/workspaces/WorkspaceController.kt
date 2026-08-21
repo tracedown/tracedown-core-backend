@@ -29,6 +29,7 @@ import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.common.pfs.applySorters
 import dev.tracedown.common.pfs.toPage
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.common.variables.SystemVariables
 import dev.tracedown.common.variables.SystemVariableSeeder
@@ -243,6 +244,14 @@ object WorkspaceController {
                 }
                 .any()
             if (exists) throw ConflictException()
+
+            // One resource, one cap. Counted live so deleting a variable frees
+            // the slot; system-managed rows are created elsewhere and are not
+            // subject to it.
+            val held = WorkspaceVariables.selectAll()
+                .where { (WorkspaceVariables.workspaceId eq workspaceId) and (WorkspaceVariables.deleted eq false) }
+                .count()
+            if (VariableLimits.isFull(held)) throw BadRequestException(ErrorCodes.VARIABLE_LIMIT_REACHED)
 
             val id = UUID.randomUUID()
             val now = Instant.now()

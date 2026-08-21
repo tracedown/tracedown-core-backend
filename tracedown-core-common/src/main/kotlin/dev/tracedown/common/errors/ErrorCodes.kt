@@ -45,6 +45,8 @@ object ErrorCodes {
     const val VERSION_CONFLICT = "version_conflict"
 
     // ── Variables ──
+    /** The resource already holds as many variables as the operator allows. */
+    const val VARIABLE_LIMIT_REACHED = "variable_limit_reached"
     const val SYSTEM_VARIABLE = "system_variable"
     const val RESERVED_KEY = "reserved_key"
     const val READONLY_VARIABLE = "readonly_variable"

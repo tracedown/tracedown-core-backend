@@ -1,12 +1,10 @@
 package dev.tracedown.common.domain
 
+import dev.tracedown.common.domain.dns.TxtLookup
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.slf4j.LoggerFactory
 import java.util.concurrent.TimeUnit
-import javax.naming.directory.InitialDirContext
-import javax.naming.Context
-import java.util.Hashtable
 
 /**
  * Verifies domain ownership via HTTP well-known file or DNS TXT record.
@@ -39,7 +37,7 @@ class HttpDnsDomainVerifier(
 
     private fun verifyHttp(domain: String, challenge: String): VerificationResult {
         val host = if (httpPort != null) "$domain:$httpPort" else domain
-        val url = "$httpScheme://$host/.well-known/tracedown-verify.txt"
+        val url = "$httpScheme://$host${DomainChallenge.WELL_KNOWN_PATH}"
         return try {
             val request = Request.Builder().url(url).get().build()
             val response = httpClient.newCall(request).execute()
@@ -71,23 +69,18 @@ class HttpDnsDomainVerifier(
     }
 
     private fun verifyDns(domain: String, challenge: String): VerificationResult {
-        val lookupDomain = "_tracedown-verify.$domain"
-        val expectedValue = "tracedown-verify=$challenge"
+        val lookupDomain = DomainChallenge.recordName(domain)
+        val expectedValue = DomainChallenge.recordValue(challenge)
         return try {
-            val env = Hashtable<String, String>()
-            env[Context.INITIAL_CONTEXT_FACTORY] = "com.sun.jndi.dns.DnsContextFactory"
-            val ctx = InitialDirContext(env)
-            val attrs = ctx.getAttributes(lookupDomain, arrayOf("TXT"))
-            val txtAttr = attrs.get("TXT")
+            val values = TxtLookup.txt(lookupDomain)
 
-            if (txtAttr == null) {
+            if (values.isEmpty()) {
                 return VerificationResult(
                     verified = false,
                     error = "No TXT records found for $lookupDomain",
                 )
             }
 
-            val values = (0 until txtAttr.size()).map { txtAttr.get(it).toString().trim('"', ' ') }
             if (values.any { it == expectedValue }) {
                 VerificationResult(verified = true)
             } else {

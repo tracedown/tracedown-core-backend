@@ -41,6 +41,9 @@ data class DomainSummary(
     val exceptions: List<String>,
     val lastCheckedAt: String?,
     val lapsed: Boolean,
+    /** How the DNS record was placed: a provider id, a host's own method, or null for by hand. */
+    val dnsSetupMethod: String?,
+    val dnsSetupAt: String?,
 )
 
 @Serializable

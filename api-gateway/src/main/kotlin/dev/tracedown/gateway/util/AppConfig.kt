@@ -9,6 +9,7 @@ import dev.tracedown.common.email.ResendConfig
 import dev.tracedown.common.email.SmtpConfig
 import dev.tracedown.common.email.TlsMode
 import dev.tracedown.common.util.processUri
+import dev.tracedown.common.variables.VariableLimits
 import io.ktor.server.application.ApplicationEnvironment
 
 data class DatabaseConfig(
@@ -84,6 +85,12 @@ data class SystemLimitsConfig(
     val purgeRetentionDays: Int,
     /** Probe-result retention (days) — caps the usage window. Mirrors the worker's. */
     val resultRetentionDays: Int,
+    /**
+     * Most variables one resource may hold — counted per org, per workspace, per
+     * project, per service and per webhook. A guard against runaway creation,
+     * identical for every organization.
+     */
+    val maxVarsPerResource: Int,
 )
 
 data class AppConfig(
@@ -159,6 +166,8 @@ data class AppConfig(
                     auditLogRetentionDays = config.property("systemLimits.auditLogRetentionDays").getString().toInt(),
                     purgeRetentionDays = config.property("systemLimits.purgeRetentionDays").getString().toInt(),
                     resultRetentionDays = config.propertyOrNull("systemLimits.resultRetentionDays")?.getString()?.toInt() ?: 90,
+                    maxVarsPerResource = config.propertyOrNull("systemLimits.maxVarsPerResource")?.getString()?.toInt()
+                        ?: VariableLimits.DEFAULT_MAX_PER_RESOURCE,
                 )
             )
         }
