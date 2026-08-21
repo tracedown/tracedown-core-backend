@@ -3,11 +3,13 @@ package dev.tracedown.gateway.controllers.domains
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.domain.DomainVerifier
+import dev.tracedown.common.domain.dns.DnsProviderProfiles
 import dev.tracedown.common.models.OrgDomains
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.gateway.data.domains.CreateDomainRequest
+import dev.tracedown.gateway.data.domains.DnsHandoffDto
 import dev.tracedown.gateway.data.domains.DomainSummary
 import dev.tracedown.gateway.data.domains.UpdateDomainRequest
 import dev.tracedown.gateway.data.domains.VerifyDomainResponse
@@ -166,6 +168,33 @@ object DomainController {
 
             AuditService.log(orgId, userId, "delete.domain", "domain", domainId.toString(), entityDisplayName = deletedDomain)
         }
+    }
+
+    /**
+     * Where this domain's DNS records are edited, when the provider is one we
+     * recognise from the zone's delegation. One DNS lookup, no credential —
+     * the point is to save the user hunting for the right page, not to touch
+     * their zone. Requires domains.read.
+     */
+    fun dnsHandoff(orgId: UUID, domainId: UUID, userId: UUID): DnsHandoffDto {
+        val domain = transaction {
+            requireOrgRead(orgId, userId) { it.domains }
+            val row = OrgDomains.selectAll()
+                .where {
+                    (OrgDomains.id eq domainId) and
+                        (OrgDomains.organizationId eq orgId) and
+                        (OrgDomains.deleted eq false)
+                }
+                .firstOrNull() ?: throw NotFoundException()
+            // Only a DNS challenge has a record to place; http-01 needs a file.
+            if (row[OrgDomains.verificationType] != "dns-01") return@transaction null
+            row[OrgDomains.domain]
+        } ?: return DnsHandoffDto.NONE
+
+        // Name-server lookup, so it stays outside the transaction.
+        val detection = DnsProviderProfiles.detect(domain) ?: return DnsHandoffDto.NONE
+        val url = detection.profile.dashboardUrl(detection.zone) ?: return DnsHandoffDto.NONE
+        return DnsHandoffDto(mode = "dashboard", providerName = detection.profile.displayName, url = url)
     }
 
     // ── Verification ──
