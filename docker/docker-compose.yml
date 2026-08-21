@@ -20,7 +20,15 @@ x-redis-env: &redis-env
   REDIS_C_URL: ${REDIS_C_URL}
 
 networks:
+  # Subnet pinned outside 100.64.0.0/10 on purpose. The daemon's
+  # default-address-pools (/etc/docker/daemon.json) sits in CGNAT space,
+  # which Tailscale claims for its own nodes; its anti-spoof netfilter
+  # rules then drop host<->container traffic, so every published port
+  # accepts the TCP connection and never answers.
   tracedown-net:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
 
 services:
   # ── Infrastructure ──
