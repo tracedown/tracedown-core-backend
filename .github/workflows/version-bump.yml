@@ -1,0 +1,50 @@
+name: Version bump
+
+# Releasing here is version-driven: release.yml publishes when the version in
+# build.gradle.kts has no tag yet, so merging a PR that changes shipped code WITHOUT
+# bumping it produces no release at all — silently, with nothing to notice
+# until someone wonders why the fix never shipped. This turns that into a
+# failed check on the PR instead.
+#
+# Escape hatches, for PRs that genuinely ship nothing: title the PR `WIP:`, or
+# label it `no-release` (docs, CI, chores).
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  version-bump:
+    if: >-
+      github.repository == 'tracedown/tracedown-core-backend'
+      && !startsWith(github.event.pull_request.title, 'WIP:')
+      && !contains(github.event.pull_request.labels.*.name, 'no-release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base commit has to be readable to compare against.
+          fetch-depth: 0
+
+      - name: The version must change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          VERSION_FILE: build.gradle.kts
+        run: |
+          set -euo pipefail
+          extract() { grep -m1 'version = "' | sed 's/.*"\(.*\)".*/\1/'; }
+
+          head_version="$(extract < "$VERSION_FILE")"
+          base_version="$(git show "$BASE_SHA:$VERSION_FILE" | extract)"
+
+          if [ -z "$head_version" ]; then
+            echo "::error file=$VERSION_FILE::Could not read a version. The check cannot vouch for this PR."
+            exit 1
+          fi
+
+          if [ "$head_version" = "$base_version" ]; then
+            echo "::error file=$VERSION_FILE::Version is still $head_version, so merging this PR publishes nothing. Bump it, or label the PR 'no-release' if it ships nothing."
+            exit 1
+          fi
+
+          echo "$base_version -> $head_version"
