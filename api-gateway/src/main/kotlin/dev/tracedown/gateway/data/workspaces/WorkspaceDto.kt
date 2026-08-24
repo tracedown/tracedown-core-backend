@@ -23,6 +23,5 @@ data class UpdateWorkspaceRequest(val name: String? = null) : Validatable {
 data class WorkspaceSummary(
     val id: String,
     val name: String,
-    val isActive: Boolean,
     val createdAt: String,
 )

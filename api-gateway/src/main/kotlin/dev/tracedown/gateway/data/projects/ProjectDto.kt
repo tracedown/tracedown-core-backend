@@ -26,7 +26,6 @@ data class ProjectSummary(
     val id: String,
     val workspaceId: String,
     val name: String,
-    val isActive: Boolean,
     val createdAt: String,
     val metrics: ServiceMetricsDto? = null,
     val serviceCount: Int = 0,

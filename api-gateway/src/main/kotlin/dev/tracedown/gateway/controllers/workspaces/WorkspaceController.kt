@@ -75,7 +75,6 @@ object WorkspaceController {
                 it[Workspaces.id] = id
                 it[organizationId] = orgId
                 it[name] = request.name
-                it[isActive] = true
                 it[deleted] = false
                 it[createdAt] = now
             }
@@ -396,7 +395,6 @@ object WorkspaceController {
     private fun workspaceSummaryFromRow(row: org.jetbrains.exposed.sql.ResultRow) = WorkspaceSummary(
         id = row[Workspaces.id].toString(),
         name = row[Workspaces.name],
-        isActive = row[Workspaces.isActive],
         createdAt = row[Workspaces.createdAt].toString(),
     )
 

@@ -147,7 +147,6 @@ object OrgBootstrap {
             it[id] = projectId
             it[Projects.workspaceId] = workspaceId
             it[Projects.name] = config.projectName
-            it[isActive] = true
             it[deleted] = false
             it[createdAt] = now
         }
@@ -158,7 +157,6 @@ object OrgBootstrap {
             it[Services.name] = config.serviceName
             it[Services.script] = script
             it[schedule] = config.schedule
-            it[isActive] = true
             it[deleted] = false
             it[createdAt] = now
         }

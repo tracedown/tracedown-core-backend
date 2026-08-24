@@ -87,7 +87,6 @@ object OrgService {
                 it[userId] = ownerId
                 it[joinedAt] = now
                 it[status] = "active"
-                it[isActive] = true
                 it[deleted] = false
                 it[orgUserList] = AccessLevel.WRITE
                 it[orgSettings] = AccessLevel.WRITE
@@ -162,7 +161,6 @@ object OrgService {
                 it[id] = workspaceId
                 it[organizationId] = orgId
                 it[Workspaces.name] = "Default"
-                it[isActive] = true
                 it[deleted] = false
                 it[createdAt] = now
             }

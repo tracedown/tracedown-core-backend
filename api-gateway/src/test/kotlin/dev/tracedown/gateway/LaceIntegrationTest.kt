@@ -82,12 +82,12 @@ class LaceIntegrationTest {
 
         val RESPONSE_SCHEMAS: Map<String, Any?> = mapOf(
             "workspaceSchema" to objSchema(
-                mapOf("id" to "string", "name" to "string", "isActive" to "boolean", "createdAt" to "string"),
-                listOf("id", "name", "isActive", "createdAt"),
+                mapOf("id" to "string", "name" to "string", "createdAt" to "string"),
+                listOf("id", "name", "createdAt"),
             ),
             "projectSchema" to objSchema(
-                mapOf("id" to "string", "workspaceId" to "string", "name" to "string", "isActive" to "boolean", "createdAt" to "string", "serviceCount" to "integer"),
-                listOf("id", "workspaceId", "name", "isActive", "createdAt", "serviceCount"),
+                mapOf("id" to "string", "workspaceId" to "string", "name" to "string", "createdAt" to "string", "serviceCount" to "integer"),
+                listOf("id", "workspaceId", "name", "createdAt", "serviceCount"),
             ),
             "serviceSchema" to objSchema(
                 mapOf("id" to "string", "projectId" to "string", "name" to "string", "script" to "string", "schedule" to "string", "probeMode" to "string", "queuePolicy" to "string", "isActive" to "boolean", "version" to "integer", "createdAt" to "string"),

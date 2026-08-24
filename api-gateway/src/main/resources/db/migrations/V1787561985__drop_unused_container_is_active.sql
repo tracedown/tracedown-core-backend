@@ -1,0 +1,28 @@
+-- Drops `is_active` from projects and workspaces.
+--
+-- Both columns have been dead since they were created. They were set to true on
+-- insert, returned in ProjectDto / WorkspaceDto, and read by nothing else: no
+-- route ever set them, and no scheduler query ever consulted them. A probe runs
+-- or does not run on `services.is_active` alone — ScheduleSyncService and
+-- DispatchQueue both filter on that column and only that column.
+--
+-- So the columns did not mean "this project is switched off". They meant
+-- nothing, while looking exactly like something: the project card in the
+-- dashboard rendered an Active/Inactive badge from a value that was true for
+-- every project that has ever existed, and the operator dashboard carried the
+-- workspace flag through its API for the same non-reason.
+--
+-- The cost of keeping them is not storage. It is that the next person to want
+-- "disable a whole project" finds a column that appears to already do it, wires
+-- it up, and ships a feature that silently changes nothing — or, worse, makes
+-- the scheduler consult two more flags and gives every probe two new ways to
+-- stop running that nobody thinks to check during an incident. Scoped enable and
+-- disable are implemented instead as sweeps over `services.is_active`
+-- (PATCH /projects/{id}/services/toggle, PATCH /workspaces/{id}/services/toggle),
+-- which keeps one flag answering one question.
+--
+-- Deliberately NOT touched: `services.is_active` (the real switch),
+-- `org_users.is_active`, `probe_agents.is_active`. Only the two container
+-- columns go.
+ALTER TABLE projects   DROP COLUMN is_active;
+ALTER TABLE workspaces DROP COLUMN is_active;

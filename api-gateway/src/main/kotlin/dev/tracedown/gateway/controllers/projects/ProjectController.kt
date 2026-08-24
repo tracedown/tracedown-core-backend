@@ -83,7 +83,6 @@ object ProjectController {
                 it[Projects.id] = id
                 it[Projects.workspaceId] = workspaceId
                 it[name] = request.name
-                it[isActive] = true
                 it[deleted] = false
                 it[createdAt] = now
             }
@@ -421,7 +420,6 @@ object ProjectController {
         id = row[Projects.id].toString(),
         workspaceId = row[Projects.workspaceId].toString(),
         name = row[Projects.name],
-        isActive = row[Projects.isActive],
         createdAt = row[Projects.createdAt].toString(),
     )
 
