@@ -15,9 +15,11 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.DynamicTest
 import org.junit.jupiter.api.TestFactory
+import org.testcontainers.containers.GenericContainer
 import org.testcontainers.containers.PostgreSQLContainer
 import org.testcontainers.junit.jupiter.Container
 import org.testcontainers.junit.jupiter.Testcontainers
+import org.testcontainers.utility.DockerImageName
 import java.io.File
 import java.net.ServerSocket
 
@@ -25,8 +27,17 @@ import java.net.ServerSocket
  * Lace integration test for rate limiting.
  *
  * Starts a separate gateway instance with rate limiting enabled at very low
- * limits (general: 5/2s, auth: 3/2s) to verify rate limit behavior.
+ * limits (general: 5/60s, auth: 3/60s) to verify rate limit behavior.
  * Redis is flushed between each test script to ensure isolation.
+ *
+ * On its OWN Redis, not the shared [TestRedis]. Limiter keys are per client IP,
+ * and every test class in this module authenticates from 127.0.0.1 — so on a
+ * shared instance the 3-requests-per-minute auth ceiling set here applies to
+ * LaceIntegrationTest and MeRoutesTest too, and their logins start coming back
+ * throttled. The per-script flush below does not help: it runs between THIS
+ * class's scripts, not between classes, and the classes interleave. That made
+ * the whole module order-dependent, failing a shifting handful of auth/session
+ * tests depending on which class reached Redis first.
  */
 @Testcontainers
 class RateLimitLaceTest {
@@ -38,6 +49,15 @@ class RateLimitLaceTest {
             .withDatabaseName("tracedown_ratelimit_test")
             .withUsername("test")
             .withPassword("test")
+
+        /** This class's own limiter store — see the note on the class. */
+        @Container
+        @JvmStatic
+        val redis: GenericContainer<*> = GenericContainer(DockerImageName.parse("redis:7-alpine"))
+            .withExposedPorts(6379)
+
+        private val redisUrl: String
+            get() = "redis://${redis.host}:${redis.getMappedPort(6379)}"
 
         private lateinit var server: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>
         private var serverPort: Int = 0
@@ -54,14 +74,14 @@ class RateLimitLaceTest {
                 .migrate()
 
             serverPort = ServerSocket(0).use { it.localPort }
-            redisClient = RedisClient.create(TestRedis.url)
+            redisClient = RedisClient.create(redisUrl)
 
             val overrides = ConfigFactory.parseMap(mapOf(
                 "database.url" to postgres.jdbcUrl,
                 "database.user" to postgres.username,
                 "database.password" to postgres.password,
-                "redis.a.url" to TestRedis.url,
-                "redis.b.url" to TestRedis.url,
+                "redis.a.url" to redisUrl,
+                "redis.b.url" to redisUrl,
                 "redis.c.url" to "",
                 // Enable rate limiting with low limits for testing
                 "rateLimit.enabled" to "true",
