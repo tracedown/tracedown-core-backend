@@ -167,6 +167,22 @@ get("$baseUrl/api/v1/services/$$svcA1", { headers: { Authorization: "Bearer $$to
 .expect(status: 200)
 .assert({ expect: [this.body.isActive eq false] })
 
+// ── The skipped list is a capped sample; the count is the whole truth ──
+// Both are asserted on the small case here, so the contract holds at any size:
+// with one skip, skippedTotal equals the list length. The cap itself (50) only
+// bites on a scope far larger than a test should create.
+patch("$baseUrl/api/v1/projects/$$projA/services/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: true })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.skippedTotal eq 1,
+    count(this.body.skipped) eq this.body.skippedTotal
+  ]
+})
+
 // ── A scope the caller cannot reach is a 404, not an empty success ──
 patch("$baseUrl/api/v1/projects/00000000-0000-0000-0000-000000000000/services/toggle", {
   headers: { Authorization: "Bearer $$token" },

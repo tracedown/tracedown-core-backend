@@ -45,6 +45,7 @@ import dev.tracedown.gateway.data.services.LastFailureInfo
 import dev.tracedown.gateway.data.services.ScriptValidationError
 import dev.tracedown.gateway.data.services.ServiceSummary
 import dev.tracedown.gateway.data.services.ScopedToggleResult
+import dev.tracedown.gateway.data.services.SKIPPED_DETAIL_LIMIT
 import dev.tracedown.gateway.data.services.SkippedService
 import dev.tracedown.gateway.data.services.ToggleServiceRequest
 import dev.tracedown.gateway.data.services.UpdateScriptRequest
@@ -626,6 +627,17 @@ object ServiceController {
         val changedIds = mutableListOf<Pair<UUID, UUID>>()
         var matched = 0
         var unchanged = 0
+        var skippedTotal = 0
+
+        // Counts every skip; keeps only the first [SKIPPED_DETAIL_LIMIT] by name.
+        // Capped as it is built rather than trimmed at the end, so a scope of
+        // thousands never materialises thousands of rows to throw most away.
+        fun skip(svc: ScopedService, reason: String) {
+            skippedTotal++
+            if (skipped.size < SKIPPED_DETAIL_LIMIT) {
+                skipped += SkippedService(svc.id.toString(), svc.name, reason)
+            }
+        }
 
         transaction {
             val cached = requireCachedPermissions(orgId, userId)
@@ -640,7 +652,7 @@ object ServiceController {
                 // Scope write access is not service write access: a member can
                 // hold the project and still be denied one service inside it.
                 if (!canWriteResource(cached, "service", svc.id, listOf("project::${svc.projectId}", "workspace::${svc.workspaceId}"))) {
-                    skipped += SkippedService(svc.id.toString(), svc.name, "forbidden")
+                    skip(svc, "forbidden")
                     continue
                 }
                 if (isActive) {
@@ -649,11 +661,11 @@ object ServiceController {
                     // dispatch. Skipped rather than fatal — one stale script in a
                     // project of two hundred should not veto the other 199.
                     if (svc.script.isBlank()) {
-                        skipped += SkippedService(svc.id.toString(), svc.name, "script_missing")
+                        skip(svc, "script_missing")
                         continue
                     }
                     if (validateScript(svc.script).isNotEmpty()) {
-                        skipped += SkippedService(svc.id.toString(), svc.name, "script_invalid")
+                        skip(svc, "script_invalid")
                         continue
                     }
                 }
@@ -713,6 +725,7 @@ object ServiceController {
             changed = changedIds.size,
             unchanged = unchanged,
             skipped = skipped,
+            skippedTotal = skippedTotal,
         )
     }
 

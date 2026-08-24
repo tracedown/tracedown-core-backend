@@ -87,9 +87,32 @@ data class ScopedToggleResult(
      * listed: this is the ordinary case for a re-run, not something to act on.
      */
     val unchanged: Int,
-    /** Covered by the scope but not acted on — see [SkippedService.reason]. */
+    /**
+     * Covered by the scope but not acted on — see [SkippedService.reason].
+     *
+     * A SAMPLE, capped at [SKIPPED_DETAIL_LIMIT]. Nothing bounds how many
+     * services a scope holds — Core gates none of it — so a workspace of five
+     * thousand scriptless services would otherwise put five thousand rows in
+     * this response and five thousand nodes in the dialog that renders it.
+     * [skippedTotal] carries the real figure.
+     */
     val skipped: List<SkippedService>,
+    /**
+     * How many were skipped in total. Equals `skipped.size` until the sample is
+     * capped, after which it keeps counting — so the caller can say "and 4,950
+     * more" instead of implying the list is complete.
+     */
+    val skippedTotal: Int,
 )
+
+/**
+ * How many skipped services a scoped toggle names individually.
+ *
+ * Enough to act on — a handful of broken scripts is the case worth listing by
+ * name — without letting the response scale with the size of the scope. Past
+ * this, the count is the useful information, not another thousand names.
+ */
+const val SKIPPED_DETAIL_LIMIT = 50
 
 /** Returned when script validation fails. */
 @Serializable
