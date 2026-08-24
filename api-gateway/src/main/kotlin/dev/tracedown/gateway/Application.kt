@@ -37,6 +37,7 @@ import dev.tracedown.gateway.routes.v1.orgs.inviteRoutes
 import dev.tracedown.gateway.routes.v1.orgs.orgSettingsRoutes
 import dev.tracedown.gateway.routes.v1.audit.auditRoutes
 import dev.tracedown.gateway.routes.v1.domains.domainRoutes
+import dev.tracedown.gateway.routes.v1.email.emailWebhookRoutes
 import dev.tracedown.gateway.routes.v1.me.meRoutes
 import dev.tracedown.gateway.routes.v1.metrics.dashboardMetricsRoutes
 import dev.tracedown.gateway.routes.v1.metrics.usageRoutes
@@ -366,6 +367,7 @@ fun Application.module() {
         usageRoutes()
         agentRoutes()
         auditRoutes()
+        emailWebhookRoutes(appConfig)
         internalAgentRoutes()
         internalHealthTokenRoutes { redisA }
     }

@@ -208,11 +208,13 @@ data class AppConfig(
                 ) else null,
                 resend = if (provider == "resend") ResendConfig(
                     apiKey = config.property("email.resend.apiKey").getString(),
+                    webhookSecret = config.propertyOrNull("email.resend.webhookSecret")?.getString() ?: "",
                 ) else null,
                 mailgun = if (provider == "mailgun") MailgunConfig(
                     apiKey = config.property("email.mailgun.apiKey").getString(),
                     domain = config.property("email.mailgun.domain").getString(),
                     region = config.property("email.mailgun.region").getString(),
+                    webhookSigningKey = config.propertyOrNull("email.mailgun.webhookSigningKey")?.getString() ?: "",
                 ) else null,
                 console = ConsoleConfig(
                     attachmentDir = config.propertyOrNull("email.console.attachmentDir")?.getString()

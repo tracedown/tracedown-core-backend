@@ -11,6 +11,13 @@ application {
 dependencies {
     implementation(project(":tracedown-core-common"))
 
+    // The suppression list is read before every send.
+    implementation(libs.exposed.core)
+    implementation(libs.exposed.jdbc)
+    implementation(libs.exposed.java.time)
+    implementation(libs.hikari)
+    implementation(libs.postgresql)
+
     // Ktor server (lifecycle container)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.netty)

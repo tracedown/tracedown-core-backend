@@ -25,12 +25,23 @@ data class SmtpConfig(
 
 data class ResendConfig(
     val apiKey: String,
+    /**
+     * Svix signing secret (`whsec_…`) for the delivery webhook. Blank disables
+     * the endpoint: an unverified bounce webhook would let anyone suppress any
+     * address, so no secret means no webhook.
+     */
+    val webhookSecret: String = "",
 )
 
 data class MailgunConfig(
     val apiKey: String,
     val domain: String,
     val region: String = "us",
+    /**
+     * Webhook signing key — distinct from [apiKey], and issued separately in the
+     * Mailgun dashboard. Blank disables the endpoint (see [ResendConfig]).
+     */
+    val webhookSigningKey: String = "",
 )
 
 data class FileConfig(

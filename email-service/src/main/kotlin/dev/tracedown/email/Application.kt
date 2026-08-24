@@ -1,5 +1,6 @@
 package dev.tracedown.email
 
+import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.email.createTransport
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.email.config.EmailServiceConfig
@@ -38,6 +39,14 @@ fun Application.module() {
     val emailTransport = createTransport(
         config.email,
         logBodies = !dev.tracedown.common.config.SecretGuard.isProduction(deployEnv),
+    )
+
+    // The suppression list is the only thing this service reads from the
+    // database; it owns no schema and runs no migrations.
+    DatabaseFactory.init(
+        jdbcUrl = config.database.url,
+        username = config.database.user,
+        password = config.database.password,
     )
 
     // Redis connection for BRPOP + idempotency SET NX

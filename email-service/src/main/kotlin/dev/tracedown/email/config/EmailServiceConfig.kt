@@ -12,10 +12,14 @@ import io.ktor.server.application.ApplicationEnvironment
 /**
  * Typed configuration for the email-service.
  */
+data class DatabaseSettings(val url: String, val user: String, val password: String)
+
 data class EmailServiceConfig(
     val redisAUrl: String,
     val email: EmailConfig,
     val popTimeoutSeconds: Long,
+    /** Only for the suppression list — this service owns no schema. */
+    val database: DatabaseSettings,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -26,6 +30,11 @@ data class EmailServiceConfig(
                 email = loadEmailConfig(env),
                 popTimeoutSeconds = config.propertyOrNull("emailService.popTimeoutSeconds")
                     ?.getString()?.toLong() ?: 5L,
+                database = DatabaseSettings(
+                    url = config.property("database.url").getString(),
+                    user = config.property("database.user").getString(),
+                    password = config.property("database.password").getString(),
+                ),
             )
         }
 
@@ -49,11 +58,13 @@ data class EmailServiceConfig(
                 ) else null,
                 resend = if (provider == "resend") ResendConfig(
                     apiKey = config.property("email.resend.apiKey").getString(),
+                    webhookSecret = config.propertyOrNull("email.resend.webhookSecret")?.getString() ?: "",
                 ) else null,
                 mailgun = if (provider == "mailgun") MailgunConfig(
                     apiKey = config.property("email.mailgun.apiKey").getString(),
                     domain = config.property("email.mailgun.domain").getString(),
                     region = config.propertyOrNull("email.mailgun.region")?.getString() ?: "us",
+                    webhookSigningKey = config.propertyOrNull("email.mailgun.webhookSigningKey")?.getString() ?: "",
                 ) else null,
                 console = ConsoleConfig(
                     attachmentDir = config.propertyOrNull("email.console.attachmentDir")?.getString()

@@ -4,6 +4,7 @@ import dev.tracedown.common.email.EmailAttachment
 import dev.tracedown.common.email.EmailMessage
 import dev.tracedown.common.email.EmailStatusEvent
 import dev.tracedown.common.email.EmailTransport
+import dev.tracedown.common.email.SuppressionList
 import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
 import kotlinx.serialization.json.JsonObject
@@ -11,6 +12,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
 import java.util.Base64
 import java.util.UUID
@@ -26,6 +28,11 @@ import java.util.concurrent.ConcurrentHashMap
 open class EmailProcessor(
     private val emailTransport: EmailTransport,
     private val redis: RedisCommands<String, String>?,
+    /**
+     * Whether the suppression list is consultable — false when the service runs
+     * without a database, as the tests and the file/console transports do.
+     */
+    private val suppressionEnabled: Boolean = true,
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -75,6 +82,17 @@ open class EmailProcessor(
                 return
             }
             htmlBody = applyLayout(body, envelope["footer"]?.jsonPrimitive?.contentOrNull)
+        }
+
+        // Withheld before the transport is touched: every producer's mail funnels
+        // through here, so this is the one place that can guarantee a bounced
+        // address is never written to again. Sending anyway is what providers
+        // score as sender abuse, and the damage lands on every other recipient.
+        if (isSuppressed(to)) {
+            log.info("withholding email {} — {} is suppressed", id, to)
+            logDelivery(id, to, subject, source, "suppressed", null)
+            publishStatus(envelope, "suppressed", "recipient suppressed")
+            return
         }
 
         // Send
@@ -155,6 +173,20 @@ open class EmailProcessor(
         }
         val event = EmailStatusEvent(logId, status, error)
         redis.lpush(EmailStatusEvent.QUEUE_KEY, event.toEnvelope().toString())
+    }
+
+    /**
+     * Whether mail to [to] must be withheld. A lookup failure is NOT treated as
+     * suppression: a database blip must not silently stop every notification.
+     */
+    open fun isSuppressed(to: String): Boolean {
+        if (!suppressionEnabled) return false
+        return try {
+            transaction { SuppressionList.isSuppressed(to) }
+        } catch (e: Exception) {
+            log.error("suppression lookup failed for {}, sending anyway: {}", to, e.message)
+            false
+        }
     }
 
     /**
