@@ -6,12 +6,14 @@ post("$baseUrl/api/v1/auth/login", {
 .expect(status: 200)
 .store({ "$$token": this.body.token })
 
-// The list returns an array of preset summaries. (Lace has no array-length
-// operator, so the count itself can't be asserted here.)
+// The list returns an array of preset summaries. Its length is recorded so the
+// create below can be checked as a change to it, rather than against a fixed
+// number that other suites sharing this org could shift.
 get("$baseUrl/api/v1/rule-presets", {
   headers: { Authorization: "Bearer $$token" }
 })
 .expect(status: 200, body: schema($rulePresetListSchema))
+.store({ "$$presetCount": count(this.body) })
 
 // Create an org-scoped preset (no workspaceId).
 post("$baseUrl/api/v1/rule-presets", {
@@ -28,3 +30,10 @@ delete("$baseUrl/api/v1/rule-presets/$$presetId", {
 })
 .expect(status: 200)
 .assert({ expect: [this.body.ok eq true] })
+
+// The list is back where it started.
+get("$baseUrl/api/v1/rule-presets", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [count(this.body) eq $$presetCount] })

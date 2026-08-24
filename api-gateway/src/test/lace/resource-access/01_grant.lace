@@ -21,12 +21,17 @@ put("$baseUrl/api/v1/access/workspace/$$wsId", {
 .expect(status: 200)
 .assert({ expect: [this.body.ok eq true] })
 
-// The access list returns an array of grant entries. (Lace has no array-length
-// operator, so the presence of the specific grant can't be asserted here.)
+// The access list returns an array of grant entries: exactly the one just made.
 get("$baseUrl/api/v1/access/workspace/$$wsId", {
   headers: { Authorization: "Bearer $$token" }
 })
 .expect(status: 200, body: schema($resourceAccessListSchema))
+.assert({
+  expect: [
+    count(this.body) eq 1,
+    includes("$memberId", this.body)
+  ]
+})
 
 // Revoke it.
 delete("$baseUrl/api/v1/access/workspace/$$wsId/user/$memberId", {
@@ -34,3 +39,10 @@ delete("$baseUrl/api/v1/access/workspace/$$wsId/user/$memberId", {
 })
 .expect(status: 200)
 .assert({ expect: [this.body.ok eq true] })
+
+// ...and the list is empty again, which is what "revoked" has to mean.
+get("$baseUrl/api/v1/access/workspace/$$wsId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [count(this.body) eq 0] })

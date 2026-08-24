@@ -29,10 +29,10 @@ post("$baseUrl/api/v1/services", {
 .expect(status: 200)
 .store({ "$$svcId": this.body.id })
 
-// History returns 200 even without data. The zero-filled-bucket count and
-// values are asserted in DashboardMetricsTest — Lace has no array-length
-// operator, so the count can't be checked here.
+// History returns 200 even without data, zero-filled to one bucket per hour
+// asked for. The bucket VALUES are asserted in DashboardMetricsTest.
 get("$baseUrl/api/v1/services/$$svcId/metrics/history?hours=3", {
   headers: { Authorization: "Bearer $$token" }
 })
 .expect(status: 200)
+.assert({ expect: [count(this.body) eq 3] })

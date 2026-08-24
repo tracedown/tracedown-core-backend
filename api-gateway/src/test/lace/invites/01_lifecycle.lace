@@ -16,13 +16,20 @@ post("$baseUrl/api/v1/invites", {
 .expect(status: 200)
 .assert({ expect: [this.body.ok eq true] })
 
-// It appears in the pending list. The list is paged, so the count comes from
-// the `total` field (Lace has no array-length operator).
+// It appears in the pending list. `total` counts the whole result set while
+// count() sees only this page, so both are checked: a paging bug that returned
+// an empty page with a healthy total would otherwise pass.
 get("$baseUrl/api/v1/invites", {
   headers: { Authorization: "Bearer $$token" }
 })
 .expect(status: 200)
-.assert({ expect: [this.body.total gt 0] })
+.assert({
+  expect: [
+    this.body.total gt 0,
+    count(this.body.items) gt 0,
+    includes("newcomer@tracedown.dev", this.body.items)
+  ]
+})
 
 // Re-inviting the same address immediately is rate-limited.
 post("$baseUrl/api/v1/invites", {
