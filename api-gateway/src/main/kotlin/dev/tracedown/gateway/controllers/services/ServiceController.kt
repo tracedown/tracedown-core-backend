@@ -25,6 +25,7 @@ import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.WorkspaceVariables
 import dev.tracedown.common.models.ProjectVariables
+import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
@@ -43,6 +44,8 @@ import dev.tracedown.gateway.data.services.FailedAssertion
 import dev.tracedown.gateway.data.services.LastFailureInfo
 import dev.tracedown.gateway.data.services.ScriptValidationError
 import dev.tracedown.gateway.data.services.ServiceSummary
+import dev.tracedown.gateway.data.services.ScopedToggleResult
+import dev.tracedown.gateway.data.services.SkippedService
 import dev.tracedown.gateway.data.services.ToggleServiceRequest
 import dev.tracedown.gateway.data.services.UpdateScriptRequest
 import dev.tracedown.gateway.data.services.UpdateServiceRequest
@@ -523,6 +526,196 @@ object ServiceController {
         }
     }
 
+    /**
+     * Enables or disables every service in a project.
+     *
+     * @see toggleScope for why this is not a loop over [toggle] on the client.
+     */
+    fun toggleProjectServices(orgId: UUID, projectId: UUID, isActive: Boolean, userId: UUID): ScopedToggleResult {
+        val ctx = ResourceResolver.resolveProject(projectId, orgId)
+        return toggleScope(orgId, userId, isActive, "project", projectId) { cached ->
+            requireProjectWriteAccess(ctx.projectId, ctx.workspaceId, cached)
+            servicesIn(listOf(ctx.projectId), ctx.workspaceId)
+        }
+    }
+
+    /**
+     * Enables or disables every service in every project of a workspace.
+     *
+     * @see toggleScope
+     */
+    fun toggleWorkspaceServices(orgId: UUID, workspaceId: UUID, isActive: Boolean, userId: UUID): ScopedToggleResult {
+        ResourceResolver.resolveWorkspace(workspaceId, orgId)
+        return toggleScope(orgId, userId, isActive, "workspace", workspaceId) { cached ->
+            requireWorkspaceWriteAccess(workspaceId, cached)
+            val projectIds = Projects.selectAll()
+                .where { (Projects.workspaceId eq workspaceId) and (Projects.deleted eq false) }
+                .map { it[Projects.id] }
+            servicesIn(projectIds, workspaceId)
+        }
+    }
+
+    /** A service the scope swept up, with the parents its permission check needs. */
+    private data class ScopedService(
+        val id: UUID,
+        val name: String,
+        val projectId: UUID,
+        val workspaceId: UUID,
+        val isActive: Boolean,
+        val script: String,
+    )
+
+    /** Every non-deleted service under [projectIds]. Ambient transaction. */
+    private fun servicesIn(projectIds: List<UUID>, workspaceId: UUID): List<ScopedService> {
+        if (projectIds.isEmpty()) return emptyList()
+        return Services.selectAll()
+            .where { (Services.projectId inList projectIds) and (Services.deleted eq false) }
+            .map {
+                ScopedService(
+                    id = it[Services.id],
+                    name = it[Services.name],
+                    projectId = it[Services.projectId],
+                    workspaceId = workspaceId,
+                    isActive = it[Services.isActive],
+                    script = it[Services.script],
+                )
+            }
+    }
+
+    /**
+     * The shared body of the scoped toggles: resolve the scope's services, then
+     * apply the ordinary single-service toggle to each one that needs it.
+     *
+     * ## Why this exists
+     *
+     * Toggling one service at a time stops being workable somewhere around a
+     * dozen, and a project can hold hundreds. The batch endpoint is no answer:
+     * it caps at ten sub-requests and each is its own transaction, so switching
+     * a project back on becomes twenty round-trips that can half-fail. Anything
+     * that switches many services off at once — an operator quieting a noisy
+     * environment, a host application acting on its own policy — otherwise
+     * leaves no practical way back.
+     *
+     * ## Why it re-enters `service.toggle` per service
+     *
+     * Every guard, hook and side effect that governs toggling one service has to
+     * govern toggling two hundred, and the only way to be sure of that is to run
+     * the same operation rather than a parallel implementation of it. So each
+     * service goes through [Interceptors] under the same `service.toggle` key,
+     * writes the same audit row, and emits the same outbox and realtime events.
+     * A host application that gates that operation gates this one for free, and
+     * cannot be circumvented by reaching for the scope instead.
+     *
+     * All of it runs in ONE transaction, so a hook that refuses part-way leaves
+     * nothing changed rather than a project half switched on. Nested
+     * `injectableInTx` calls join this transaction rather than opening their own.
+     *
+     * Services already in the requested state are passed over entirely, hooks
+     * included: asking to enable what is already enabled must not be put to the
+     * hooks, or a re-run could be refused where the first run succeeded.
+     */
+    private fun toggleScope(
+        orgId: UUID,
+        userId: UUID,
+        isActive: Boolean,
+        scopeType: String,
+        scopeId: UUID,
+        resolve: (CachedPermissions) -> List<ScopedService>,
+    ): ScopedToggleResult {
+        val skipped = mutableListOf<SkippedService>()
+        val changedIds = mutableListOf<Pair<UUID, UUID>>()
+        var matched = 0
+        var unchanged = 0
+
+        transaction {
+            val cached = requireCachedPermissions(orgId, userId)
+            val services = resolve(cached)
+            matched = services.size
+
+            for (svc in services) {
+                if (svc.isActive == isActive) {
+                    unchanged++
+                    continue
+                }
+                // Scope write access is not service write access: a member can
+                // hold the project and still be denied one service inside it.
+                if (!canWriteResource(cached, "service", svc.id, listOf("project::${svc.projectId}", "workspace::${svc.workspaceId}"))) {
+                    skipped += SkippedService(svc.id.toString(), svc.name, "forbidden")
+                    continue
+                }
+                if (isActive) {
+                    // Same precondition as the single toggle: a service with no
+                    // script, or one that no longer validates, must not reach
+                    // dispatch. Skipped rather than fatal — one stale script in a
+                    // project of two hundred should not veto the other 199.
+                    if (svc.script.isBlank()) {
+                        skipped += SkippedService(svc.id.toString(), svc.name, "script_missing")
+                        continue
+                    }
+                    if (validateScript(svc.script).isNotEmpty()) {
+                        skipped += SkippedService(svc.id.toString(), svc.name, "script_invalid")
+                        continue
+                    }
+                }
+
+                Interceptors.injectableInTx(
+                    "service.toggle",
+                    InterceptorContext(
+                        orgId = orgId, userId = userId, workspaceId = svc.workspaceId,
+                        projectId = svc.projectId, serviceId = svc.id,
+                        extra = mutableMapOf("isActive" to isActive),
+                    ),
+                ) {
+                    Services.update({ (Services.id eq svc.id) and (Services.projectId eq svc.projectId) }) {
+                        it[Services.isActive] = isActive
+                    }
+                    AuditService.log(
+                        orgId, userId, if (isActive) "enable.service" else "disable.service",
+                        "service", svc.id.toString(),
+                        entityDisplayName = svc.name,
+                        diff = auditDiff(Triple("isActive", !isActive, isActive)),
+                    )
+                    OutboxEmit.emitResourceEvent(
+                        "resource.service.updated", "service", svc.id,
+                        buildJsonObject {
+                            put("id", svc.id.toString()); put("orgId", orgId.toString())
+                            put("parentId", svc.projectId.toString())
+                        },
+                    )
+                }
+                changedIds += svc.id to svc.projectId
+            }
+
+            // The scope itself is the fact an operator will look for later — the
+            // per-service rows say what moved, this says one person asked for all
+            // of it at once.
+            if (changedIds.isNotEmpty()) {
+                AuditService.log(
+                    orgId, userId,
+                    if (isActive) "enable.services.scope" else "disable.services.scope",
+                    scopeType, scopeId.toString(),
+                    comment = "${changedIds.size} of $matched service(s)",
+                )
+            }
+        }
+
+        // After commit: nothing here may run against work that rolled back.
+        for ((serviceId, projectId) in changedIds) {
+            publishNudge(serviceId)
+            RealtimePublisher.publish(
+                "project:$projectId", orgId, "service.updated",
+                buildJsonObject { put("serviceId", serviceId.toString()) },
+            )
+        }
+
+        return ScopedToggleResult(
+            matched = matched,
+            changed = changedIds.size,
+            unchanged = unchanged,
+            skipped = skipped,
+        )
+    }
+
     private fun validateScript(script: String): List<ScriptValidationError> {
         return try {
             val ast = dev.lacelang.validator.parse(script)
@@ -923,6 +1116,12 @@ object ServiceController {
     private fun requireServiceAccess(serviceId: UUID, projectId: UUID, workspaceId: UUID, cached: CachedPermissions) {
         val parentChain = listOf("project::$projectId", "workspace::$workspaceId")
         if (!canAccessResource(cached, "service", serviceId, parentChain)) {
+            throw NotFoundException()
+        }
+    }
+
+    private fun requireWorkspaceWriteAccess(workspaceId: UUID, cached: CachedPermissions) {
+        if (!canWriteResource(cached, "workspace", workspaceId, emptyList())) {
             throw NotFoundException()
         }
     }

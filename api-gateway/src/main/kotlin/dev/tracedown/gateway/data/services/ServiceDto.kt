@@ -60,6 +60,37 @@ data class ToggleServiceRequest(
     val isActive: Boolean,
 )
 
+/**
+ * One service a scoped toggle did not act on, and why.
+ *
+ * A scope is a blunt instrument — it names a project, not the services in it —
+ * so some of what it sweeps up will not be actionable. Naming each one is the
+ * difference between "34 of 40 enabled" and knowing which six to go and fix.
+ */
+@Serializable
+data class SkippedService(
+    val serviceId: String,
+    val name: String,
+    /** `forbidden`, `script_missing` or `script_invalid`. */
+    val reason: String,
+)
+
+/** Outcome of enabling or disabling every service in a project or workspace. */
+@Serializable
+data class ScopedToggleResult(
+    /** Services the scope covered, before any were filtered out. */
+    val matched: Int,
+    /** Services whose `isActive` actually moved. */
+    val changed: Int,
+    /**
+     * Already in the requested state, so left untouched. Counted rather than
+     * listed: this is the ordinary case for a re-run, not something to act on.
+     */
+    val unchanged: Int,
+    /** Covered by the scope but not acted on — see [SkippedService.reason]. */
+    val skipped: List<SkippedService>,
+)
+
 /** Returned when script validation fails. */
 @Serializable
 data class ScriptValidationError(

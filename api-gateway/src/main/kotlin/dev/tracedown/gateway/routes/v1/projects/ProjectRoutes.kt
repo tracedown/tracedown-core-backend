@@ -4,7 +4,9 @@ import dev.tracedown.gateway.controllers.projects.ProjectController
 import dev.tracedown.gateway.controllers.variables.VariableHierarchyController
 import dev.tracedown.gateway.data.CreateVariableRequest
 import dev.tracedown.gateway.data.UpdateVariableRequest
+import dev.tracedown.gateway.controllers.services.ServiceController
 import dev.tracedown.gateway.data.projects.CreateProjectRequest
+import dev.tracedown.gateway.data.services.ToggleServiceRequest
 import dev.tracedown.gateway.data.projects.UpdateProjectRequest
 import dev.tracedown.gateway.routes.v1
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
@@ -27,6 +29,9 @@ import io.ktor.server.resources.post
 class Projects {
     @Resource("{id}")
     class ById(val parent: Projects = Projects(), val id: String) {
+        @Resource("services/toggle")
+        class ServicesToggle(val parent: ById)
+
         @Resource("variables")
         class Variables(val parent: ById) {
             @Resource("hierarchy")
@@ -63,6 +68,17 @@ fun Route.projectRoutes() {
         val (principal, orgId) = requireAuthWithOrg(call)
         val projId = parseUuid(resource.id, "id")
         call.respond(ProjectController.get(orgId, projId, principal.userId))
+    }
+
+    /**
+     * Enables or disables every service in the project, in one transaction.
+     * Reports what moved, what was already there, and what was skipped.
+     */
+    patch<Projects.ById.ServicesToggle> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val projId = parseUuid(resource.parent.id, "id")
+        val body = tryReceive<ToggleServiceRequest>(call)
+        call.respond(ServiceController.toggleProjectServices(orgId, projId, body.isActive, principal.userId))
     }
 
     /** Updates a project's name. */

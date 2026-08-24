@@ -4,6 +4,8 @@ import dev.tracedown.gateway.controllers.workspaces.WorkspaceController
 import dev.tracedown.gateway.controllers.variables.VariableHierarchyController
 import dev.tracedown.gateway.data.CreateVariableRequest
 import dev.tracedown.gateway.data.UpdateVariableRequest
+import dev.tracedown.gateway.controllers.services.ServiceController
+import dev.tracedown.gateway.data.services.ToggleServiceRequest
 import dev.tracedown.gateway.data.workspaces.CreateWorkspaceRequest
 import dev.tracedown.gateway.data.workspaces.UpdateWorkspaceRequest
 import dev.tracedown.gateway.routes.v1
@@ -27,6 +29,9 @@ import io.ktor.server.resources.post
 class Workspaces {
     @Resource("{workspaceId}")
     class ById(val parent: Workspaces = Workspaces(), val workspaceId: String) {
+        @Resource("services/toggle")
+        class ServicesToggle(val parent: ById)
+
         @Resource("variables")
         class Variables(val parent: ById) {
             @Resource("hierarchy")
@@ -61,6 +66,17 @@ fun Route.workspaceRoutes() {
         val (principal, orgId) = requireAuthWithOrg(call)
         val wsId = parseUuid(resource.workspaceId, "workspace ID")
         call.respond(WorkspaceController.get(orgId, wsId, principal.userId))
+    }
+
+    /**
+     * Enables or disables every service in every project of the workspace, in one
+     * transaction. Reports what moved, what was already there, and what was skipped.
+     */
+    patch<Workspaces.ById.ServicesToggle> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val wsId = parseUuid(resource.parent.workspaceId, "workspaceId")
+        val body = tryReceive<ToggleServiceRequest>(call)
+        call.respond(ServiceController.toggleWorkspaceServices(orgId, wsId, body.isActive, principal.userId))
     }
 
     /** Updates a workspace's name. */

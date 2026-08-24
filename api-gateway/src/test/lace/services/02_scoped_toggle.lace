@@ -1,0 +1,175 @@
+// Scoped enable/disable: every service in a project, and every service in a
+// workspace. Covers the counts the response reports, the re-run being a no-op,
+// and a service that cannot be enabled being skipped rather than failing the batch.
+
+// Login
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// ── A workspace with two projects ──
+post("$baseUrl/api/v1/workspaces", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "ScopeToggleWs" })
+})
+.expect(status: 200)
+.store({ "$$wsId": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "ScopeProjA" })
+})
+.expect(status: 200)
+.store({ "$$projA": this.body.id })
+
+post("$baseUrl/api/v1/projects", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ workspaceId: "$$wsId", name: "ScopeProjB" })
+})
+.expect(status: 200)
+.store({ "$$projB": this.body.id })
+
+// ── Project A: two runnable services ──
+// Services are created disabled with an empty script, so each needs a valid one
+// before it can be enabled at all.
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projA", name: "A One", label: "a-one" })
+})
+.expect(status: 200)
+.store({ "$$svcA1": this.body.id })
+
+patch("$baseUrl/api/v1/services/$$svcA1/script", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ script: "get(\"https://example.com\").expect(status: 200)", version: 1 })
+})
+.expect(status: 200)
+
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projA", name: "A Two", label: "a-two" })
+})
+.expect(status: 200)
+.store({ "$$svcA2": this.body.id })
+
+patch("$baseUrl/api/v1/services/$$svcA2/script", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ script: "get(\"https://example.com\").expect(status: 200)", version: 1 })
+})
+.expect(status: 200)
+
+// ── Project A: a third service left with no script ──
+// It is in scope and must be reported, not silently dropped and not fatal.
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projA", name: "A Scriptless", label: "a-none" })
+})
+.expect(status: 200)
+.store({ "$$svcA3": this.body.id })
+
+// ── Enable everything in project A ──
+patch("$baseUrl/api/v1/projects/$$projA/services/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: true })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.matched eq 3,
+    this.body.changed eq 2,
+    this.body.unchanged eq 0,
+    count(this.body.skipped) eq 1,
+    includes("$$svcA3", this.body.skipped),
+    includes("script_missing", this.body.skipped)
+  ]
+})
+
+// The two runnable ones really did move.
+get("$baseUrl/api/v1/services/$$svcA1", { headers: { Authorization: "Bearer $$token" } })
+.expect(status: 200)
+.assert({ expect: [this.body.isActive eq true] })
+
+get("$baseUrl/api/v1/services/$$svcA3", { headers: { Authorization: "Bearer $$token" } })
+.expect(status: 200)
+.assert({ expect: [this.body.isActive eq false] })
+
+// ── Re-running is a no-op ──
+// Nothing left to change, and the scriptless one is still reported.
+patch("$baseUrl/api/v1/projects/$$projA/services/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: true })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.matched eq 3,
+    this.body.changed eq 0,
+    this.body.unchanged eq 2,
+    count(this.body.skipped) eq 1,
+    includes("script_missing", this.body.skipped)
+  ]
+})
+
+// ── Project B: one runnable service, still disabled ──
+post("$baseUrl/api/v1/services", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ projectId: "$$projB", name: "B One", label: "b-one" })
+})
+.expect(status: 200)
+.store({ "$$svcB1": this.body.id })
+
+patch("$baseUrl/api/v1/services/$$svcB1/script", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ script: "get(\"https://example.com\").expect(status: 200)", version: 1 })
+})
+.expect(status: 200)
+
+// ── The workspace scope reaches across both projects ──
+// Four services in total; two already enabled in A, B's one still to go.
+patch("$baseUrl/api/v1/workspaces/$$wsId/services/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: true })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.matched eq 4,
+    this.body.changed eq 1,
+    this.body.unchanged eq 2,
+    count(this.body.skipped) eq 1
+  ]
+})
+
+get("$baseUrl/api/v1/services/$$svcB1", { headers: { Authorization: "Bearer $$token" } })
+.expect(status: 200)
+.assert({ expect: [this.body.isActive eq true] })
+
+// ── Disabling needs no script, so nothing is skipped ──
+// The scriptless service is disabled already, so it counts as unchanged rather
+// than skipped — the script precondition belongs to enabling alone.
+patch("$baseUrl/api/v1/workspaces/$$wsId/services/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: false })
+})
+.expect(status: 200)
+.assert({
+  expect: [
+    this.body.matched eq 4,
+    this.body.changed eq 3,
+    this.body.unchanged eq 1,
+    count(this.body.skipped) eq 0
+  ]
+})
+
+get("$baseUrl/api/v1/services/$$svcA1", { headers: { Authorization: "Bearer $$token" } })
+.expect(status: 200)
+.assert({ expect: [this.body.isActive eq false] })
+
+// ── A scope the caller cannot reach is a 404, not an empty success ──
+patch("$baseUrl/api/v1/projects/00000000-0000-0000-0000-000000000000/services/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: false })
+})
+.expect(status: 404)
