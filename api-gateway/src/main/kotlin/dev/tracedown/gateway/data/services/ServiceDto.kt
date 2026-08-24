@@ -103,6 +103,14 @@ data class ScopedToggleResult(
      * more" instead of implying the list is complete.
      */
     val skippedTotal: Int,
+    /**
+     * Skip count per reason, over ALL skips rather than the capped sample.
+     *
+     * This is what stays useful as the scope grows: fifty names out of five
+     * thousand tells the reader almost nothing, while "4,950 have no script
+     * yet, 2 you cannot edit" tells them exactly what to go and do.
+     */
+    val skippedByReason: Map<String, Int>,
 )
 
 /**

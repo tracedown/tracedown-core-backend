@@ -179,7 +179,8 @@ patch("$baseUrl/api/v1/projects/$$projA/services/toggle", {
 .assert({
   expect: [
     this.body.skippedTotal eq 1,
-    count(this.body.skipped) eq this.body.skippedTotal
+    count(this.body.skipped) eq this.body.skippedTotal,
+    this.body.skippedByReason.script_missing eq 1
   ]
 })
 

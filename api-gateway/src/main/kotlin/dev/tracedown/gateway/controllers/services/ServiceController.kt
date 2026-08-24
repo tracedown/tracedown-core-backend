@@ -628,12 +628,16 @@ object ServiceController {
         var matched = 0
         var unchanged = 0
         var skippedTotal = 0
+        val skippedByReason = mutableMapOf<String, Int>()
 
         // Counts every skip; keeps only the first [SKIPPED_DETAIL_LIMIT] by name.
         // Capped as it is built rather than trimmed at the end, so a scope of
         // thousands never materialises thousands of rows to throw most away.
+        // The per-reason tally is not capped — it is a handful of integers, and
+        // it is the part that survives being useful at any size.
         fun skip(svc: ScopedService, reason: String) {
             skippedTotal++
+            skippedByReason.merge(reason, 1, Int::plus)
             if (skipped.size < SKIPPED_DETAIL_LIMIT) {
                 skipped += SkippedService(svc.id.toString(), svc.name, reason)
             }
@@ -726,6 +730,7 @@ object ServiceController {
             unchanged = unchanged,
             skipped = skipped,
             skippedTotal = skippedTotal,
+            skippedByReason = skippedByReason,
         )
     }
 
