@@ -53,6 +53,8 @@ data class AgentSummary(
     val lastStatus: String,
     val lastPing: String?,
     val lastPongDeltaMs: Int?,
+    val encryptPayload: Boolean,
+    val supportsEncryptedPayload: Boolean,
     val createdAt: String,
 )
 
@@ -69,8 +71,14 @@ data class CreateBootstrapTokenRequest(val slug: String, val label: String? = nu
 @Serializable
 data class BootstrapTokenResponse(val slug: String, val token: String, val expiresAt: String)
 
+/**
+ * Partial update — an absent field is left as it is.
+ *
+ * `supportsEncryptedPayload` is deliberately not here: it is the agent's own
+ * report of what it can do, refreshed by the health challenge, never a choice.
+ */
 @Serializable
-data class UpdateAgentRequest(val isActive: Boolean)
+data class UpdateAgentRequest(val isActive: Boolean? = null, val encryptPayload: Boolean? = null)
 
 @Serializable
 data class AgentHealthCheck(
@@ -87,8 +95,9 @@ private val SLUG_RE = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
 /**
  * @OpenAPITag Agents
  * Probe-agent fleet management: registered-agent list, bootstrap-token
- * generation (the API twin of the `--agent-bootstrap` CLI), activation
- * toggle. Agents are platform infrastructure — gated on org settings.
+ * generation (the API twin of the `--agent-bootstrap` CLI), activation and
+ * payload-sealing toggles. Agents are platform infrastructure — gated on org
+ * settings.
  */
 @Resource("/api/v1/agents")
 class AgentAdmin {
@@ -125,6 +134,8 @@ fun Route.agentAdminRoutes() {
                         lastStatus = row[ProbeAgents.lastStatus],
                         lastPing = row[ProbeAgents.lastPing].toString(),
                         lastPongDeltaMs = row[ProbeAgents.lastPongDeltaMs],
+                        encryptPayload = row[ProbeAgents.encryptPayload],
+                        supportsEncryptedPayload = row[ProbeAgents.supportsEncryptedPayload],
                         createdAt = row[ProbeAgents.createdAt].toString(),
                     )
                 }
@@ -255,25 +266,40 @@ fun Route.agentAdminRoutes() {
         call.respond(mapOf("ok" to true))
     }
 
-    /** Activates/deactivates an agent (inactive agents are never selected). */
+    /**
+     * Updates the operator-set flags on an agent: activation (inactive agents
+     * are never selected) and payload sealing. Sealing is accepted even for an
+     * agent that reports no support — the scheduler warns and dispatches
+     * unsealed, so an agent upgraded after the fact needs no second visit here.
+     */
     patch<AgentAdmin.BySlug> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val body = tryReceive<UpdateAgentRequest>(call)
+        if (body.isActive == null && body.encryptPayload == null) throw BadRequestException(ErrorCodes.FIELD_INVALID)
         Interceptors.injectableInTx(
             "agent.update",
             InterceptorContext(orgId = orgId, userId = principal.userId, extra = mutableMapOf("slug" to resource.slug)),
         ) {
             requireOrgWrite(orgId, principal.userId) { it.settings }
-            val updated = ProbeAgents.update({ (ProbeAgents.slug eq resource.slug) and (ProbeAgents.deleted eq false) }) {
-                it[isActive] = body.isActive
+            val updated = ProbeAgents.update({ (ProbeAgents.slug eq resource.slug) and (ProbeAgents.deleted eq false) }) { stmt ->
+                if (body.isActive != null) stmt[isActive] = body.isActive
+                if (body.encryptPayload != null) stmt[encryptPayload] = body.encryptPayload
             }
             if (updated == 0) throw NotFoundException()
-            AuditService.log(
-                orgId, principal.userId,
-                if (body.isActive) "activate.agent" else "deactivate.agent",
-                "agent", resource.slug,
-                entityDisplayName = resource.slug,
-            )
+            if (body.isActive != null) {
+                AuditService.log(
+                    orgId, principal.userId,
+                    if (body.isActive) "activate.agent" else "deactivate.agent",
+                    "agent", resource.slug,
+                    entityDisplayName = resource.slug,
+                )
+            }
+            if (body.encryptPayload != null) {
+                AuditService.log(
+                    orgId, principal.userId, "update.agent", "agent", resource.slug,
+                    entityDisplayName = resource.slug,
+                )
+            }
         }
         call.respond(mapOf("ok" to true))
     }

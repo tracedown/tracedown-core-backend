@@ -118,6 +118,12 @@ class HealthChallengeJob : Job {
 
             val success = body["success"]?.jsonPrimitive?.boolean ?: false
             val returnedToken = body["token"]?.jsonPrimitive?.content
+            // Capability, not configuration: an agent that cannot open a sealed
+            // dispatch says so here, and the sealing decision refuses to act on
+            // the operator's toggle without it. Absent (an older agent that does
+            // not send the field) reads as false, which is the safe direction.
+            val supportsSealed = body["payloadEncryption"]?.jsonPrimitive?.boolean
+                ?: body["payload_encryption"]?.jsonPrimitive?.boolean ?: false
 
             val result = when {
                 !success -> "fail"
@@ -125,14 +131,17 @@ class HealthChallengeJob : Job {
                 else -> "wrong_token"
             }
 
-            recordResult(agent.id, agent.slug, challengeId, challengedAt, respondedAt, roundTripMs, result)
+            recordResult(agent.id, agent.slug, challengeId, challengedAt, respondedAt, roundTripMs, result, supportsSealed)
             log.debug("health challenge {} for agent {}: {}", challengeId, agent.slug, result)
         } catch (e: Exception) {
             val respondedAt = Instant.now()
             val roundTripMs = (respondedAt.toEpochMilli() - challengedAt.toEpochMilli()).toInt()
             val result = if (e is kotlinx.coroutines.TimeoutCancellationException) "timeout" else "fail"
 
-            recordResult(agent.id, agent.slug, challengeId, challengedAt, respondedAt, roundTripMs, result)
+            // No answer came back, so nothing was learned about capability —
+            // null leaves the last observation in place rather than clearing it
+            // on a timeout.
+            recordResult(agent.id, agent.slug, challengeId, challengedAt, respondedAt, roundTripMs, result, null)
             log.warn("health challenge for agent {} failed: {}", agent.slug, e.message)
         }
     }
@@ -148,6 +157,7 @@ class HealthChallengeJob : Job {
         respondedAt: Instant,
         roundTripMs: Int,
         result: String,
+        supportsSealed: Boolean?,
     ) {
         val status = if (result == "pass") "success" else "failure"
         transaction {
@@ -167,6 +177,7 @@ class HealthChallengeJob : Job {
                 it[lastStatus] = status
                 it[lastPingDelayMs] = 0
                 it[lastPongDeltaMs] = roundTripMs
+                if (supportsSealed != null) it[supportsEncryptedPayload] = supportsSealed
             }
         }
 

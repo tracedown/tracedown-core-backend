@@ -9,6 +9,7 @@ import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
+import dev.tracedown.scheduler.crypto.PayloadSealing
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -30,6 +31,12 @@ import org.slf4j.LoggerFactory
  */
 class AgentDispatchService(
     private val clientFactory: AgentMtlsClientFactory,
+    /**
+     * Seals the payload to the agent's certificate on top of mTLS. Null (the
+     * default) keeps the wire exactly as it was — this is opt-in, and an
+     * installation that never turns it on is unaffected by any of it.
+     */
+    private val sealing: PayloadSealing? = null,
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -94,17 +101,21 @@ class AgentDispatchService(
         // certificate identity, so this body (scripts + resolved secrets) can
         // only be delivered to the intended agent.
         val client = clientFactory.client(expectedSlug)
+        // Sealed or plain is decided per agent, so a fleet can be upgraded a
+        // node at a time. The agent answers in whichever shape it was asked in.
+        val wire = sealing?.seal(expectedSlug, body) ?: body
         return try {
             val response = client.post("$agentUri/probe") {
                 contentType(ContentType.Application.Json)
-                setBody(body)
+                setBody(wire)
                 timeout {
                     requestTimeoutMillis = clientTimeoutMs
                     socketTimeoutMillis = clientTimeoutMs
                 }
             }
 
-            DispatchResult(Json.decodeFromString<JsonObject>(response.bodyAsText()), agentEgressBytes)
+            val decoded = Json.decodeFromString<JsonObject>(response.bodyAsText())
+            DispatchResult(sealing?.open(decoded) ?: decoded, agentEgressBytes)
         } catch (e: HttpRequestTimeoutException) {
             log.warn("dispatch to {} timed out after {}ms — recording timeout result", agentUri, clientTimeoutMs)
             DispatchResult(syntheticTimeout(clientTimeoutMs), agentEgressBytes)

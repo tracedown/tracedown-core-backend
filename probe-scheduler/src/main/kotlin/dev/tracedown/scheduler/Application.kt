@@ -5,6 +5,7 @@ import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.util.VariableCrypto
 import dev.tracedown.scheduler.config.SchedulerConfig
 import dev.tracedown.scheduler.crypto.AgentMtlsClientFactory
+import dev.tracedown.scheduler.crypto.PayloadSealing
 import dev.tracedown.scheduler.crypto.RevocationChecker
 import dev.tracedown.scheduler.crypto.SchedulerCertService
 import dev.tracedown.scheduler.dispatch.AgentDispatchService
@@ -76,8 +77,21 @@ fun Application.module() {
 
     // Probe execution: the agent backend (slug-pinned mTLS dispatch) by
     // default, or whatever backend the host registered.
+    // Payload sealing on top of mTLS, decided per agent at dispatch time. Null
+    // only when the fleet-wide kill switch is off; an agent that has not opted
+    // in is unaffected either way.
+    val sealing = if (!config.probe.payloadEncryptionEnabled) {
+        log.info("probe payload encryption disabled fleet-wide")
+        null
+    } else {
+        PayloadSealing(
+            schedulerCertPem = certService.certificatePem,
+            schedulerKey = certService.privateKey,
+        )
+    }
+
     val executionBackend = ProbeExecutionBackends.provider?.invoke()
-        ?: AgentExecutionBackend(AgentSelector(redis), AgentDispatchService(agentClientFactory))
+        ?: AgentExecutionBackend(AgentSelector(redis), AgentDispatchService(agentClientFactory, sealing))
 
     // Queue policy
     val queuePolicy = QueuePolicyManager(redis)

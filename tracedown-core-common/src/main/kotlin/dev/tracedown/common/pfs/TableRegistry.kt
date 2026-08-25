@@ -71,8 +71,9 @@ object TableRegistry {
         ),
         "services" to setOf(
             "id", "project_id", "name", "label", "schedule", "probe_mode",
-            "queue_policy", "service_window", "is_active", "last_status",
-            "last_status_since", "last_status_consecutive", "last_run_id",
+            "queue_policy", "service_window", "save_response_bodies",
+            "is_active", "last_status", "last_status_since",
+            "last_status_consecutive", "last_run_id",
             "version", "deleted", "deleted_at", "purge_after", "created_at",
         ),
         "probe_results" to setOf(

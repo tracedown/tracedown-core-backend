@@ -175,6 +175,7 @@ object ServiceController {
                 it[name] = request.name
                 it[label] = request.label
                 it[schedule] = request.schedule ?: "*/5 * * * *"
+                it[saveResponseBodies] = request.saveResponseBodies ?: true
                 it[isActive] = false
                 it[deleted] = false
                 it[createdAt] = now
@@ -315,6 +316,7 @@ object ServiceController {
                 request.queuePolicy?.let { v -> it[queuePolicy] = v }
                 // Blank clears the window (the request field is null when unchanged).
                 request.serviceWindow?.let { v -> it[serviceWindow] = v.trim().ifBlank { null } }
+                request.saveResponseBodies?.let { v -> it[saveResponseBodies] = v }
             }
 
             AuditService.log(
@@ -329,6 +331,10 @@ object ServiceController {
                     Triple(
                         "serviceWindow", old[Services.serviceWindow],
                         request.serviceWindow?.trim()?.ifBlank { null } ?: old[Services.serviceWindow],
+                    ),
+                    Triple(
+                        "saveResponseBodies", old[Services.saveResponseBodies],
+                        request.saveResponseBodies ?: old[Services.saveResponseBodies],
                     ),
                 ),
             )
@@ -1171,6 +1177,7 @@ object ServiceController {
         probeMode = row[Services.probeMode],
         queuePolicy = row[Services.queuePolicy],
         serviceWindow = row[Services.serviceWindow],
+        saveResponseBodies = row[Services.saveResponseBodies],
         isActive = row[Services.isActive],
         lastStatus = row[Services.lastStatus],
         lastStatusSince = row[Services.lastStatusSince]?.toString(),

@@ -34,6 +34,13 @@ data class SchedulerConfig(
         val maxTimeoutMs: Int,
         /** Maximum redirect hops (executor.maxRedirects). */
         val maxRedirects: Int,
+        /**
+         * Fleet-wide kill switch for payload sealing. Whether a given dispatch
+         * is sealed is a per-agent setting; this only exists so an operator can
+         * turn the whole mechanism off from the environment, without editing
+         * rows, if it ever misbehaves in production.
+         */
+        val payloadEncryptionEnabled: Boolean = true,
     )
 
     companion object {
@@ -66,6 +73,8 @@ data class SchedulerConfig(
                         ?.getString()?.toIntOrNull() ?: 300_000,
                     maxRedirects = config.propertyOrNull("probe.maxRedirects")
                         ?.getString()?.toIntOrNull() ?: 10,
+                    payloadEncryptionEnabled = config.propertyOrNull("probe.payloadEncryptionEnabled")
+                        ?.getString()?.toBooleanStrictOrNull() ?: true,
                 ),
             )
         }

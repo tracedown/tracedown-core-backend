@@ -90,8 +90,8 @@ class LaceIntegrationTest {
                 listOf("id", "workspaceId", "name", "createdAt", "serviceCount"),
             ),
             "serviceSchema" to objSchema(
-                mapOf("id" to "string", "projectId" to "string", "name" to "string", "script" to "string", "schedule" to "string", "probeMode" to "string", "queuePolicy" to "string", "isActive" to "boolean", "version" to "integer", "createdAt" to "string"),
-                listOf("id", "projectId", "name", "script", "schedule", "probeMode", "queuePolicy", "isActive", "version", "createdAt"),
+                mapOf("id" to "string", "projectId" to "string", "name" to "string", "script" to "string", "schedule" to "string", "probeMode" to "string", "queuePolicy" to "string", "saveResponseBodies" to "boolean", "isActive" to "boolean", "version" to "integer", "createdAt" to "string"),
+                listOf("id", "projectId", "name", "script", "schedule", "probeMode", "queuePolicy", "saveResponseBodies", "isActive", "version", "createdAt"),
             ),
             "usageSchema" to objSchema(
                 mapOf("windowHours" to "integer", "requests" to "integer", "ingressBytes" to "integer", "egressBytes" to "integer", "agentEgressBytes" to "integer"),

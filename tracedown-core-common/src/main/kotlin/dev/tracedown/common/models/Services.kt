@@ -13,6 +13,8 @@ object Services : Table("services") {
     val probeMode = varchar("probe_mode", 16).default("consecutive")
     val queuePolicy = varchar("queue_policy", 16).default("skip")
     val serviceWindow = varchar("service_window", 256).nullable()
+    /** Permits the executor to store response bodies; dispatch may still withhold it. */
+    val saveResponseBodies = bool("save_response_bodies").default(true)
     val isActive = bool("is_active").default(true)
     val lastStatus = varchar("last_status", 8).nullable()
     val lastStatusSince = timestamp("last_status_since").nullable()
