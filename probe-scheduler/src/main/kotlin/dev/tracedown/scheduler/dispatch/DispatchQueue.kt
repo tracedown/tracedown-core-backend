@@ -195,8 +195,11 @@ class DispatchQueue(
             val ctx = transaction { resolveContext(serviceId) } ?: return
 
             // Anti-abuse limits for unverified target domains (spec §18.4):
-            // max 3 calls, no body saving, min 5-minute interval.
-            var allowBodySave = true
+            // max 3 calls, no body saving, min 5-minute interval. The rule
+            // below narrows the service's own setting — it never widens it, so
+            // a service that saves bodies still loses them on unverified
+            // domains.
+            var allowBodySave = service[Services.saveResponseBodies]
             if (!trustedDomainMode) {
                 val varsMap = variables.mapValues { (_, v) -> v.jsonPrimitive.content }
                 val policy = transaction { DomainPolicy.evaluate(script, varsMap, ctx.orgId) }

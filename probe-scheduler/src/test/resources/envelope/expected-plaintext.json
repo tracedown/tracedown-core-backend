@@ -1,0 +1,1 @@
+{"script": "GET https://example.test", "variables": {"s_token": "hunter2"}}

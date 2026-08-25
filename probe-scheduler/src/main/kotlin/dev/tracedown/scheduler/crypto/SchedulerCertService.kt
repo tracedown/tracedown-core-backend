@@ -43,6 +43,19 @@ class SchedulerCertService(private val aesKeyHex: String) {
         private set
     lateinit var privateKey: PrivateKey
         private set
+
+    /**
+     * [certificate] in PEM, for sealing into a dispatch so the agent can seal
+     * its answer back. Derived rather than stored: the certificate is ephemeral
+     * and regenerated on every start, so there is no PEM to keep.
+     */
+    val certificatePem: String
+        get() = buildString {
+            append("-----BEGIN CERTIFICATE-----\n")
+            append(java.util.Base64.getMimeEncoder(64, "\n".toByteArray()).encodeToString(certificate.encoded))
+            append("\n-----END CERTIFICATE-----\n")
+        }
+
     lateinit var caCertificate: X509Certificate
         private set
 

@@ -11,6 +11,7 @@ data class CreateServiceRequest(
     val name: String,
     val label: String? = null,
     val schedule: String? = null,
+    val saveResponseBodies: Boolean? = null,
 ) : Validatable {
     override fun validate() = buildList {
         Validators.notBlank("projectId", projectId)?.let(::add)
@@ -30,6 +31,7 @@ data class UpdateServiceRequest(
     val probeMode: String? = null,
     val queuePolicy: String? = null,
     val serviceWindow: String? = null,
+    val saveResponseBodies: Boolean? = null,
 ) : Validatable {
     override fun validate() = buildList {
         Validators.maxLen("name", name, 128)?.let(::add)
@@ -142,6 +144,8 @@ data class ServiceSummary(
     val probeMode: String,
     val queuePolicy: String,
     val serviceWindow: String?,
+    /** When false, runs are dispatched with body saving off — no stored body to inspect. */
+    val saveResponseBodies: Boolean,
     val isActive: Boolean,
     val lastStatus: String?,
     val lastStatusSince: String?,

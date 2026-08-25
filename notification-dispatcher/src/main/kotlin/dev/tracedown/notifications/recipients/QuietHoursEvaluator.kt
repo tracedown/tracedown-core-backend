@@ -44,7 +44,15 @@ object QuietHoursEvaluator {
             60L
         }
         val zoneName = if (parts.size > 2) parts.drop(2).joinToString("/") else defaultZone
-        val zone = TimeZone.getTimeZone(zoneName)
+        // Validate before converting: TimeZone.getTimeZone silently answers GMT
+        // for an id it does not know, so a typo'd zone would not be rejected —
+        // it would quietly move someone's quiet hours to GMT and suppress
+        // alerts at the wrong times. ZoneId.of throws instead.
+        val zone = try {
+            TimeZone.getTimeZone(java.time.ZoneId.of(zoneName))
+        } catch (e: java.time.DateTimeException) {
+            return false
+        }
         val windowMs = durationMinutes * 60_000L
 
         return try {

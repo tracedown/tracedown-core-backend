@@ -36,7 +36,8 @@ post("$baseUrl/api/v1/services", {
     this.body.isActive eq false,
     this.body.script eq "",
     this.body.version eq 1,
-    this.body.probeMode eq "consecutive"
+    this.body.probeMode eq "consecutive",
+    this.body.saveResponseBodies eq true
   ]
 })
 .store({ "$$svcId": this.body.id })
@@ -109,13 +110,14 @@ patch("$baseUrl/api/v1/services/$$svcId/toggle", {
 // ── Update config (not script, not toggle) ──
 patch("$baseUrl/api/v1/services/$$svcId", {
   headers: { Authorization: "Bearer $$token" },
-  body: json({ name: "Health Check v2", schedule: "*/10 * * * *" })
+  body: json({ name: "Health Check v2", schedule: "*/10 * * * *", saveResponseBodies: false })
 })
 .expect(status: 200)
 .assert({
   expect: [
     this.body.name eq "Health Check v2",
-    this.body.schedule eq "*/10 * * * *"
+    this.body.schedule eq "*/10 * * * *",
+    this.body.saveResponseBodies eq false
   ]
 })
 
