@@ -192,6 +192,12 @@ services:
     build:
       context: ../../..
       dockerfile: core/tracedown-core-backend/e2e/Dockerfile.agent
+    # The agent advertises https://<its own FQDN>:<port> when it registers, and
+    # the certificate it is issued carries the SLUG as its SAN. The scheduler
+    # pins that SAN, so the hostname has to BE the slug or every dispatch fails
+    # verification against a name the certificate does not carry. Without this
+    # the container's FQDN is its container id and nothing can reach the agent.
+    hostname: e2e-agent
     environment:
       PROBE_AGENT_BOOTSTRAP_TOKEN: "${AGENT_BOOTSTRAP_TOKEN}"
       PROBE_AGENT_SCHEDULER_URL: http://gateway:8080
@@ -204,9 +210,15 @@ services:
       testbin:
         condition: service_healthy
     healthcheck:
-      # The listener requires a client certificate (mutual TLS), so the health
-      # probe presents the agent's own cert over https.
-      test: ["CMD-SHELL", "python -c \"import ssl,urllib.request; c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.load_cert_chain('/certs/agent.pem','/certs/agent-key.pem'); c.load_verify_locations('/certs/ca.pem'); c.check_hostname=False; urllib.request.urlopen('https://localhost:8443/health', context=c)\" || exit 1"]
+      # Liveness only — a TCP connect, not an HTTP request.
+      #
+      # The listener demands a client certificate for the TLS *client* purpose,
+      # and the only certificate in this container is the agent's own, which is
+      # serverAuth-only. OpenSSL rejects it as an unsuitable purpose, so an HTTP
+      # health probe from in here can never succeed however it is written. The
+      # scheduler is the only party holding a clientAuth certificate, and its
+      # health challenge is what actually proves the agent works.
+      test: ["CMD-SHELL", "python -c \"import socket; socket.create_connection(('localhost', 8443), 3).close()\" || exit 1"]
       interval: 3s
       timeout: 5s
       retries: 20

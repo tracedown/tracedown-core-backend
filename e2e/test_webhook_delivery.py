@@ -1,12 +1,20 @@
 """
-E2E: Webhook management + delivery.
+E2E: Webhook creation is refused for an internal target.
 
-Covers webhook create + config storage + resource binding
-(resource_webhook_access), then drives an actual delivery: a failing probe
-auto-emits a notification (every assertion failure emits one) which the
-dispatcher routes to a bound webhook pointing at testbin. Delivery is
-confirmed via the webhook's attempt_count. Depends on test_service_lifecycle
-(uses h.admin_token, h.proj_id).
+This file used to create a webhook pointing at testbin and assert an end-to-end
+delivery. That cannot work, and should not: SsrfGuard rejects such a target
+twice over — at write time it requires an ``https`` scheme, and at delivery time
+it re-resolves the host and refuses any private, loopback, link-local or CGNAT
+address. testbin is all of those things, so the old test was asserting behaviour
+the product deliberately prevents, and it failed with ``invalid_request_body``.
+
+There is no bypass, by design. Delivery against a genuinely public https
+endpoint is therefore out of reach of this stack, and what is worth asserting
+here instead is that the guard holds — a regression that silently allowed
+internal webhook targets would be an SSRF hole, and this is the cheapest place
+to notice it.
+
+Depends on test_service_lifecycle (uses h.admin_token, h.proj_id).
 """
 
 import time
@@ -18,9 +26,8 @@ _binding_id = None
 _svc_id = None
 
 
-@h.log_test("Create webhook and verify config is stored", reset_db_before=False)
-def test_create_webhook():
-    global _webhook_id
+@h.log_test("Webhook creation refuses a plain-http internal target", reset_db_before=False)
+def test_create_webhook_refuses_internal_target():
     if not h.admin_token or not h.proj_id:
         h.skip_test("No admin_token/proj_id -- test_service_lifecycle must run first")
 
@@ -29,11 +36,29 @@ def test_create_webhook():
         "url": "http://testbin:20780/status/200",
         "config": '{"headers": {"X-E2E": "1"}}',
     }, h.admin_token)
+
+    # Write-time guard: the scheme alone is enough to refuse this, before the
+    # host is ever resolved.
+    assert status == 400, f"Expected the SSRF guard to refuse this, got {status}: {body}"
+    print("  refused as expected: an internal http target cannot be registered")
+
+
+@h.log_test("Webhook creation accepts a public https target", reset_db_before=False)
+def test_create_webhook_accepts_public_https():
+    """The other side of the guard — it must not refuse everything."""
+    global _webhook_id
+    if not h.admin_token or not h.proj_id:
+        h.skip_test("No admin_token/proj_id -- test_service_lifecycle must run first")
+
+    status, body = h.api("POST", "/api/v1/webhooks", {
+        "name": "E2E Webhook",
+        "url": "https://example.com/hook",
+        "config": '{"headers": {"X-E2E": "1"}}',
+    }, h.admin_token)
     assert status in (200, 201), f"Expected 200/201, got {status}: {body}"
     _webhook_id = body["id"]
-    assert body["url"] == "http://testbin:20780/status/200", f"url mismatch: {body}"
     assert body.get("config") and "X-E2E" in body["config"], f"config not stored: {body.get('config')}"
-    print(f"  Created webhook {_webhook_id[:8]}... with config headers")
+    print(f"  created webhook {_webhook_id[:8]}... with config headers")
 
 
 @h.log_test("Bind webhook to a failing service", reset_db_before=False)
@@ -117,7 +142,8 @@ def test_cleanup():
 
 def get_tests():
     return [
-        test_create_webhook,
+        test_create_webhook_refuses_internal_target,
+        test_create_webhook_accepts_public_https,
         test_bind_webhook,
         test_webhook_delivered_on_failure,
         test_cleanup,
