@@ -8,6 +8,8 @@ import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWriteResource
+import dev.tracedown.gateway.util.ForbiddenException
+import dev.tracedown.gateway.util.VariableRevealPolicy
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
@@ -195,7 +197,8 @@ object WorkspaceController {
 
     /**
      * Decrypts and returns a single variable's value.
-     * Only works for "variable" type. Secrets cannot be revealed. Metrics are always plain.
+     * Only works for "variable" type. Secrets cannot be revealed. Metrics are
+     * always plain. Reveal is a write-level operation — see [VariableRevealPolicy].
      */
     fun revealVariable(orgId: UUID, workspaceId: UUID, varId: UUID, userId: UUID): VariableSummary {
         return transaction {
@@ -210,8 +213,13 @@ object WorkspaceController {
                 }
                 .firstOrNull() ?: throw NotFoundException()
 
-            if (row[WorkspaceVariables.secret]) {
-                throw BadRequestException(ErrorCodes.FORBIDDEN)
+            val canWrite = canWriteResource(cached, "workspace", workspaceId)
+            when (VariableRevealPolicy.decide(row[WorkspaceVariables.secret], canWrite)) {
+                VariableRevealPolicy.Decision.REFUSED_SECRET ->
+                    throw BadRequestException(ErrorCodes.FORBIDDEN)
+                VariableRevealPolicy.Decision.REFUSED_READ_ONLY ->
+                    throw ForbiddenException(ErrorCodes.INSUFFICIENT_PERMISSIONS)
+                VariableRevealPolicy.Decision.REVEAL -> Unit
             }
 
             variableSummaryFromRow(row, reveal = true)

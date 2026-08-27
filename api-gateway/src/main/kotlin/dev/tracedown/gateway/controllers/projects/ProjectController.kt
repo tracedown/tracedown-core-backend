@@ -9,6 +9,8 @@ import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.auth.canWriteResource
+import dev.tracedown.gateway.util.ForbiddenException
+import dev.tracedown.gateway.util.VariableRevealPolicy
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
@@ -231,7 +233,10 @@ object ProjectController {
         }
     }
 
-    /** Decrypts and returns a single project variable. Secrets cannot be revealed. */
+    /**
+     * Decrypts and returns a single project variable. Secrets cannot be
+     * revealed, and reveal is a write-level operation — see [VariableRevealPolicy].
+     */
     fun revealVariable(orgId: UUID, projectId: UUID, varId: UUID, userId: UUID): VariableSummary {
         return transaction {
             val ctx = ResourceResolver.resolveProject(projectId, orgId)
@@ -246,8 +251,13 @@ object ProjectController {
                 }
                 .firstOrNull() ?: throw NotFoundException()
 
-            if (row[ProjectVariables.secret]) {
-                throw BadRequestException(ErrorCodes.FORBIDDEN)
+            val canWrite = canWriteResource(cached, "project", projectId, listOf("workspace::${ctx.workspaceId}"))
+            when (VariableRevealPolicy.decide(row[ProjectVariables.secret], canWrite)) {
+                VariableRevealPolicy.Decision.REFUSED_SECRET ->
+                    throw BadRequestException(ErrorCodes.FORBIDDEN)
+                VariableRevealPolicy.Decision.REFUSED_READ_ONLY ->
+                    throw ForbiddenException(ErrorCodes.INSUFFICIENT_PERMISSIONS)
+                VariableRevealPolicy.Decision.REVEAL -> Unit
             }
 
             variableSummaryFromRow(row, reveal = true)
