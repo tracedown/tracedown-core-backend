@@ -2,6 +2,7 @@ package dev.tracedown.worker.config
 
 import dev.tracedown.common.storage.S3Config
 import io.ktor.server.application.ApplicationEnvironment
+import java.time.Duration
 
 data class DatabaseConfig(
     val url: String,
@@ -35,6 +36,14 @@ data class WorkerConfig(
     val notificationLogRetentionDays: Int,
     /** Mirrors the gateway flag; disables domain re-verification when true. */
     val trustedDomainMode: Boolean,
+    /**
+     * How long an outbox consumer may sit behind the log without advancing
+     * before the purge stops holding rows back for it. See
+     * [dev.tracedown.worker.jobs.OutboxCursorPolicy]. Zero or negative restores
+     * the unconditional floor — a stalled consumer then pins the outbox
+     * forever, so only set that deliberately.
+     */
+    val outboxCursorStaleHorizon: Duration,
     /** Job execution intervals. */
     val jobIntervals: JobIntervals,
     /** S3-compatible storage config. Null if only filesystem storage is used. */
@@ -64,6 +73,9 @@ data class WorkerConfig(
                     ?.getString()?.toInt() ?: 90,
                 trustedDomainMode = config.propertyOrNull("worker.trustedDomainMode")
                     ?.getString()?.toBoolean() ?: true,
+                outboxCursorStaleHorizon = config.propertyOrNull("worker.outboxCursorStaleHours")
+                    ?.getString()?.toLongOrNull()?.let { Duration.ofHours(it) }
+                    ?: dev.tracedown.worker.jobs.OutboxCursorPolicy.DEFAULT_STALE_HORIZON,
                 jobIntervals = JobIntervals(
                     hourlyAggregationSeconds = config.propertyOrNull("worker.intervals.hourlyAggregation")
                         ?.getString()?.toLong() ?: 900L,
