@@ -32,6 +32,22 @@ data class UpdateServiceRequest(
     val queuePolicy: String? = null,
     val serviceWindow: String? = null,
     val saveResponseBodies: Boolean? = null,
+    /**
+     * The service's Lace script, when this save changes it. Config and script
+     * travel together so an editor's save is one transaction — see
+     * `ServiceController.update`. Requires [version].
+     */
+    val script: String? = null,
+    /**
+     * The version the editor loaded, if it wants the save version-checked; the
+     * save is refused with `version_conflict` when the service has moved on.
+     *
+     * Optional so a non-interactive caller changing one field need not read the
+     * service first, but any save carrying a [script] must supply it: a script
+     * is the thing two people edit at once, and an unchecked script write is how
+     * one of them silently loses their work.
+     */
+    val version: Int? = null,
 ) : Validatable {
     override fun validate() = buildList {
         Validators.maxLen("name", name, 128)?.let(::add)
@@ -40,10 +56,18 @@ data class UpdateServiceRequest(
         Validators.oneOf("probeMode", probeMode, setOf("consecutive", "simultaneous", "random"))?.let(::add)
         Validators.oneOf("queuePolicy", queuePolicy, setOf("skip", "enqueue_once"))?.let(::add)
         Validators.maxLen("serviceWindow", serviceWindow, 256)?.let(::add)
+        // script is a text column (no length cap); generous bound guards against abuse.
+        Validators.maxLen("script", script, 65536)?.let(::add)
+        version?.let { Validators.inRange("version", it, 1..Int.MAX_VALUE)?.let(::add) }
     }
 }
 
-/** Updates the service's Lace script. Validates before saving. */
+/**
+ * Updates the service's Lace script. Validates before saving.
+ *
+ * A narrower spelling of [UpdateServiceRequest] with the script and version
+ * required — it keeps the script-only endpoint honest, and delegates.
+ */
 @Serializable
 data class UpdateScriptRequest(
     val script: String,

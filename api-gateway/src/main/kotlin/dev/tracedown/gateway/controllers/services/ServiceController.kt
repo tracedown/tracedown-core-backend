@@ -9,6 +9,8 @@ import dev.tracedown.common.util.LineDiff
 import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWriteResource
+import dev.tracedown.gateway.util.ForbiddenException
+import dev.tracedown.gateway.util.VariableRevealPolicy
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ServiceVariables
 import kotlinx.serialization.json.buildJsonObject
@@ -246,8 +248,39 @@ object ServiceController {
         )
     }
 
-    /** Updates service configuration. Requires write access. */
+    /**
+     * Updates a service: its configuration, its Lace script, or both. Requires
+     * write access.
+     *
+     * **Both halves of an editor's save land in one transaction, or neither
+     * does.** They used to be two requests — an unversioned config PATCH and a
+     * version-checked script PATCH — issued in that order, so a save that lost a
+     * race committed the config and only then learned the script was stale. The
+     * result was a service wearing one editor's schedule and another's script,
+     * which no one had ever reviewed together. Ordering the two requests would
+     * only move the window; being one transaction closes it.
+     *
+     * [UpdateServiceRequest.version] is the version the editor loaded. Present,
+     * it is checked against the row and a mismatch is a 409 with nothing
+     * written; absent, the save is last-writer-wins, which is left available for
+     * a non-interactive caller changing a single field. A save carrying a script
+     * must supply it.
+     *
+     * A successful save bumps the version. The scheduler treats that column as
+     * its "this service changed" marker, so a schedule edit now moves it too and
+     * the consistency sweep sees the change even if the nudge is missed.
+     */
     fun update(orgId: UUID, serviceId: UUID, request: UpdateServiceRequest, userId: UUID): ServiceSummary {
+        // A script write must say what it is replacing. Rejected before the
+        // transaction: it is a malformed request, not a conflict.
+        if (request.script != null && request.version == null) {
+            throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
+        }
+        // Parsing is pure and can be slow — keep it off the transaction.
+        if (request.script != null && validateScript(request.script).isNotEmpty()) {
+            throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        }
+
         return transaction {
             val ctx = ResourceResolver.resolveService(serviceId, orgId)
             val cached = requireCachedPermissions(orgId, userId)
@@ -290,21 +323,51 @@ object ServiceController {
             }
 
             val old = Services.selectAll()
-                .where { Services.id eq serviceId }
+                .where { (Services.id eq serviceId) and (Services.deleted eq false) }
                 .firstOrNull() ?: throw NotFoundException()
 
-            // A schedule below the unverified-domain floor is rejected here,
-            // mirroring dispatch (which would silently throttle instead).
-            if (!trustedDomainMode && request.schedule != null &&
-                DomainPolicy.minIntervalMinutes(request.schedule) < DomainPolicy.MIN_INTERVAL_MINUTES
-            ) {
+            val currentVersion = old[Services.version]
+            // Optimistic concurrency. Read inside the transaction, so the row
+            // this compares against is the row the update below writes.
+            if (request.version != null && request.version != currentVersion) {
+                throw ConflictException(ErrorCodes.VERSION_CONFLICT)
+            }
+
+            // What the service will look like once this save lands — the policy
+            // below judges that, not the halves. A save changing schedule and
+            // script together used to have its new schedule checked against the
+            // OLD script.
+            val effectiveScript = request.script ?: old[Services.script]
+            val effectiveSchedule = request.schedule ?: old[Services.schedule]
+
+            // Save-time twin of the scheduler's unverified-domain policy: a
+            // script that dispatch would refuse (over the 3-call limit with
+            // unverified targets) is rejected here with a clear error instead
+            // of silently never running, and a schedule below the floor is
+            // rejected rather than silently throttled. Bodies limits stay
+            // dispatch-side — they don't make a script un-runnable.
+            val intervalTooShort =
+                DomainPolicy.minIntervalMinutes(effectiveSchedule) < DomainPolicy.MIN_INTERVAL_MINUTES
+            val policyRelevant = request.script != null ||
+                (request.schedule != null && intervalTooShort)
+            if (!trustedDomainMode && policyRelevant) {
                 val policy = DomainPolicy.evaluate(
-                    old[Services.script],
+                    effectiveScript,
                     resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
                     orgId,
                 )
                 if (!policy.covered) {
-                    throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_INTERVAL)
+                    // includes() against an unverified target is a scraping oracle —
+                    // refuse it at save time (dispatch would refuse it anyway).
+                    if (request.script != null && policy.usesIncludes) {
+                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_INCLUDES)
+                    }
+                    if (request.script != null && policy.callCount > DomainPolicy.MAX_CALLS) {
+                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_CALL_LIMIT)
+                    }
+                    if (intervalTooShort) {
+                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_INTERVAL)
+                    }
                 }
             }
 
@@ -317,27 +380,55 @@ object ServiceController {
                 // Blank clears the window (the request field is null when unchanged).
                 request.serviceWindow?.let { v -> it[serviceWindow] = v.trim().ifBlank { null } }
                 request.saveResponseBodies?.let { v -> it[saveResponseBodies] = v }
+                request.script?.let { v -> it[script] = v }
+                it[version] = currentVersion + 1
             }
 
-            AuditService.log(
-                orgId, userId, "update.service", "service", serviceId.toString(),
-                entityDisplayName = old[Services.name],
-                diff = auditDiff(
-                    Triple("name", old[Services.name], request.name ?: old[Services.name]),
-                    Triple("label", old[Services.label], request.label ?: old[Services.label]),
-                    Triple("schedule", old[Services.schedule], request.schedule ?: old[Services.schedule]),
-                    Triple("probeMode", old[Services.probeMode], request.probeMode ?: old[Services.probeMode]),
-                    Triple("queuePolicy", old[Services.queuePolicy], request.queuePolicy ?: old[Services.queuePolicy]),
-                    Triple(
-                        "serviceWindow", old[Services.serviceWindow],
-                        request.serviceWindow?.trim()?.ifBlank { null } ?: old[Services.serviceWindow],
+            // The script change gets its own entry, with its own diff: it is the
+            // part of a service anyone ever reads history for.
+            if (request.script != null) {
+                AuditService.log(
+                    orgId, userId, "update.service.script", "service", serviceId.toString(),
+                    entityDisplayName = old[Services.name],
+                    diff = kotlinx.serialization.json.buildJsonObject {
+                        put("version", kotlinx.serialization.json.buildJsonObject {
+                            put("from", kotlinx.serialization.json.JsonPrimitive(currentVersion))
+                            put("to", kotlinx.serialization.json.JsonPrimitive(currentVersion + 1))
+                        })
+                        put(
+                            "scriptDiff",
+                            kotlinx.serialization.json.JsonPrimitive(
+                                LineDiff.unified(old[Services.script], request.script),
+                            ),
+                        )
+                    }.toString(),
+                )
+            }
+
+            // Only when the save actually carried configuration. A script-only
+            // save through the script endpoint would otherwise log a second,
+            // entirely empty "update.service" entry next to the script one.
+            if (touchesConfig(request)) {
+                AuditService.log(
+                    orgId, userId, "update.service", "service", serviceId.toString(),
+                    entityDisplayName = old[Services.name],
+                    diff = auditDiff(
+                        Triple("name", old[Services.name], request.name ?: old[Services.name]),
+                        Triple("label", old[Services.label], request.label ?: old[Services.label]),
+                        Triple("schedule", old[Services.schedule], request.schedule ?: old[Services.schedule]),
+                        Triple("probeMode", old[Services.probeMode], request.probeMode ?: old[Services.probeMode]),
+                        Triple("queuePolicy", old[Services.queuePolicy], request.queuePolicy ?: old[Services.queuePolicy]),
+                        Triple(
+                            "serviceWindow", old[Services.serviceWindow],
+                            request.serviceWindow?.trim()?.ifBlank { null } ?: old[Services.serviceWindow],
+                        ),
+                        Triple(
+                            "saveResponseBodies", old[Services.saveResponseBodies],
+                            request.saveResponseBodies ?: old[Services.saveResponseBodies],
+                        ),
                     ),
-                    Triple(
-                        "saveResponseBodies", old[Services.saveResponseBodies],
-                        request.saveResponseBodies ?: old[Services.saveResponseBodies],
-                    ),
-                ),
-            )
+                )
+            }
 
             OutboxEmit.emitResourceEvent(
                 "resource.service.updated", "service", serviceId,
@@ -387,87 +478,19 @@ object ServiceController {
     /**
      * Updates a service's Lace script. Parses and validates before saving.
      * Increments the service version on success.
+     *
+     * The script-only spelling of [update], and nothing more — the version check,
+     * the unverified-domain policy, the audit entry and the version bump all live
+     * there, so this endpoint and an editor's combined save can never diverge on
+     * what a script write means.
      */
-    fun updateScript(orgId: UUID, serviceId: UUID, request: UpdateScriptRequest, userId: UUID): ServiceSummary {
-        // Validate the script
-        val errors = validateScript(request.script)
-        if (errors.isNotEmpty()) {
-            throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        }
-
-        val ctx = ResourceResolver.resolveService(serviceId, orgId)
-        return transaction {
-            val cached = requireCachedPermissions(orgId, userId)
-            requireServiceWriteAccess(ctx.serviceId, ctx.projectId, ctx.workspaceId, cached)
-
-            val service = Services.selectAll()
-                .where { (Services.id eq serviceId) and (Services.deleted eq false) }
-                .firstOrNull() ?: throw NotFoundException()
-
-            val currentVersion = service[Services.version]
-            if (currentVersion != request.version) {
-                throw ConflictException(ErrorCodes.VERSION_CONFLICT)
-            }
-
-            // Save-time twin of the scheduler's unverified-domain policy: a
-            // script that dispatch would refuse (over the 3-call limit with
-            // unverified targets) is rejected here with a clear error instead
-            // of silently never running. Bodies/interval limits stay
-            // dispatch-side — they don't make a script un-runnable.
-            if (!trustedDomainMode) {
-                val policy = DomainPolicy.evaluate(
-                    request.script,
-                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
-                    orgId,
-                )
-                if (!policy.covered) {
-                    // includes() against an unverified target is a scraping oracle —
-                    // refuse it at save time (dispatch would refuse it anyway).
-                    if (policy.usesIncludes) {
-                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_INCLUDES)
-                    }
-                    if (policy.callCount > DomainPolicy.MAX_CALLS) {
-                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_CALL_LIMIT)
-                    }
-                    if (DomainPolicy.minIntervalMinutes(service[Services.schedule]) < DomainPolicy.MIN_INTERVAL_MINUTES) {
-                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_INTERVAL)
-                    }
-                }
-            }
-
-            Services.update({ (Services.id eq serviceId) and (Services.projectId eq ctx.projectId) }) {
-                it[script] = request.script
-                it[version] = currentVersion + 1
-            }
-
-            AuditService.log(
-                orgId, userId, "update.service.script", "service", serviceId.toString(),
-                entityDisplayName = service[Services.name],
-                diff = kotlinx.serialization.json.buildJsonObject {
-                    put("version", kotlinx.serialization.json.buildJsonObject {
-                        put("from", kotlinx.serialization.json.JsonPrimitive(currentVersion))
-                        put("to", kotlinx.serialization.json.JsonPrimitive(currentVersion + 1))
-                    })
-                    put(
-                        "scriptDiff",
-                        kotlinx.serialization.json.JsonPrimitive(
-                            LineDiff.unified(service[Services.script], request.script),
-                        ),
-                    )
-                }.toString(),
-            )
-
-            OutboxEmit.emitResourceEvent(
-                "resource.service.updated", "service", serviceId,
-                buildJsonObject { put("id", serviceId.toString()); put("orgId", orgId.toString()); put("parentId", ctx.projectId.toString()) },
-            )
-            serviceSummary(serviceId)
-        }.also {
-            publishNudge(serviceId)
-            RealtimePublisher.publish("project:${ctx.projectId}", orgId, "service.updated",
-                buildJsonObject { put("serviceId", serviceId.toString()) })
-        }
-    }
+    fun updateScript(orgId: UUID, serviceId: UUID, request: UpdateScriptRequest, userId: UUID): ServiceSummary =
+        update(
+            orgId,
+            serviceId,
+            UpdateServiceRequest(script = request.script, version = request.version),
+            userId,
+        )
 
     /**
      * Enables or disables a service. Enabling requires a valid non-empty script.
@@ -740,6 +763,12 @@ object ServiceController {
         )
     }
 
+    /** True when the save carries at least one configuration field. */
+    private fun touchesConfig(request: UpdateServiceRequest): Boolean =
+        request.name != null || request.label != null || request.schedule != null ||
+        request.probeMode != null || request.queuePolicy != null ||
+        request.serviceWindow != null || request.saveResponseBodies != null
+
     private fun validateScript(script: String): List<ScriptValidationError> {
         return try {
             val ast = dev.lacelang.validator.parse(script)
@@ -924,7 +953,10 @@ object ServiceController {
         }
     }
 
-    /** Decrypts and returns a single service variable. Secrets cannot be revealed. */
+    /**
+     * Decrypts and returns a single service variable. Secrets cannot be
+     * revealed, and reveal is a write-level operation — see [VariableRevealPolicy].
+     */
     fun revealVariable(orgId: UUID, serviceId: UUID, varId: UUID, userId: UUID): VariableSummary {
         return transaction {
             val ctx = ResourceResolver.resolveService(serviceId, orgId)
@@ -939,8 +971,16 @@ object ServiceController {
                 }
                 .firstOrNull() ?: throw NotFoundException()
 
-            if (row[ServiceVariables.secret]) {
-                throw BadRequestException(ErrorCodes.FORBIDDEN)
+            val canWrite = canWriteResource(
+                cached, "service", ctx.serviceId,
+                listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"),
+            )
+            when (VariableRevealPolicy.decide(row[ServiceVariables.secret], canWrite)) {
+                VariableRevealPolicy.Decision.REFUSED_SECRET ->
+                    throw BadRequestException(ErrorCodes.FORBIDDEN)
+                VariableRevealPolicy.Decision.REFUSED_READ_ONLY ->
+                    throw ForbiddenException(ErrorCodes.INSUFFICIENT_PERMISSIONS)
+                VariableRevealPolicy.Decision.REVEAL -> Unit
             }
 
             variableSummaryFromRow(row, reveal = true)
