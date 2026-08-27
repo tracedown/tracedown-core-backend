@@ -1,6 +1,10 @@
 package dev.tracedown.ingestor
 
 import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.config.SecretGuard
+import dev.tracedown.common.health.databaseCheck
+import dev.tracedown.common.health.installHealthEndpoints
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.storage.BodyConfinement
 import dev.tracedown.common.storage.BodyStorageClient
@@ -23,6 +27,14 @@ fun main(args: Array<String>) = EngineMain.main(args)
 /** Ktor module — wires DB, Redis, and the consumer loop. */
 fun Application.module() {
     val config = IngestorConfig.load(environment)
+
+    // This service has no insecure defaults of its own to guard, but it still
+    // reports which deployment environment it resolved — an unset or misspelt
+    // DEPLOYMENT_ENV is a fleet-wide condition and every log should say so.
+    SecretGuard.announce(
+        environment.config.propertyOrNull("deployment.environment")?.getString(),
+        "result-ingestor",
+    )
 
     // Database
     val dataSource = DatabaseFactory.init(
@@ -53,16 +65,36 @@ fun Application.module() {
     )
     ResultPersistenceService.init(BodyRelocator(bodyStorageClient))
 
-    // Consumer
-    val consumer = ProbeResultConsumer(redis, config.popTimeoutSeconds)
+    // Consumer. It gets a connection of its own: its pop is a blocking command,
+    // and anything pipelined behind one waits for it — the realtime publisher
+    // above shares the other connection and must not be held up by a quiet queue.
+    // createBlockingConnection, not createConnection: the default command
+    // timeout is shorter than this consumer's own pop timeout, and a quiet
+    // queue must not read as an unresponsive server.
+    val consumerConn = RedisFactory.createBlockingConnection(config.redisAUrl, config.popTimeoutSeconds)
+    val consumer = ProbeResultConsumer(consumerConn.sync(), config.popTimeoutSeconds)
     val consumerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     consumer.start(consumerScope)
+
+    // Both dependencies are required: this service exists to move rows from the
+    // queue into the database. The check rides the non-consumer connection —
+    // never the one parked in BLMOVE.
+    installHealthEndpoints(
+        "result-ingestor",
+        listOf(
+            databaseCheck(dataSource),
+            redisCheck("redis-a") { redis },
+        ),
+    )
 
     log.info("result-ingestor started")
 
     // Shutdown hooks
     monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
+        // stop() hands back whatever the consumer still holds, so it runs while
+        // its connection is still open.
         consumer.stop()
+        consumerConn.close()
         redisConn.close()
         dataSource.close()
         log.info("result-ingestor shut down")
