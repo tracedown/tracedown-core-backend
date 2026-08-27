@@ -53,7 +53,11 @@ import dev.tracedown.gateway.routes.internal.internalAgentRoutes
 import dev.tracedown.gateway.routes.internal.internalHealthTokenRoutes
 import dev.tracedown.gateway.util.ApiException
 import dev.tracedown.gateway.util.AppConfig
+import dev.tracedown.common.health.databaseCheck
+import dev.tracedown.common.health.readinessRoute
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.gateway.util.RateLimitConfig
+import dev.tracedown.gateway.util.validatePassword
 import dev.tracedown.gateway.util.RateLimiter
 import dev.tracedown.gateway.util.ResourceResolver
 import io.ktor.http.HttpStatusCode
@@ -109,7 +113,7 @@ fun Application.module() {
         ),
     )
 
-    DatabaseFactory.init(
+    val dataSource = DatabaseFactory.init(
         jdbcUrl = appConfig.database.url,
         username = appConfig.database.user,
         password = appConfig.database.password
@@ -143,11 +147,16 @@ fun Application.module() {
     ServiceController.init { redisA }
     dev.tracedown.common.realtime.RealtimePublisher.init { redisA }
 
-    // Redis C (resource hierarchy cache) — optional, disabled if not configured
+    // Redis C (resource hierarchy cache) — optional, disabled if not configured.
+    // Lazy like A and B: the cache is an optimisation, and connecting to it
+    // during module init let an unreachable instance stop Ktor from binding.
     val resourceCache = if (appConfig.redis.cUrl != null) {
-        val redisCConn = RedisFactory.createConnection(appConfig.redis.cUrl!!)
-        monitor.subscribe(io.ktor.server.application.ApplicationStopped) { redisCConn.close() }
-        dev.tracedown.common.cache.ResourceCache(redisCConn.sync(), appConfig.redis.cacheTtlSeconds)
+        val redisC by lazy {
+            val conn = RedisFactory.createConnection(appConfig.redis.cUrl!!)
+            monitor.subscribe(io.ktor.server.application.ApplicationStopped) { conn.close() }
+            conn.sync()
+        }
+        dev.tracedown.common.cache.ResourceCache({ redisC }, appConfig.redis.cacheTtlSeconds)
     } else {
         log.info("Redis C not configured — resource cache disabled (DB-only mode)")
         dev.tracedown.common.cache.ResourceCache.DISABLED
@@ -162,7 +171,11 @@ fun Application.module() {
     }
 
     val rateLimitConfig = RateLimitConfig.load(environment.config)
-    val rateLimiter = RateLimiter(redis = { redisB }, config = rateLimitConfig)
+    // The auth tier fails CLOSED, so the limiter's store has to be the durable
+    // operational instance rather than the evictable cache: an allkeys-lru
+    // Redis B is allowed to drop counters, and losing it locks logins out.
+    // In the default single-instance setup this is the same server either way.
+    val rateLimiter = RateLimiter(redis = { redisA }, config = rateLimitConfig)
 
     dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.init { redisB }
     dev.tracedown.gateway.controllers.metrics.UsageController.init({ redisB }, appConfig.systemLimits.resultRetentionDays)
@@ -193,9 +206,15 @@ fun Application.module() {
         )
     )
 
-    val emailPublisher = EmailPublisher(redisA)
+    // Provider, not an instance: constructing it must not force the lazy
+    // connection and drag Redis into module init (see EmailPublisher).
+    val emailPublisher = EmailPublisher { redisA }
 
     if (appConfig.platform.singleOrgMode) {
+        requireBootstrapAllowed(
+            environment.config.propertyOrNull("deployment.environment")?.getString(),
+            appConfig,
+        )
         bootstrapSingleOrg(appConfig)
     }
 
@@ -264,7 +283,17 @@ fun Application.module() {
             )
         }
         exception<ApiException> { call, cause ->
-            call.respond(cause.status, mapOf("error" to cause.code))
+            // Most codes stand alone; the few that cannot carry `details` with
+            // the specifics the client needs to say what is in the way.
+            val details = cause.details
+            if (details == null) {
+                call.respond(cause.status, mapOf("error" to cause.code))
+            } else {
+                call.respond(cause.status, kotlinx.serialization.json.buildJsonObject {
+                    put("error", kotlinx.serialization.json.JsonPrimitive(cause.code))
+                    put("details", details)
+                })
+            }
         }
         // A PFS filter/sort naming a non-allowlisted table/column is a bad
         // request, not a server error — surface the neutral code.
@@ -368,7 +397,88 @@ fun Application.module() {
         auditRoutes()
         internalAgentRoutes()
         internalHealthTokenRoutes { redisA }
+
+        // Readiness alongside the existing static /ping (liveness). The
+        // database is required — the gateway cannot answer anything without
+        // it. Redis A is reported but not required: rate limiting and email
+        // queueing both degrade rather than stop, and failing readiness on a
+        // Redis blip is the restart loop this pass is removing.
+        readinessRoute(
+            "api-gateway",
+            listOf(
+                databaseCheck(dataSource),
+                redisCheck("redis-a", required = false) { redisA },
+            ),
+        )
     }
+}
+
+/** The bootstrap identity as committed to this repository — i.e. public. */
+private const val PUBLISHED_DEMO_EMAIL = "admin@tracedown.dev"
+private const val PUBLISHED_DEMO_PASSWORD = "Down2trace!"
+
+/**
+ * Makes it impossible for a production deployment to end up with the published
+ * owner account.
+ *
+ * `platform.singleOrgMode` is the zero-configuration bootstrap: it creates the
+ * first organization and its owner from `demoUserEmail` / `demoUserPassword`,
+ * whose defaults are committed in `platform.conf` on purpose — that is what
+ * makes a fresh checkout or a demo instance run with no setup at all. It is now
+ * **off by default**, so nothing seeds an owner unless a deployment explicitly
+ * asks for it.
+ *
+ * Under `DEPLOYMENT_ENV=production`, asking for it is not enough: the gateway
+ * refuses to start unless both credentials have been moved off their published
+ * values and the password satisfies the platform's own policy. Flipping
+ * `SINGLE_ORG_MODE=true` on a production install therefore cannot produce the
+ * account whose password is committed in `platform.conf` — it produces a
+ * startup failure that names exactly what is wrong.
+ *
+ * Why this shape rather than banning the flag outright in production: the
+ * bootstrap is the *only* code path in Core that creates a user. Everything
+ * else — `--create-org`, invites — needs one to already exist, so an
+ * unconditional ban would leave a production self-hoster with no way to get
+ * their first account, and the workaround (boot once with `DEPLOYMENT_ENV`
+ * unset, then flip it back) would leave the published credentials live and make
+ * the ban theatre. Binding the refusal to the credentials instead closes the
+ * hole the flag actually opens.
+ *
+ * There is deliberately no escape hatch. `ALLOW_INSECURE_DEV_KEYS` lifts the
+ * [dev.tracedown.common.config.SecretGuard] checks; it does not lift this one.
+ * A weak key is a risk assessment — a published password is not.
+ */
+private fun requireBootstrapAllowed(deploymentEnvironment: String?, appConfig: AppConfig) {
+    if (!dev.tracedown.common.config.SecretGuard.isProduction(deploymentEnvironment)) return
+
+    val problems = mutableListOf<String>()
+    if (appConfig.platform.demoUserEmail == PUBLISHED_DEMO_EMAIL) {
+        problems += "DEMO_USER_EMAIL is still the published default"
+    }
+    if (appConfig.platform.demoUserPassword == PUBLISHED_DEMO_PASSWORD) {
+        problems += "DEMO_USER_PASSWORD is still the published default"
+    }
+    validatePassword(appConfig.platform.demoUserPassword, appConfig.auth.passwordPolicy)
+        .forEach { problems += "DEMO_USER_PASSWORD: $it" }
+
+    if (problems.isEmpty()) {
+        log.warn(
+            "SINGLE_ORG_MODE is enabled in production — the first organization and its owner " +
+                "will be created from DEMO_USER_EMAIL. Turn it off once the account exists.",
+        )
+        return
+    }
+
+    throw IllegalStateException(
+        "api-gateway refusing to start: SINGLE_ORG_MODE is enabled with " +
+            "${dev.tracedown.common.config.SecretGuard.ENV_VAR}=" +
+            "${dev.tracedown.common.config.SecretGuard.PRODUCTION}, and " +
+            problems.joinToString("; ") +
+            ". The bootstrap credentials ship in the source repository, so leaving them in place " +
+            "would create a publicly-known owner account. Set real values, or leave " +
+            "SINGLE_ORG_MODE off (its default) and use --create-org <name> --owner <email> once a " +
+            "user exists. This has no override.",
+    )
 }
 
 private fun bootstrapSingleOrg(appConfig: AppConfig) {

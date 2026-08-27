@@ -16,6 +16,12 @@
 # DB_POOL_SIZE shrinks each service's Hikari pool (default 10; Hikari fills
 # to max eagerly, so 8 JVM services = 80 idle connections otherwise).
 # Takes effect once images carry the DB_POOL_SIZE-aware DatabaseFactory.
+#
+# The scheduler is the exception: its pool is normally derived from
+# SCHEDULER_DISPATCH_WORKERS, because every in-flight dispatch can want a
+# connection at once and one that cannot get it loses the probe. Capping its
+# pool here therefore means capping its concurrency to match — the two are set
+# together below and must stay that way.
 
 x-jvm-env: &jvm-env
   JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60"
@@ -41,7 +47,11 @@ services:
     mem_limit: 768m
     environment:
       <<: *jvm-env
+      # Paired on purpose: a pool of 6 serves 4 concurrent dispatches plus the
+      # sweep, the health round and the shed recorders. Raising one without the
+      # other puts the workers back to timing out on connections.
       DB_POOL_SIZE: "6"
+      SCHEDULER_DISPATCH_WORKERS: "4"
 
   tracedown-ingestor:
     cpus: 1

@@ -35,8 +35,11 @@ services:
       POSTGRES_DB: ${DB_NAME}
       # timescaledb-tune runs at initdb and derives max_connections from
       # available memory — on small hosts it lands below what the service
-      # connection pools need (8 JVM services x 10) and the stack can't boot.
-      TS_TUNE_MAX_CONNS: "100"
+      # connection pools need and the stack can't boot. Seven JVM services at
+      # the default pool of 10, plus the scheduler, whose pool is derived from
+      # its dispatch concurrency (50 workers + headroom) because a worker that
+      # cannot get a connection loses the probe outright.
+      TS_TUNE_MAX_CONNS: "160"
     volumes:
       - tracedown-pgdata:/var/lib/postgresql/data
     ports:

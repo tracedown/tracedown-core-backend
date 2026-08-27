@@ -71,7 +71,9 @@ class RateLimiter(
             // attacker could knock Redis over to unlock brute forcing.
             when (tier) {
                 Tier.AUTH -> {
-                    log.warn("Rate limiter Redis error on auth tier, failing closed: {}", e.message)
+                    // ERROR, not WARN: a security control has stopped working
+                    // and every login on this instance is now being refused.
+                    log.error("Rate limiter Redis error on auth tier, failing closed: {}", e.message)
                     RateLimitResult(
                         allowed = false,
                         limit = tierConfig.maxRequests,
