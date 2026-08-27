@@ -1,10 +1,11 @@
 package dev.tracedown.gateway.controllers.agents
 
 import at.favre.lib.crypto.bcrypt.BCrypt
+import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.models.AgentBootstrapTokens
 import dev.tracedown.common.models.AgentCertificates
 import dev.tracedown.common.models.ProbeAgents
-import dev.tracedown.common.realtime.RealtimePublisher
+import dev.tracedown.common.agents.FleetAudience
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import dev.tracedown.gateway.data.agents.AgentRegisterRequest
@@ -49,20 +50,32 @@ object AgentRegistrationController {
     fun register(request: AgentRegisterRequest, agentUri: String): AgentRegisterResponse {
         return transaction {
             // Find and validate the bootstrap token.
+            //
+            // This endpoint is unauthenticated AND rate-limit-exempt (all of
+            // /internal/* is, deliberately — it carries enrolment and the
+            // health-challenge token endpoint, which customer traffic must not
+            // throttle). It therefore must not do work proportional to how many
+            // tokens exist: the row is located by its indexed SHA-256 digest,
+            // and expiry is settled in SQL, so a wrong or expired token costs a
+            // single indexed lookup and NO bcrypt at all. Exactly one candidate
+            // can match, and only it is bcrypt-verified — the digest locates,
+            // the bcrypt hash still authenticates.
+            val now = Instant.now()
             val tokenRow = AgentBootstrapTokens.selectAll()
-                .where { AgentBootstrapTokens.used eq false }
-                .toList()
-                .firstOrNull { row ->
+                .where {
+                    (AgentBootstrapTokens.tokenLookup eq TokenHasher.sha256Hex(request.bootstrapToken)) and
+                        (AgentBootstrapTokens.used eq false) and
+                        (AgentBootstrapTokens.expiresAt greater now)
+                }
+                .limit(1)
+                .firstOrNull()
+                ?.takeIf { row ->
                     BCrypt.verifyer().verify(
                         request.bootstrapToken.toCharArray(),
                         row[AgentBootstrapTokens.tokenHash],
                     ).verified
                 }
                 ?: throw ForbiddenException()
-
-            if (tokenRow[AgentBootstrapTokens.expiresAt].isBefore(Instant.now())) {
-                throw ForbiddenException()
-            }
 
             val slug = tokenRow[AgentBootstrapTokens.slug]
             val label = tokenRow[AgentBootstrapTokens.label]
@@ -89,7 +102,6 @@ object AgentRegistrationController {
             val publicKeyPem = pemEncodePublicKey(agentCert.publicKey.encoded)
 
             // Create the probe agent.
-            val now = Instant.now()
             val agentId = ProbeAgents.insert {
                 it[ProbeAgents.slug] = slug
                 it[ProbeAgents.label] = label
@@ -130,8 +142,7 @@ object AgentRegistrationController {
                 put("lastCheck", now.toString())
                 put("lastResponseMs", 0)
             }
-            RealtimePublisher.publish("agents:summary", GLOBAL_ORG, "health.updated", eventData)
-            RealtimePublisher.publish("agents", GLOBAL_ORG, "health.updated", eventData)
+            FleetAudience.publish(slug, "health.updated", eventData)
 
             AgentRegisterResponse(
                 certificatePem = agentCertPem,
@@ -230,8 +241,6 @@ object AgentRegistrationController {
         }
     }
 
-    /** Global UUID for agent events (agents are not org-scoped). */
-    internal val GLOBAL_ORG = java.util.UUID(0, 0)
 
     private fun parsePublicKeyPem(pem: String): PublicKey {
         val base64 = pem

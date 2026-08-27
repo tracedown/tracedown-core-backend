@@ -253,12 +253,47 @@ data class SessionSummary(
 data class RevokedCount(val revoked: Int)
 
 @Serializable
-data class DeleteAccountRequest(val password: String) : Validatable {
+data class DeleteAccountRequest(
+    val password: String,
+    /** TOTP or recovery code; required when the account has 2FA enrolled. */
+    val code: String? = null,
+    /**
+     * Delete along with the account every organization it owns and is the only
+     * member of. Owned organizations that still have other members are never
+     * covered by this — they have to be handed to another owner first.
+     */
+    val deleteOwnedOrgs: Boolean = false,
+) : Validatable {
     override fun validate() = buildList {
         Validators.notBlank("password", password)?.let(::add)
         Validators.maxLen("password", password, 256)?.let(::add)
+        Validators.maxLen("code", code, 64)?.let(::add)
     }
 }
+
+/**
+ * An organization this account owns, and therefore has to deal with before it
+ * can be closed. [soleMember] means nobody else holds a membership, so the
+ * organization can simply go with the account.
+ */
+@Serializable
+data class OwnedOrgSummary(
+    val id: String,
+    val name: String,
+    val soleMember: Boolean,
+)
+
+/**
+ * What the current user is allowed to do to their own account, and what stands
+ * in the way. Fetched by the profile page to decide which sections to render.
+ */
+@Serializable
+data class ProfileCapabilitiesResponse(
+    val allowProfileEdit: Boolean,
+    val allowAccountClosure: Boolean,
+    /** Empty unless [allowAccountClosure] — nothing else consumes it. */
+    val ownedOrgs: List<OwnedOrgSummary> = emptyList(),
+)
 
 // --- Org Membership ---
 

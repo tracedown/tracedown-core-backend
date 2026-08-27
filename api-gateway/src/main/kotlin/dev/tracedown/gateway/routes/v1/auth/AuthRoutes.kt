@@ -8,6 +8,7 @@ import dev.tracedown.gateway.data.auth.ChangePasswordRequest
 import dev.tracedown.gateway.data.auth.LoginRequest
 import dev.tracedown.gateway.data.auth.PasswordResetConfirm
 import dev.tracedown.gateway.data.auth.PasswordResetRequest
+import dev.tracedown.gateway.data.auth.ProfileCapabilitiesResponse
 import dev.tracedown.gateway.data.auth.RevokedCount
 import dev.tracedown.gateway.data.auth.SwitchOrgRequest
 import dev.tracedown.gateway.data.auth.TotpConfirmRequest
@@ -214,7 +215,7 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
         call.respond(AuthController.updateProfile(principal.userId, body.displayName))
     }
 
-    /** Returns whether the current user can edit their profile. */
+    /** Returns what the current user may do to their own account. */
     get<Auth.ProfileCapabilities> {
         val principal = requireAuth(call)
         val canEdit = if (appConfig.platform.allowProfileEdit) {
@@ -223,7 +224,16 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
             val orgId = principal.organizationId
             orgId != null && hasOrgUsersWrite(orgId, principal.userId)
         }
-        call.respond(mapOf("allowProfileEdit" to canEdit))
+        val canClose = appConfig.platform.allowAccountClosure
+        call.respond(
+            ProfileCapabilitiesResponse(
+                allowProfileEdit = canEdit,
+                allowAccountClosure = canClose,
+                // Only the closure section reads these, so nothing is queried
+                // for an install that has closure switched off.
+                ownedOrgs = if (canClose) AuthController.ownedOrgs(principal.userId) else emptyList(),
+            )
+        )
     }
 
     /** Changes the current user's password. Requires current password. */
@@ -292,11 +302,29 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
         call.respond(RevokedCount(revoked = count))
     }
 
-    /** Deletes the current user's account. Requires password. Must not own any orgs. */
+    /**
+     * Closes the current user's account. Off unless the operator switched
+     * `platform.allowAccountClosure` on — on a managed install an account is
+     * the operator's to remove, and an org admin removing the last membership
+     * already ends one.
+     *
+     * Confirmed with password plus a second factor when enrolled. Owned
+     * organizations block it (409) unless the account is their only member and
+     * the request opts to take them along.
+     */
     delete<Auth.Account> {
         val principal = requireAuth(call)
+        if (!appConfig.platform.allowAccountClosure) {
+            throw ForbiddenException(ErrorCodes.ACCOUNT_CLOSURE_DISABLED)
+        }
         val body = tryReceive<dev.tracedown.gateway.data.auth.DeleteAccountRequest>(call)
-        AuthController.deleteAccount(principal.userId, body.password)
+        AuthController.deleteAccount(
+            userId = principal.userId,
+            password = body.password,
+            code = body.code,
+            deleteOwnedOrgs = body.deleteOwnedOrgs,
+            purgeRetentionDays = appConfig.systemLimits.purgeRetentionDays,
+        )
         call.respond(mapOf("ok" to true))
     }
 }

@@ -9,7 +9,10 @@ import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.common.models.OrgGroups
 import dev.tracedown.common.models.OrgUserGroups
 import dev.tracedown.common.models.OrgUsers
+import dev.tracedown.common.audit.AuditService
+import dev.tracedown.common.onboarding.AccountLifecycle
 import dev.tracedown.common.onboarding.PasswordHasher
+import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.common.auth.canRead
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.PasswordResetTokens
@@ -23,16 +26,27 @@ import dev.tracedown.gateway.data.auth.LoginResponse
 import dev.tracedown.gateway.data.auth.MeResponse
 import dev.tracedown.gateway.data.auth.OrgMembership
 import dev.tracedown.gateway.data.auth.OrgPermissionsDto
+import dev.tracedown.gateway.data.auth.OwnedOrgSummary
 import dev.tracedown.gateway.data.auth.TotpSetupResponse
 import dev.tracedown.gateway.data.auth.UserSummary
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.gateway.controllers.orgs.MembershipAccess
+import dev.tracedown.gateway.controllers.orgs.OrgSettingsController
+import dev.tracedown.gateway.util.AccountClosurePolicy
 import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.PasswordPolicyConfig
 import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.validatePassword
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.neq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
@@ -58,7 +72,9 @@ object AuthController {
     private val secureRandom = SecureRandom()
     private const val CHALLENGE_TTL_SECONDS = 300L // 5 minutes
     private const val SESSION_TOUCH_DEBOUNCE_SECONDS = 60L
-    private const val MAX_TOTP_ATTEMPTS = 5 // failed codes per pending session before lockout
+    // Per-login guess cap. The account-wide limit that actually bounds guessing
+    // lives in TotpPolicy — this one only stops a single pending session being
+    // hammered, and a fresh login resets it by design.
 
     /** Tracks last touch time per session to debounce last_active_at updates. */
     private val sessionTouchCache = java.util.concurrent.ConcurrentHashMap<UUID, Long>()
@@ -120,8 +136,13 @@ object AuthController {
      * Verifies a TOTP code against the pending session named by [challenge] (its
      * id) and, on success, activates that same row into a usable session — the
      * bearer token is minted only here, so the pre-auth challenge never doubles
-     * as a credential. Failed codes increment the row's attempt counter and lock
-     * it at [MAX_TOTP_ATTEMPTS] for the remainder of its TTL.
+     * as a credential.
+     *
+     * Failed codes count against the ACCOUNT, not this session: counting them on
+     * the pending row meant an attacker holding the password reset the counter
+     * by starting a new login, so five guesses per login became unlimited
+     * guesses. The account counter trips a time-boxed lock (see [TotpPolicy]);
+     * the pending row's own counter is kept as a per-login cap on top of it.
      */
     fun verifyTotp(
         challenge: String,
@@ -150,7 +171,7 @@ object AuthController {
             }
 
             val attempts = pending[Sessions.totpAttemptCount]
-            if (attempts >= MAX_TOTP_ATTEMPTS) {
+            if (attempts >= TotpPolicy.MAX_ATTEMPTS) {
                 throw UnauthorizedException(ErrorCodes.INVALID_TOTP_CODE)
             }
 
@@ -162,23 +183,31 @@ object AuthController {
 
             if (!user[Users.isActive]) throw UnauthorizedException(ErrorCodes.ACCOUNT_DEACTIVATED)
 
-            val secret = user[Users.totpSecretEncrypted]
-                ?: throw UnauthorizedException(ErrorCodes.TOTP_NOT_CONFIGURED)
-            val iv = user[Users.totpSecretIv]
-                ?: throw UnauthorizedException(ErrorCodes.TOTP_NOT_CONFIGURED)
+            val attemptedAt = Instant.now()
+            if (TotpPolicy.isLocked(user[Users.totpLockedUntil], attemptedAt)) {
+                throw UnauthorizedException(ErrorCodes.INVALID_TOTP_CODE)
+            }
 
-            val decryptedSecret = TotpUtil.decryptSecret(secret, iv, hmacKey)
-            val valid = TotpUtil.verifyCode(decryptedSecret, code) || tryRecoveryCode(userId, code)
+            if (user[Users.totpSecretEncrypted] == null || user[Users.totpSecretIv] == null) {
+                throw UnauthorizedException(ErrorCodes.TOTP_NOT_CONFIGURED)
+            }
 
-            if (!valid) {
+            if (!consumeSecondFactor(user, code)) {
+                val failure = TotpPolicy.afterFailure(user[Users.totpFailedAttempts], attemptedAt)
+                Users.update({ Users.id eq userId }) {
+                    it[totpFailedAttempts] = failure.attempts
+                    if (failure.lockedUntil != null) it[totpLockedUntil] = failure.lockedUntil
+                }
                 Sessions.update({ Sessions.id eq pendingId }) {
                     it[totpAttemptCount] = attempts + 1
                 }
                 throw UnauthorizedException(ErrorCodes.INVALID_TOTP_CODE)
             }
 
+            // A completed second factor clears the account's guess history.
             Users.update({ Users.id eq userId }) {
-                it[totpLastUsedAt] = Instant.now()
+                it[totpFailedAttempts] = 0
+                it[totpLockedUntil] = null
             }
 
             // Activate the pending row in place: mint the bearer token now.
@@ -290,11 +319,13 @@ object AuthController {
             throw UnauthorizedException(ErrorCodes.INVALID_SETUP_TOKEN)
         }
 
-        // Verify the code against the embedded secret
+        // Verify the code against the embedded secret. The secret is not stored
+        // yet, so there is no consumed-step history to check against — but the
+        // step that enrolls is recorded below, so the very same code cannot
+        // then be replayed at the login prompt.
         val secret = TotpUtil.decryptSecret(encrypted, iv, hmacKey)
-        if (!TotpUtil.verifyCode(secret, code)) {
-            throw UnauthorizedException(ErrorCodes.INVALID_TOTP_CODE)
-        }
+        val enrollStep = TotpUtil.matchingStep(secret, code)
+            ?: throw UnauthorizedException(ErrorCodes.INVALID_TOTP_CODE)
 
         return transaction {
             val user = Users.selectAll()
@@ -309,6 +340,7 @@ object AuthController {
                 it[totpEnabled] = true
                 it[totpEnrolledAt] = Instant.now()
                 it[totpLastUsedAt] = Instant.now()
+                it[totpLastStep] = enrollStep
             }
 
             // Generate recovery codes (shown once)
@@ -593,6 +625,9 @@ object AuthController {
                     it[id] = UUID.randomUUID()
                     it[PasswordResetTokens.userId] = userId
                     it[PasswordResetTokens.tokenHash] = tokenHash
+                    // Indexed locator — confirmation looks the row up by this
+                    // digest instead of bcrypting every outstanding reset.
+                    it[tokenLookup] = TokenHasher.sha256Hex(rawToken)
                     it[PasswordResetTokens.expiresAt] = expiresAt
                     it[createdAt] = now
                 }
@@ -631,16 +666,25 @@ object AuthController {
         if (errors.isNotEmpty()) throw BadRequestException(ErrorCodes.PASSWORD_TOO_WEAK)
 
         transaction {
-            // Find all unused, non-expired tokens and verify against each
-            val candidates = PasswordResetTokens.selectAll()
-                .where { (PasswordResetTokens.used eq false) }
-                .toList()
-
-            val matchedToken = candidates.firstOrNull { row ->
-                val expiresAt = row[PasswordResetTokens.expiresAt]
-                expiresAt > Instant.now() &&
-                BCrypt.verifyer().verify(token.toCharArray(), row[PasswordResetTokens.tokenHash]).verified
-            } ?: throw BadRequestException(ErrorCodes.INVALID_TOKEN)
+            // Locate the single candidate by its indexed digest, with unused and
+            // unexpired settled in SQL. This endpoint is unauthenticated, so it
+            // must not do work proportional to how many resets are outstanding:
+            // scanning every unused row and bcrypting each hash let one junk
+            // request burn a bcrypt per live token. A wrong or expired token now
+            // costs one indexed lookup and no bcrypt; only the located row is
+            // verified — the digest locates, the bcrypt hash authenticates.
+            val matchedToken = PasswordResetTokens.selectAll()
+                .where {
+                    (PasswordResetTokens.tokenLookup eq TokenHasher.sha256Hex(token)) and
+                        (PasswordResetTokens.used eq false) and
+                        (PasswordResetTokens.expiresAt greater Instant.now())
+                }
+                .limit(1)
+                .firstOrNull()
+                ?.takeIf { row ->
+                    BCrypt.verifyer().verify(token.toCharArray(), row[PasswordResetTokens.tokenHash]).verified
+                }
+                ?: throw BadRequestException(ErrorCodes.INVALID_TOKEN)
 
             val userId = matchedToken[PasswordResetTokens.userId]
             val passwordHash = PasswordHasher.hash(newPassword)
@@ -734,9 +778,7 @@ object AuthController {
             val iv = user[Users.totpSecretIv]
             if (secret != null && iv != null) {
                 if (code.isNullOrBlank()) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
-                val decryptedSecret = TotpUtil.decryptSecret(secret, iv, hmacKey)
-                val valid = TotpUtil.verifyCode(decryptedSecret, code) || tryRecoveryCode(userId, code)
-                if (!valid) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
+                if (!consumeSecondFactor(user, code)) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
             }
         }
     }
@@ -761,20 +803,18 @@ object AuthController {
             val iv = user[Users.totpSecretIv]
                 ?: throw BadRequestException(ErrorCodes.TOTP_NOT_CONFIGURED)
 
-            val decryptedSecret = TotpUtil.decryptSecret(secret, iv, hmacKey)
-            if (!TotpUtil.verifyCode(decryptedSecret, code)) {
-                // Try recovery code
-                if (!tryRecoveryCode(userId, code)) {
-                    throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
-                }
+            if (!consumeSecondFactor(user, code)) {
+                throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
             }
 
-            // Clear TOTP fields
+            // Clear TOTP fields. The consumed-step marker goes too: the secret
+            // is gone, so a re-enrollment starts from a clean slate.
             Users.update({ Users.id eq userId }) {
                 it[totpEnabled] = false
                 it[totpSecretEncrypted] = null
                 it[totpSecretIv] = null
                 it[totpEnrolledAt] = null
+                it[totpLastStep] = null
             }
 
             // Delete all recovery codes
@@ -794,10 +834,10 @@ object AuthController {
                 .where { (Users.id eq userId) and (Users.deleted eq false) }
                 .firstOrNull() ?: throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
             if (!user[Users.totpEnabled]) throw BadRequestException(ErrorCodes.TOTP_NOT_CONFIGURED)
-            val secret = user[Users.totpSecretEncrypted] ?: throw BadRequestException(ErrorCodes.TOTP_NOT_CONFIGURED)
-            val iv = user[Users.totpSecretIv] ?: throw BadRequestException(ErrorCodes.TOTP_NOT_CONFIGURED)
-            val decryptedSecret = TotpUtil.decryptSecret(secret, iv, hmacKey)
-            if (!TotpUtil.verifyCode(decryptedSecret, code) && !tryRecoveryCode(userId, code)) {
+            if (user[Users.totpSecretEncrypted] == null || user[Users.totpSecretIv] == null) {
+                throw BadRequestException(ErrorCodes.TOTP_NOT_CONFIGURED)
+            }
+            if (!consumeSecondFactor(user, code)) {
                 throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
             }
             // Replaces the whole set (delete + insert), returning the plaintext once.
@@ -831,6 +871,47 @@ object AuthController {
         }
 
         return codes
+    }
+
+    /**
+     * Verifies a second factor for [user] — a TOTP code or a recovery code —
+     * and CONSUMES it. Returns false if neither matched, or if the TOTP code
+     * matched a step this account has already spent.
+     *
+     * Consumption is the point. A TOTP code is single-use by definition, but
+     * the verifier only ever asked "does this match the current or previous
+     * window", so an observed code stayed good for the rest of its window on
+     * every endpoint that takes a second factor. Recording the consumed step
+     * and demanding a strictly newer one closes that, and does it once for
+     * every caller rather than per endpoint. Recovery codes were always
+     * single-use; they are consumed by [tryRecoveryCode] as before.
+     *
+     * Must run inside a transaction, and [user] must be a freshly read row —
+     * the replay check reads `totp_last_step` from it.
+     */
+    private fun consumeSecondFactor(user: ResultRow, code: String): Boolean {
+        val userId = user[Users.id]
+        val secret = user[Users.totpSecretEncrypted]
+        val iv = user[Users.totpSecretIv]
+        val step = if (secret != null && iv != null) {
+            TotpUtil.matchingStep(TotpUtil.decryptSecret(secret, iv, hmacKey), code)
+        } else {
+            null
+        }
+
+        if (step != null) {
+            // A replayed code is not then tried as a recovery code: it is a
+            // TOTP code, and it is spent.
+            if (!TotpPolicy.consumes(step, user[Users.totpLastStep])) return false
+        } else if (!tryRecoveryCode(userId, code)) {
+            return false
+        }
+
+        Users.update({ Users.id eq userId }) {
+            if (step != null) it[totpLastStep] = step
+            it[totpLastUsedAt] = Instant.now()
+        }
+        return true
     }
 
     /**
@@ -1099,49 +1180,140 @@ object AuthController {
     }
 
     /**
-     * Deletes the user's account.
+     * Organizations [userId] owns, with whether they hold any other membership.
      *
-     * Requires password confirmation. The user must not be the owner of any
-     * organization — ownership must be transferred first.
-     * Soft-deletes the user, revokes all sessions, and removes org memberships.
+     * "Sole member" means no other non-deleted membership row exists — a pending
+     * invite counts as somebody, deliberately: it is a person who was told they
+     * were getting an organization, and deleting it out from under them should
+     * be an explicit hand-off, not a side effect of somebody closing an account.
      */
-    fun deleteAccount(userId: UUID, password: String) {
+    fun ownedOrgs(userId: UUID): List<OwnedOrgSummary> = transaction {
+        Organizations.selectAll()
+            .where { (Organizations.ownerId eq userId) and (Organizations.deleted eq false) }
+            .map { org ->
+                val orgId = org[Organizations.id]
+                val others = OrgUsers.selectAll()
+                    .where {
+                        (OrgUsers.organizationId eq orgId) and
+                        (OrgUsers.userId neq userId) and
+                        (OrgUsers.deleted eq false)
+                    }
+                    .limit(1)
+                    .any()
+                OwnedOrgSummary(
+                    id = orgId.toString(),
+                    name = org[Organizations.name],
+                    soleMember = !others,
+                )
+            }
+    }
+
+    /**
+     * Closes the user's own account.
+     *
+     * Confirmed exactly as deleting an organization is — password plus a second
+     * factor when one is enrolled ([verifyIdentity]) — because it sits next to
+     * that button and ends just as much.
+     *
+     * An owned organization blocks the closure. Where the account is its only
+     * member, [deleteOwnedOrgs] lets the request take the organization with it,
+     * through the normal deletion path so the same teardown runs; anything with
+     * other members has to be handed over first, and comes back as a 409 naming
+     * what is in the way.
+     *
+     * The account itself is never soft-deleted here directly. Every membership
+     * is ended the way a removal ends one — access revoked before the row goes —
+     * and [AccountLifecycle.reconcile] then draws the same conclusion it draws
+     * for a member removed by an admin: no memberships left, so the account is
+     * scheduled for deletion, its sessions and silences purged with it. One
+     * policy, one code path.
+     *
+     * The one thing that differs from the admin-removal case is *how long* the
+     * row is kept. [AccountLifecycle.ORPHAN_GRACE_SECONDS] exists so an account
+     * that lost its last membership without asking can be revived by a re-invite.
+     * Nothing here was unasked for: the holder proved who they were and pressed
+     * the button. So the window is the operator's configured retention
+     * ([purgeRetentionDays], `systemLimits.purgeRetentionDays`) — the same one
+     * the deleted organizations above are given, and the same one whose zero
+     * default is what makes "delete" mean deleted on this install.
+     */
+    fun deleteAccount(
+        userId: UUID,
+        password: String,
+        code: String? = null,
+        deleteOwnedOrgs: Boolean = false,
+        purgeRetentionDays: Int = 0,
+    ) {
+        // Identity first: nothing below runs, and nothing is written to any
+        // audit log, until the person at the keyboard has proved who they are.
+        verifyIdentity(userId, password, code)
+
+        val toDelete = transaction {
+            val owned = ownedOrgs(userId)
+            val blocking = AccountClosurePolicy.blocking(owned, deleteOwnedOrgs)
+            if (blocking.isNotEmpty()) {
+                throw ConflictException(
+                    ErrorCodes.ACCOUNT_OWNS_ORGANIZATIONS,
+                    details = buildJsonObject {
+                        put("organizations", buildJsonArray { blocking.forEach { add(JsonPrimitive(it.name)) } })
+                    },
+                )
+            }
+
+            val displayName = Users.selectAll()
+                .where { Users.id eq userId }
+                .firstOrNull()?.get(Users.displayName)
+
+            // The account is its own actor: this is the one deletion of a member
+            // nobody else ordered, and the log should say so rather than leave a
+            // membership vanishing with no entry at all.
+            OrgUsers.selectAll()
+                .where { (OrgUsers.userId eq userId) and (OrgUsers.deleted eq false) }
+                .map { it[OrgUsers.organizationId] }
+                .distinct()
+                .forEach { orgId ->
+                    AuditService.log(
+                        orgId, userId, "close.account", "user", userId.toString(),
+                        entityDisplayName = displayName,
+                    )
+                }
+
+            owned.map { UUID.fromString(it.id) }
+        }
+
+        // Owned organizations go through the ordinary deletion path — same owner
+        // check, same interception seam, same probe teardown — rather than a
+        // second, quieter copy of it here.
+        toDelete.forEach { OrgSettingsController.deleteOrg(it, userId, purgeRetentionDays) }
+
         transaction {
-            val user = Users.selectAll()
-                .where { (Users.id eq userId) and (Users.deleted eq false) }
-                .firstOrNull() ?: throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
-
-            // Verify password
-            val result = BCrypt.verifyer().verify(password.toCharArray(), user[Users.passwordHash])
-            if (!result.verified) throw UnauthorizedException(ErrorCodes.INCORRECT_PASSWORD)
-
-            // Check user doesn't own any active orgs
-            val ownedOrgs = Organizations.selectAll()
-                .where { (Organizations.ownerId eq userId) and (Organizations.deleted eq false) }
-                .toList()
-            if (ownedOrgs.isNotEmpty()) {
-                throw BadRequestException(ErrorCodes.FORBIDDEN)
-            }
-
             val now = Instant.now()
+            // The operator's retention setting, in seconds. Zero — the default —
+            // makes every row below purgeable immediately, which is the whole
+            // contract of `systemLimits.purgeRetentionDays = 0`.
+            val retentionSeconds = purgeRetentionDays * 86_400L
+            val memberships = OrgUsers.selectAll()
+                .where { (OrgUsers.userId eq userId) and (OrgUsers.deleted eq false) }
+                .map { it[OrgUsers.id] to it[OrgUsers.organizationId] }
 
-            // Revoke all sessions
-            Sessions.update({ Sessions.userId eq userId }) {
-                it[revoked] = true
+            memberships.forEach { (membershipId, orgId) ->
+                MembershipAccess.revokeAll(orgId, membershipId)
+                OrgUsers.update({ OrgUsers.id eq membershipId }) {
+                    it[deleted] = true
+                    it[deletedAt] = now
+                    it[purgeAfter] = now.plusSeconds(retentionSeconds)
+                    it[isActive] = false
+                }
             }
 
-            // Remove org memberships
-            OrgUsers.update({ (OrgUsers.userId eq userId) and (OrgUsers.deleted eq false) }) {
-                it[deleted] = true
-                it[deletedAt] = now
-            }
+            // Sessions and silences go with it. The window is the configured
+            // retention, not the orphan grace: this closure was requested.
+            AccountLifecycle.reconcile(userId, now, retentionSeconds)
 
-            // Soft-delete user
-            Users.update({ Users.id eq userId }) {
-                it[deleted] = true
-                it[deletedAt] = now
-                it[isActive] = false
-                it[purgeAfter] = now.plusSeconds(30L * 24 * 3600) // 30 days retention
+            memberships.forEach { (_, orgId) ->
+                RealtimePublisher.publish("org:$orgId", orgId, "user.removed", buildJsonObject {
+                    put("userId", userId.toString())
+                })
             }
         }
     }

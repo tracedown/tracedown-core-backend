@@ -28,14 +28,35 @@ object TotpUtil {
         return Base64.getEncoder().encodeToString(encrypted) to Base64.getEncoder().encodeToString(iv)
     }
 
-    fun verifyCode(secret: ByteArray, code: String): Boolean {
+    /**
+     * The time-step index [code] matches, or null if it matches neither the
+     * current step nor the one behind it (clock-drift tolerance).
+     *
+     * Callers need the step, not just a yes/no: a TOTP code is single-use, and
+     * the only way to enforce that is to record which step was consumed and
+     * refuse anything that is not strictly newer (see [TotpPolicy.consumes]).
+     * A bare boolean cannot express which of the two accepted windows matched,
+     * so a replayed code was indistinguishable from a fresh one.
+     */
+    fun matchingStep(secret: ByteArray, code: String, now: Instant = Instant.now()): Long? {
         val key = SecretKeySpec(secret, totp.algorithm)
-        val now = Instant.now()
+        val stepSeconds = totp.timeStep.seconds
+        val currentStep = Math.floorDiv(now.epochSecond, stepSeconds)
         // Accept current window and one step back (clock drift tolerance)
-        val current = totp.generateOneTimePasswordString(key, now)
-        val previous = totp.generateOneTimePasswordString(key, now.minus(totp.timeStep))
-        return code == current || code == previous
+        if (code == totp.generateOneTimePasswordString(key, now)) return currentStep
+        if (code == totp.generateOneTimePasswordString(key, now.minus(totp.timeStep))) return currentStep - 1
+        return null
     }
+
+    /**
+     * Whether [code] matches a currently valid step at all, ignoring whether it
+     * has already been used. Only for flows with no account state to consume
+     * against — enrollment confirmation, where the secret is not stored yet.
+     * Every flow that authenticates an existing account must go through
+     * [matchingStep] and [TotpPolicy.consumes] instead.
+     */
+    fun verifyCode(secret: ByteArray, code: String): Boolean =
+        matchingStep(secret, code) != null
 
     fun generateCode(secret: ByteArray): String {
         val key = SecretKeySpec(secret, totp.algorithm)
