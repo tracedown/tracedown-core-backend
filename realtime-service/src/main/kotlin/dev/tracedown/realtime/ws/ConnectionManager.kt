@@ -1,5 +1,6 @@
 package dev.tracedown.realtime.ws
 
+import dev.tracedown.common.agents.FleetAudience
 import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.realtime.auth.ChannelAuthorizer
 import io.ktor.websocket.Frame
@@ -131,10 +132,22 @@ class ConnectionManager {
      * Queues an event for all clients subscribed to the given channel; the
      * flusher coalesces queued events into one batch frame per interval so
      * dispatch bursts don't spam thousands of tiny frames per client.
-     * Filters by orgId unless the channel is global (e.g., agents:*).
+     *
+     * Filters by orgId, with one exemption: a fleet event published under
+     * [FleetAudience.GLOBAL]. That sentinel means the event belongs to no
+     * organization — Core's agents are shared platform infrastructure, so an org
+     * filter would deliver it to nobody — and who may hold a subscription to the
+     * feed at all is decided at subscribe time by
+     * [ChannelAuthorizer.canSubscribe].
+     *
+     * The exemption is on the sentinel, not on the channel. A deployment that
+     * gives agents owners installs a [FleetAudience.Ownership], its publishes
+     * name real organizations, and those events are filtered here exactly like
+     * every other channel's — no second gate and no per-client lookup. The
+     * read-side twin for REST fleet lists is `AgentVisibility`.
      */
     fun broadcast(channel: String, orgId: UUID, eventJson: String) {
-        val global = channel.startsWith("agents")
+        val global = ChannelAuthorizer.isFleetChannel(channel) && orgId == FleetAudience.GLOBAL
         val subscribers = channelSubscribers[channel] ?: return
         for (cid in subscribers) {
             val client = clients[cid] ?: continue

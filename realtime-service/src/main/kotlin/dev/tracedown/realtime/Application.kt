@@ -1,6 +1,10 @@
 package dev.tracedown.realtime
 
 import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.config.SecretGuard
+import dev.tracedown.common.health.databaseCheck
+import dev.tracedown.common.health.installHealthEndpoints
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.realtime.config.RealtimeConfig
@@ -30,6 +34,13 @@ fun main(args: Array<String>) = EngineMain.main(args)
 /** Ktor module — wires DB, Redis A (pub/sub), WebSocket, and routes. */
 fun Application.module() {
     val config = RealtimeConfig.load(environment)
+
+    // No insecure defaults of its own to guard; still reports the resolved
+    // deployment environment so a misspelt DEPLOYMENT_ENV is visible here too.
+    SecretGuard.announce(
+        environment.config.propertyOrNull("deployment.environment")?.getString(),
+        "realtime-service",
+    )
 
     // Database (for session validation)
     val dataSource = DatabaseFactory.init(
@@ -77,10 +88,22 @@ fun Application.module() {
     eventRouter.start()
     connectionManager.startFlusher(routerScope)
 
-    // Routes
+    // Routes. /ping already exists here and answers "pong" in plain text, so
+    // only readiness is added — callers depend on that body. Both dependencies
+    // are required: sessions are validated against Postgres on every connect,
+    // and with Redis A gone a socket connects and then receives nothing, which
+    // is worse than reporting not-ready.
     routing {
         realtimeRoutes(connectionManager)
     }
+    installHealthEndpoints(
+        "realtime-service",
+        listOf(
+            databaseCheck(dataSource),
+            redisCheck("redis-a") { commandConnection.sync() },
+        ),
+        liveness = false,
+    )
 
     log.info("realtime-service started (pingInterval={}ms, pingTimeout={}ms)", config.pingIntervalMs, config.pingTimeoutMs)
 
