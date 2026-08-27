@@ -1,6 +1,8 @@
 package dev.tracedown.email
 
 import dev.tracedown.common.email.createTransport
+import dev.tracedown.common.health.installHealthEndpoints
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.email.config.EmailServiceConfig
 import dev.tracedown.email.consumers.EmailQueueConsumer
@@ -40,21 +42,35 @@ fun Application.module() {
         logBodies = !dev.tracedown.common.config.SecretGuard.isProduction(deployEnv),
     )
 
-    // Redis connection for BRPOP + idempotency SET NX
+    // Redis connection for the processor's idempotency SET NX.
     val redisConn = RedisFactory.createConnection(config.redisAUrl)
     val redis = redisConn.sync()
 
+    // The consumer gets its own blocking connection: BRPOP holds a connection
+    // for its whole pop timeout, so anything sharing it (the idempotency check
+    // the processor runs for every message) waited behind an idle queue, and
+    // the shorter default command timeout would have cut the pop short.
+    val consumerConn = RedisFactory.createBlockingConnection(config.redisAUrl, config.popTimeoutSeconds)
+
     // Processor + Consumer
     val processor = EmailProcessor(emailTransport, redis)
-    val consumer = EmailQueueConsumer(redis, processor, config.popTimeoutSeconds)
+    val consumer = EmailQueueConsumer(consumerConn.sync(), processor, config.popTimeoutSeconds)
     val consumerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     consumer.start(consumerScope)
+
+    // No database here at all. Redis A is required — it is the entire input to
+    // this service. Probed on the processor's connection, not the parked one.
+    installHealthEndpoints(
+        "email-service",
+        listOf(redisCheck("redis-a") { redis }),
+    )
 
     log.info("email-service started (provider={})", config.email.provider)
 
     // Shutdown hooks
     monitor.subscribe(ApplicationStopped) {
         consumer.stop()
+        consumerConn.close()
         redisConn.close()
         emailTransport.close()
         log.info("email-service shut down")

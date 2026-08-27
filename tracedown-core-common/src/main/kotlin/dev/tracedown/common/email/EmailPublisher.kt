@@ -5,6 +5,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.Base64
 import java.util.UUID
@@ -16,8 +17,24 @@ import java.util.UUID
  * - [publish]: named template + vars (used by gateway for system emails)
  * - [publishBody]: pre-baked HTML body (used by notification-dispatcher), and
  *   the only mode that carries attachments
+ *
+ * Redis arrives as a provider so a caller holding its connection behind
+ * `by lazy` is not forced to connect just to construct this — the gateway
+ * builds one during module init, and an eager connect there meant a Redis
+ * restart mid-deploy stopped Ktor from ever binding.
+ *
+ * **Queueing never throws.** A failed enqueue is logged and reported through
+ * the return value. An unreachable queue is a mail outage, and turning it into
+ * an exception turned it into a 500 on every path that sends mail — password
+ * reset requests included, where the caller answers identically either way on
+ * purpose. Callers that can act on the failure should check the result.
  */
-class EmailPublisher(private val redis: RedisCommands<String, String>) {
+class EmailPublisher(private val redis: () -> RedisCommands<String, String>) {
+
+    /** Convenience for callers that already hold a live connection. */
+    constructor(redis: RedisCommands<String, String>) : this({ redis })
+
+    private val log = LoggerFactory.getLogger(javaClass)
 
     companion object {
         const val QUEUE_KEY = "email_queue"
@@ -36,7 +53,7 @@ class EmailPublisher(private val redis: RedisCommands<String, String>) {
         vars: Map<String, String>,
         source: String,
         replyTo: String? = null,
-    ) {
+    ): Boolean {
         val envelope = buildJsonObject {
             put("id", UUID.randomUUID().toString())
             put("to", to)
@@ -47,7 +64,7 @@ class EmailPublisher(private val redis: RedisCommands<String, String>) {
             if (replyTo != null) put("replyTo", replyTo)
             put("createdAt", Instant.now().toString())
         }
-        redis.lpush(QUEUE_KEY, envelope.toString())
+        return enqueue(envelope.toString(), type)
     }
 
     /**
@@ -73,7 +90,7 @@ class EmailPublisher(private val redis: RedisCommands<String, String>) {
         notificationLogId: UUID? = null,
         attachments: List<EmailAttachment> = emptyList(),
         footer: String? = null,
-    ) {
+    ): Boolean {
         val envelope = buildJsonObject {
             put("id", UUID.randomUUID().toString())
             put("to", to)
@@ -86,7 +103,23 @@ class EmailPublisher(private val redis: RedisCommands<String, String>) {
             if (!footer.isNullOrBlank()) put("footer", footer)
             put("createdAt", Instant.now().toString())
         }
-        redis.lpush(QUEUE_KEY, envelope.toString())
+        return enqueue(envelope.toString(), "body")
+    }
+
+    /**
+     * Pushes one envelope, converting a queue outage into a logged failure
+     * rather than an exception thrown at whatever request happened to be
+     * sending mail. Returns true when the job is on the queue.
+     */
+    private fun enqueue(envelope: String, kind: String): Boolean = try {
+        redis().lpush(QUEUE_KEY, envelope)
+        true
+    } catch (e: Exception) {
+        log.error(
+            "email job '{}' was NOT queued — the mail queue is unreachable: {}",
+            kind, e.message,
+        )
+        false
     }
 
     /**

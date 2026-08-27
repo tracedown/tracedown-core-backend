@@ -17,6 +17,12 @@ import org.slf4j.LoggerFactory
  * arms the guards. An explicit escape hatch, `ALLOW_INSECURE_DEV_KEYS=true`,
  * suppresses the guards even in production (for a throwaway prod-like sandbox); it
  * is never needed for ordinary development, which is not `production` to begin with.
+ *
+ * Arming on one exact string means the guards are fail-open by construction: a
+ * `prod` typo, an unrecognised value or an unset variable all leave a service
+ * running on dev secrets. They are never fail-*silent*, though — an unarmed
+ * guard says so at startup ([announce]), and a value that was clearly reaching
+ * for production says so at ERROR.
  */
 object SecretGuard {
     const val ENV_VAR = "DEPLOYMENT_ENV"
@@ -57,10 +63,14 @@ object SecretGuard {
      * Fails startup with a single [IllegalStateException] listing every offending
      * setting when the guards are enforcing. [checks] maps a human-readable setting
      * name to whether it currently holds an insecure default (`true` = insecure).
-     * A no-op in dev (or when the override is set).
+     * A no-op in dev (or when the override is set) — but never a *silent* one:
+     * see [announce].
      */
     fun requireSecure(configValue: String?, service: String, checks: Map<String, Boolean>) {
-        if (!enforcing(configValue)) return
+        if (!enforcing(configValue)) {
+            announce(configValue, service, checks)
+            return
+        }
         val violations = checks.filterValues { it }.keys
         if (violations.isEmpty()) return
         throw IllegalStateException(
@@ -69,4 +79,56 @@ object SecretGuard {
                 ". Configure real values (or set $OVERRIDE_VAR=true to override — not recommended).",
         )
     }
+
+    /**
+     * Says, at startup, that the guards are NOT armed and why.
+     *
+     * The guards arm on one exact string, so every way of getting it wrong —
+     * `prod`, a stray value, the variable never set — silently produces a
+     * *running* service with dev secrets in it. That is the failure worth
+     * shouting about: nothing else in the boot sequence mentions it. Call this
+     * directly from services that have no insecure-default checks of their own,
+     * so `DEPLOYMENT_ENV` is reported uniformly across the fleet;
+     * [requireSecure] calls it for the rest.
+     *
+     * A value that *looks* like an attempt at production (`prod`, `prd`,
+     * `live`, `production-eu`…) is logged at ERROR, because it is a typo with
+     * security consequences rather than an ordinary dev run.
+     */
+    fun announce(configValue: String?, service: String, checks: Map<String, Boolean> = emptyMap()) {
+        val env = environment(configValue)
+        val insecure = checks.filterValues { it }.keys
+        val stillInsecure = if (insecure.isEmpty()) "" else " Dev defaults in place: ${insecure.joinToString(", ")}."
+
+        if (env == PRODUCTION) {
+            // enforcing() already warned about the override; make the consequence explicit.
+            log.error(
+                "SECURITY: {} is running in production with the insecure-default guards DISABLED by {}.{}",
+                service, OVERRIDE_VAR, stillInsecure,
+            )
+            return
+        }
+
+        if (looksLikeProduction(env)) {
+            log.error(
+                "SECURITY: {} read {}='{}', which is NOT the literal '{}' — the insecure-default startup " +
+                    "guards are NOT armed. Set {}={} exactly.{}",
+                service, ENV_VAR, env, PRODUCTION, ENV_VAR, PRODUCTION, stillInsecure,
+            )
+            return
+        }
+
+        log.warn(
+            "{} starting with {}='{}' — insecure-default startup guards are NOT armed (only '{}' arms them).{}",
+            service, ENV_VAR, env, PRODUCTION, stillInsecure,
+        )
+    }
+
+    /**
+     * Near-misses for [PRODUCTION]. Anything reaching for production without
+     * hitting it exactly leaves a deployment unguarded, so it is called out
+     * louder than an ordinary dev value.
+     */
+    internal fun looksLikeProduction(env: String): Boolean =
+        env != PRODUCTION && (env.startsWith("prod") || env.startsWith("prd") || env == "live")
 }
