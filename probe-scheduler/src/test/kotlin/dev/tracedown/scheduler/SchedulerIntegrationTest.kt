@@ -282,6 +282,7 @@ class SchedulerIntegrationTest {
             workspaceId = workspaceId,
             organizationId = orgId,
             rawResult = rawResult,
+            startedAt = java.time.Instant.now(),
         )
 
         val length = redisSync.llen(ResultPublisher.QUEUE_KEY)

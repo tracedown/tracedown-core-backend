@@ -32,7 +32,7 @@ class AgentSelector(private val redis: RedisCommands<String, String>) {
      * @return list of agents to dispatch to (may be empty if none eligible)
      */
     fun select(serviceId: UUID, probeMode: String): List<Agent> {
-        val agents = transaction { eligibleAgents(serviceId) }
+        val agents = eligible(serviceId)
         if (agents.isEmpty()) return emptyList()
 
         return when (probeMode) {
@@ -50,6 +50,16 @@ class AgentSelector(private val redis: RedisCommands<String, String>) {
             else -> listOf(agents.first())
         }
     }
+
+    /**
+     * Every agent this service is allowed to run on, in a stable order.
+     *
+     * [select] narrows this to the agent(s) one tick dispatches to; the
+     * re-dispatch path needs the full set so it can fall back to an agent the
+     * mode did not pick. The membership rule is identical either way — a run
+     * never lands on an agent the health check has not cleared.
+     */
+    fun eligible(serviceId: UUID): List<Agent> = transaction { eligibleAgents(serviceId) }
 
     private fun eligibleAgents(serviceId: UUID): List<Agent> {
         // Check if service has specific allowed agents

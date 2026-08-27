@@ -2,6 +2,7 @@ package dev.tracedown.scheduler.scheduling
 
 import org.quartz.*
 import org.quartz.impl.StdSchedulerFactory
+import org.quartz.listeners.TriggerListenerSupport
 import org.slf4j.LoggerFactory
 import java.util.Properties
 import java.util.UUID
@@ -25,6 +26,34 @@ class QuartzManager(threadPoolSize: Int) {
             setProperty("org.quartz.jobStore.class", "org.quartz.simpl.RAMJobStore")
         }
         scheduler = StdSchedulerFactory(props).scheduler
+    }
+
+    /**
+     * Reports probe triggers that Quartz dropped without firing.
+     *
+     * The probe triggers use `withMisfireHandlingInstructionDoNothing`: a cron
+     * probe that is late is skipped rather than run twice, which is the right
+     * policy and the wrong amount of noise — nothing was logged and nothing was
+     * recorded, so a scheduler whose thread pool saturated lost coverage
+     * invisibly. The handler is called on the Quartz thread that detected the
+     * misfire and must not block.
+     */
+    fun onProbeMisfire(handler: (UUID) -> Unit) {
+        scheduler.listenerManager.addTriggerListener(object : TriggerListenerSupport() {
+            override fun getName() = "probe-misfire-listener"
+
+            override fun triggerMisfired(trigger: Trigger) {
+                if (trigger.key.group != PROBE_GROUP) return
+                val raw = trigger.key.name.removePrefix("trigger-")
+                val serviceId = try {
+                    UUID.fromString(raw)
+                } catch (_: Exception) {
+                    return
+                }
+                log.warn("trigger for service {} misfired — recording the tick as skipped", serviceId)
+                handler(serviceId)
+            }
+        })
     }
 
     /** Starts the Quartz scheduler. */
@@ -125,6 +154,11 @@ class QuartzManager(threadPoolSize: Int) {
         return "0 ${fields[0]} ${fields[1]} $dayOfMonth ${fields[3]} $dayOfWeek"
     }
 
-    private fun jobKey(serviceId: UUID) = JobKey("probe-$serviceId", "probes")
-    private fun triggerKey(serviceId: UUID) = TriggerKey("trigger-$serviceId", "probes")
+    private fun jobKey(serviceId: UUID) = JobKey("probe-$serviceId", PROBE_GROUP)
+    private fun triggerKey(serviceId: UUID) = TriggerKey("trigger-$serviceId", PROBE_GROUP)
+
+    companion object {
+        /** Quartz group holding the per-service probe jobs and triggers. */
+        const val PROBE_GROUP = "probes"
+    }
 }
