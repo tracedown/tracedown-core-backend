@@ -9,7 +9,11 @@ import dev.tracedown.common.auth.PermissionCacheService
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.common.pfs.applyPfs
+import dev.tracedown.common.auth.OrgPermissions
+import dev.tracedown.gateway.util.orgGroupSections
+import dev.tracedown.gateway.util.requireGroupGrantable
 import dev.tracedown.gateway.util.requireOrgRead
+import dev.tracedown.gateway.util.requireOrgWrite
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
@@ -20,7 +24,6 @@ import dev.tracedown.common.models.OrgUserGroups
 import dev.tracedown.common.onboarding.AccountLifecycle
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Organizations
-import dev.tracedown.common.models.ResourcePermissions
 import dev.tracedown.common.models.Users
 import dev.tracedown.gateway.controllers.auth.AuthController
 import dev.tracedown.gateway.data.orgs.AcceptInviteResponse
@@ -40,7 +43,6 @@ import dev.tracedown.gateway.util.validatePassword
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -105,6 +107,12 @@ object InviteController {
 
         // Runs inside the caller's injectableInTx transaction.
         return run {
+            // Creating a membership is a write on the user surface — the same
+            // permission its siblings (list, revoke) read. Without it any member
+            // could invite a second address of their own, pre-assign it whatever
+            // group they liked, and accept from their own inbox.
+            val caller = requireOrgWritePermission(orgId, invitedByUserId)
+
             val org = Organizations.selectAll()
                 .where { (Organizations.id eq orgId) and (Organizations.deleted eq false) }
                 .firstOrNull()
@@ -153,16 +161,13 @@ object InviteController {
                         it[lastInviteSentAt] = now
                     }
 
-                    // Access state must reflect THIS invite, not leftovers from
-                    // the previous membership — reset both group memberships and
-                    // direct resource grants before reapplying this invite's groups.
-                    OrgUserGroups.deleteWhere { OrgUserGroups.orgUserId eq orgUserId }
-                    ResourcePermissions.deleteWhere {
-                        (ResourcePermissions.orgId eq orgId) and
-                        (ResourcePermissions.principalType eq "org_user") and
-                        (ResourcePermissions.principalId eq orgUserId)
-                    }
-                    applyPreassignedGroups(orgId, orgUserId, groupIds)
+                    // A returning member starts from nothing. Removal already
+                    // stripped the row (see MembershipAccess); repeating it here
+                    // costs one statement and covers rows soft-deleted before
+                    // that rule existed, so no re-invite can resurrect old
+                    // sections, groups or resource grants.
+                    MembershipAccess.revokeAll(orgId, orgUserId)
+                    applyPreassignedGroups(orgId, orgUserId, groupIds, caller)
 
                     sendInviteEmail(
                         email, org[Organizations.name],
@@ -252,7 +257,7 @@ object InviteController {
 
             // Pre-assign groups so the member lands fully provisioned. The
             // permission cache is recomputed at acceptance.
-            applyPreassignedGroups(orgId, orgUserId, groupIds)
+            applyPreassignedGroups(orgId, orgUserId, groupIds, caller)
 
             AuditService.log(
                 orgId, invitedByUserId, "invite.user", "user", userId.toString(),
@@ -435,7 +440,9 @@ object InviteController {
 
     fun revokeInvite(orgId: UUID, inviteId: UUID, requestingUserId: UUID) {
         transaction {
-            requireOrgPermission(orgId, requestingUserId)
+            // Cancelling a membership is a write, not a read — the same
+            // permission that creating one takes.
+            requireOrgWritePermission(orgId, requestingUserId)
 
             val invite = OrgUsers.selectAll()
                 .where {
@@ -447,6 +454,10 @@ object InviteController {
                 .firstOrNull()
                 ?: throw NotFoundException()
 
+            // A revoked invite is a removed membership: strip it so a later
+            // re-invite resurrects an empty row rather than the pre-configured
+            // sections and groups this one carried.
+            MembershipAccess.revokeAll(orgId, invite[OrgUsers.id])
             OrgUsers.update({ OrgUsers.id eq invite[OrgUsers.id] }) {
                 it[deleted] = true
                 it[deletedAt] = Instant.now()
@@ -464,23 +475,35 @@ object InviteController {
 
     // ── Internals ──
 
-    /** Validates and inserts group memberships for a (pre-)invited member. */
-    private fun applyPreassignedGroups(orgId: UUID, orgUserId: UUID, groupIds: List<String>) {
+    /**
+     * Validates and inserts group memberships for a (pre-)invited member.
+     *
+     * Belonging to the org is not enough to make a group assignable: the group
+     * carries permission levels, so pre-assigning one is a grant of those levels
+     * and goes through the same rule as adding a member to the group by hand.
+     */
+    private fun applyPreassignedGroups(
+        orgId: UUID,
+        orgUserId: UUID,
+        groupIds: List<String>,
+        caller: OrgPermissions,
+    ) {
         if (groupIds.isEmpty()) return
         val validGroups = OrgGroups.selectAll()
             .where {
                 (OrgGroups.organizationId eq orgId) and
                 (OrgGroups.id inList groupIds.map { UUID.fromString(it) })
             }
-            .map { it[OrgGroups.id] }
+            .toList()
         if (validGroups.size != groupIds.distinct().size) {
             throw BadRequestException(ErrorCodes.FIELD_INVALID)
         }
-        validGroups.forEach { gid ->
+        validGroups.forEach { group ->
+            requireGroupGrantable(caller, orgGroupSections(group))
             OrgUserGroups.insert {
                 it[id] = UUID.randomUUID()
                 it[OrgUserGroups.orgUserId] = orgUserId
-                it[orgGroupId] = gid
+                it[orgGroupId] = group[OrgGroups.id]
             }
         }
     }
@@ -508,6 +531,10 @@ object InviteController {
     private fun requireOrgPermission(orgId: UUID, userId: UUID) {
         requireOrgRead(orgId, userId) { it.users }
     }
+
+    /** The write counterpart, for the paths that create or cancel a membership. */
+    private fun requireOrgWritePermission(orgId: UUID, userId: UUID): OrgPermissions =
+        requireOrgWrite(orgId, userId) { it.users }
 
     private fun sendInviteEmail(
         recipientEmail: String,

@@ -4,6 +4,7 @@ import kotlinx.serialization.json.buildJsonObject
 import dev.tracedown.common.realtime.RealtimePublisher
 
 import dev.tracedown.common.audit.AuditService
+import dev.tracedown.common.auth.AccessLevel
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.PermissionCacheService
 import dev.tracedown.common.interceptors.Injectable
@@ -25,6 +26,11 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.GrantPolicy
+import dev.tracedown.gateway.util.orgGroupSections
+import dev.tracedown.gateway.util.requireGrantable
+import dev.tracedown.gateway.util.requireGroupGrantable
+import dev.tracedown.gateway.util.requireOrgPolicyWrite
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
@@ -101,7 +107,7 @@ object GroupController {
      */
     fun updateGroup(orgId: UUID, groupId: UUID, request: UpdateGroupRequest, requestingUserId: UUID): GroupSummary {
         return transaction {
-            requireOrgWrite(orgId, requestingUserId) { it.users }
+            val caller = requireOrgWrite(orgId, requestingUserId) { it.users }
 
             val group = OrgGroups.selectAll()
                 .where { (OrgGroups.id eq groupId) and (OrgGroups.organizationId eq orgId) }
@@ -111,6 +117,17 @@ object GroupController {
             // Validate access levels
             listOfNotNull(request.users, request.settings, request.domains, request.webhooks, request.notifications, request.admin, request.workspaces).forEach { level ->
                 if (level !in 0..2) throw BadRequestException(ErrorCodes.FIELD_INVALID)
+            }
+
+            // A group is a grant with an indirection: raising it raises everyone
+            // in it. Same rule as writing the levels onto a member directly.
+            requireGrantable(caller, orgGroupSections(group), requestedSections(request))
+
+            // TOTP enrolment enforcement is org policy, exactly like the
+            // org-level toggle in OrgSettingsController — admin write, not
+            // users write.
+            if (request.totpRequired != null && request.totpRequired != group[OrgGroups.totpRequired]) {
+                requireOrgPolicyWrite(caller)
             }
 
             // Check name uniqueness if changing
@@ -175,14 +192,33 @@ object GroupController {
         }
     }
 
-    /** Deletes a group and all its memberships. Hard delete — groups have no soft-delete. */
+    /**
+     * Deletes a group and all its memberships. Hard delete — groups have no
+     * soft-delete.
+     *
+     * A delete is strictly de-escalating, so [GrantPolicy]'s first rule — nobody
+     * hands out what they do not hold — never objects. Its second rule does, and
+     * must: deleting a group that carries `admin` takes org admin away from
+     * everyone in it at once, and that is the same write [updateGroup] performs
+     * when it sets the admin section to `none`, where admin write is required.
+     * Without the check here the delete button is simply the cheaper route to
+     * the identical outcome — a `users` writer emptying the org of admins.
+     *
+     * Expressed as what the delete writes: every section this group carries goes
+     * to [AccessLevel.NONE]. A group carrying no admin is unaffected, since a
+     * section already at its requested level is not a grant.
+     */
     fun deleteGroup(orgId: UUID, groupId: UUID, requestingUserId: UUID) {
         transaction {
-            requireOrgWrite(orgId, requestingUserId) { it.users }
+            val caller = requireOrgWrite(orgId, requestingUserId) { it.users }
 
-            val groupName = OrgGroups.selectAll()
+            val group = OrgGroups.selectAll()
                 .where { (OrgGroups.id eq groupId) and (OrgGroups.organizationId eq orgId) }
-                .firstOrNull()?.get(OrgGroups.name) ?: throw NotFoundException()
+                .firstOrNull() ?: throw NotFoundException()
+            val groupName = group[OrgGroups.name]
+
+            val carried = orgGroupSections(group)
+            requireGrantable(caller, carried, carried.mapValues { AccessLevel.NONE })
 
             // Collect affected users before deletion
             val affectedOrgUserIds = OrgUserGroups.selectAll()
@@ -208,8 +244,9 @@ object GroupController {
     /** Adds an org member to a group. The user must be an active member of the organization. */
     fun addMember(orgId: UUID, groupId: UUID, userId: UUID, requestingUserId: UUID) {
         transaction {
-            requireOrgWrite(orgId, requestingUserId) { it.users }
+            val caller = requireOrgWrite(orgId, requestingUserId) { it.users }
             val orgUserId = resolveOrgUserId(orgId, groupId, userId)
+            requireGroupGrantable(caller, groupSections(orgId, groupId))
 
             val already = OrgUserGroups.selectAll()
                 .where { (OrgUserGroups.orgUserId eq orgUserId) and (OrgUserGroups.orgGroupId eq groupId) }
@@ -254,7 +291,7 @@ object GroupController {
      */
     fun syncMembers(orgId: UUID, groupId: UUID, userIds: List<UUID>, requestingUserId: UUID): List<GroupMember> {
         return transaction {
-            requireOrgWrite(orgId, requestingUserId) { it.users }
+            val caller = requireOrgWrite(orgId, requestingUserId) { it.users }
             requireGroupExists(orgId, groupId)
 
             // Current members: orgUserId → userId
@@ -284,6 +321,11 @@ object GroupController {
 
             // Add users not yet in the group
             val toAdd = desiredUserIds - currentUserIds
+            // Removal-only syncs need no grant check — taking a group away
+            // hands out nothing.
+            if (toAdd.isNotEmpty()) {
+                requireGroupGrantable(caller, groupSections(orgId, groupId))
+            }
             for (uid in toAdd) {
                 val orgUserId = resolveOrgUserId(orgId, groupId, uid)
                 OrgUserGroups.insert {
@@ -394,6 +436,26 @@ object GroupController {
                     displayName = user[Users.displayName],
                 )
             }
+    }
+
+    /** The section levels a group carries — what joining it would grant. */
+    private fun groupSections(orgId: UUID, groupId: UUID): Map<String, Short> {
+        val row = OrgGroups.selectAll()
+            .where { (OrgGroups.id eq groupId) and (OrgGroups.organizationId eq orgId) }
+            .firstOrNull()
+            ?: throw NotFoundException()
+        return orgGroupSections(row)
+    }
+
+    /** The section levels this request would write, omitting the fields it leaves alone. */
+    private fun requestedSections(request: UpdateGroupRequest): Map<String, Short> = buildMap {
+        request.users?.let { put("users", it) }
+        request.settings?.let { put("settings", it) }
+        request.domains?.let { put("domains", it) }
+        request.webhooks?.let { put("webhooks", it) }
+        request.notifications?.let { put("notifications", it) }
+        request.admin?.let { put("admin", it) }
+        request.workspaces?.let { put("workspaces", it) }
     }
 
     private fun requireGroupExists(orgId: UUID, groupId: UUID) {
