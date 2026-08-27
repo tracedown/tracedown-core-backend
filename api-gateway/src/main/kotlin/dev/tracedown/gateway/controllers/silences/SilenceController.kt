@@ -1,5 +1,7 @@
 package dev.tracedown.gateway.controllers.silences
 
+import dev.tracedown.common.auth.CachedPermissions
+import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Projects
@@ -15,7 +17,10 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.ResourceResolver
+import dev.tracedown.gateway.util.requireCachedPermissions
 import org.dmfs.rfc5545.recur.RecurrenceRule
+import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.deleteWhere
@@ -27,10 +32,6 @@ import java.util.UUID
 
 object SilenceController {
 
-    // "quiet-hours" is a carrier: it matches no dispatch channel, so the row
-    // never silences anything — it only holds the user's quietHours window
-    // (the dispatcher reads quietHours from any of the user's rows).
-    private val validChannels = setOf("email", "webhook", "all", "quiet-hours")
 
     /** Creates a notification silence for the current user. */
     fun create(orgId: UUID, userId: UUID, request: CreateSilenceRequest): SilenceSummary {
@@ -45,9 +46,14 @@ object SilenceController {
         return transaction {
             val orgUserId = resolveOrgUserId(orgId, userId)
 
-            wsId?.let { requireWorkspaceExists(it, orgId) }
-            projId?.let { requireProjectExists(it) }
-            svcId?.let { requireServiceExists(it) }
+            // The target is a caller-supplied id. Resolving it by id alone
+            // confirmed only that the row existed anywhere in the installation,
+            // and the summary then echoed its name back — so any member could
+            // enumerate another org's projects and services by silencing them.
+            // Resolve inside the org, and require the same read access the
+            // resource itself takes: silencing something you cannot see has no
+            // meaning, since notification eligibility keys off the same grants.
+            requireVisibleTarget(orgId, userId, wsId, projId, svcId)
 
             val id = UUID.randomUUID()
 
@@ -62,7 +68,7 @@ object SilenceController {
                 it[quietHours] = request.quietHours
             }
 
-            silenceSummary(id)
+            silenceSummary(orgId, id)
         }
     }
 
@@ -75,7 +81,7 @@ object SilenceController {
                 .where { NotificationSilences.orgUserId eq orgUserId }
 
             val (pagedQuery, total) = query.applyPfs(pfs)
-            val items = pagedQuery.map { silenceSummaryFromRow(it) }
+            val items = pagedQuery.map { silenceSummaryFromRow(orgId, it) }
 
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
@@ -85,13 +91,13 @@ object SilenceController {
     fun get(orgId: UUID, userId: UUID, silenceId: UUID): SilenceSummary {
         return transaction {
             val orgUserId = resolveOrgUserId(orgId, userId)
-            silenceSummary(silenceId, orgUserId)
+            silenceSummary(orgId, silenceId, orgUserId)
         }
     }
 
     /** Updates a silence's channel, config, or quiet hours. */
     fun update(orgId: UUID, userId: UUID, silenceId: UUID, request: UpdateSilenceRequest): SilenceSummary {
-        if (request.channel != null && request.channel !in validChannels) {
+        if (request.channel != null && !SilenceChannels.isAccepted(request.channel)) {
             throw BadRequestException(ErrorCodes.FIELD_INVALID)
         }
         validateQuietHours(request.quietHours)
@@ -106,7 +112,7 @@ object SilenceController {
                 request.quietHours?.let { v -> it[quietHours] = v }
             }
 
-            silenceSummary(silenceId)
+            silenceSummary(orgId, silenceId)
         }
     }
 
@@ -123,7 +129,10 @@ object SilenceController {
     // ── Validation ──
 
     private fun validateRequest(request: CreateSilenceRequest) {
-        if (request.channel !in validChannels) {
+        // A channel nothing enforces is a control that silently does nothing —
+        // "webhook" in particular is refused here rather than stored and
+        // ignored. See SilenceChannels for the reasoning.
+        if (!SilenceChannels.isAccepted(request.channel)) {
             throw BadRequestException(ErrorCodes.FIELD_INVALID)
         }
 
@@ -192,28 +201,33 @@ object SilenceController {
         if (!exists) throw NotFoundException()
     }
 
-    private fun requireWorkspaceExists(workspaceId: UUID, orgId: UUID) {
-        val exists = Workspaces.selectAll()
-            .where { (Workspaces.id eq workspaceId) and (Workspaces.organizationId eq orgId) and (Workspaces.deleted eq false) }
-            .any()
-        if (!exists) throw NotFoundException()
+    /**
+     * Resolves the silenced scope inside [orgId] and requires read access to it.
+     * At most one of the three is set (see [validateRequest]). Anything the
+     * caller may not see is indistinguishable from a nonexistent id.
+     */
+    private fun requireVisibleTarget(orgId: UUID, userId: UUID, wsId: UUID?, projId: UUID?, svcId: UUID?) {
+        if (wsId == null && projId == null && svcId == null) return
+        val cached = requireCachedPermissions(orgId, userId)
+        when {
+            svcId != null -> {
+                val ctx = ResourceResolver.resolveService(svcId, orgId)
+                val chain = listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
+                if (!canAccessResource(cached, "service", svcId, chain)) throw NotFoundException()
+            }
+            projId != null -> {
+                val ctx = ResourceResolver.resolveProject(projId, orgId)
+                val chain = listOf("workspace::${ctx.workspaceId}")
+                if (!canAccessResource(cached, "project", projId, chain)) throw NotFoundException()
+            }
+            else -> {
+                ResourceResolver.resolveWorkspace(wsId!!, orgId)
+                if (!canAccessResource(cached, "workspace", wsId)) throw NotFoundException()
+            }
+        }
     }
 
-    private fun requireProjectExists(projectId: UUID) {
-        val exists = Projects.selectAll()
-            .where { (Projects.id eq projectId) and (Projects.deleted eq false) }
-            .any()
-        if (!exists) throw NotFoundException()
-    }
-
-    private fun requireServiceExists(serviceId: UUID) {
-        val exists = Services.selectAll()
-            .where { (Services.id eq serviceId) and (Services.deleted eq false) }
-            .any()
-        if (!exists) throw NotFoundException()
-    }
-
-    private fun silenceSummary(id: UUID, orgUserId: UUID? = null): SilenceSummary {
+    private fun silenceSummary(orgId: UUID, id: UUID, orgUserId: UUID? = null): SilenceSummary {
         val query = if (orgUserId != null) {
             NotificationSilences.selectAll().where {
                 (NotificationSilences.id eq id) and
@@ -225,10 +239,10 @@ object SilenceController {
             }
         }
         val row = query.firstOrNull() ?: throw NotFoundException()
-        return silenceSummaryFromRow(row)
+        return silenceSummaryFromRow(orgId, row)
     }
 
-    private fun silenceSummaryFromRow(row: org.jetbrains.exposed.sql.ResultRow) = SilenceSummary(
+    private fun silenceSummaryFromRow(orgId: UUID, row: org.jetbrains.exposed.sql.ResultRow) = SilenceSummary(
         id = row[NotificationSilences.id].toString(),
         orgUserId = row[NotificationSilences.orgUserId].toString(),
         workspaceId = row[NotificationSilences.workspaceId]?.toString(),
@@ -237,19 +251,38 @@ object SilenceController {
         channel = row[NotificationSilences.channel],
         config = row[NotificationSilences.config]?.toString(),
         quietHours = row[NotificationSilences.quietHours],
-        resourceName = resolveResourceName(row),
+        resourceName = resolveResourceName(orgId, row),
     )
 
-    /** Display name of the most specific silenced scope, for list UIs. */
-    private fun resolveResourceName(row: org.jetbrains.exposed.sql.ResultRow): String? {
+    /**
+     * Display name of the most specific silenced scope, for list UIs.
+     *
+     * Only `workspaces` carries organization_id; a project reaches the org
+     * through its workspace and a service through its project, so each name
+     * lookup joins up to the workspace and filters there. Rows written before
+     * [requireVisibleTarget] existed may still point outside the org — those
+     * resolve to no name rather than echoing a foreign one.
+     */
+    private fun resolveResourceName(orgId: UUID, row: org.jetbrains.exposed.sql.ResultRow): String? {
         row[NotificationSilences.serviceId]?.let { id ->
-            return Services.selectAll().where { Services.id eq id }.firstOrNull()?.get(Services.name)
+            return Services
+                .join(Projects, JoinType.INNER, Services.projectId, Projects.id)
+                .join(Workspaces, JoinType.INNER, Projects.workspaceId, Workspaces.id)
+                .select(Services.name)
+                .where { (Services.id eq id) and (Workspaces.organizationId eq orgId) }
+                .firstOrNull()?.get(Services.name)
         }
         row[NotificationSilences.projectId]?.let { id ->
-            return Projects.selectAll().where { Projects.id eq id }.firstOrNull()?.get(Projects.name)
+            return Projects
+                .join(Workspaces, JoinType.INNER, Projects.workspaceId, Workspaces.id)
+                .select(Projects.name)
+                .where { (Projects.id eq id) and (Workspaces.organizationId eq orgId) }
+                .firstOrNull()?.get(Projects.name)
         }
         row[NotificationSilences.workspaceId]?.let { id ->
-            return Workspaces.selectAll().where { Workspaces.id eq id }.firstOrNull()?.get(Workspaces.name)
+            return Workspaces.selectAll()
+                .where { (Workspaces.id eq id) and (Workspaces.organizationId eq orgId) }
+                .firstOrNull()?.get(Workspaces.name)
         }
         return null
     }

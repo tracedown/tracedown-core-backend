@@ -87,8 +87,11 @@ object ApiKeyController {
         transaction {
             requireOrgWrite(orgId, userId) { it.settings }
 
+            // Same three terms the update below carries. `settings` write
+            // admits the caller to the surface; it does not say which org's key
+            // this id names, and the name goes into the audit entry.
             val keyName = ApiKeys.selectAll()
-                .where { ApiKeys.id eq keyId }
+                .where { (ApiKeys.id eq keyId) and (ApiKeys.organizationId eq orgId) }
                 .firstOrNull()?.get(ApiKeys.name)
 
             val updated = ApiKeys.update({
@@ -107,8 +110,11 @@ object ApiKeyController {
         transaction {
             requireOrgWrite(orgId, userId) { it.settings }
 
+            // Same three terms the update below carries. `settings` write
+            // admits the caller to the surface; it does not say which org's key
+            // this id names, and the name goes into the audit entry.
             val keyName = ApiKeys.selectAll()
-                .where { ApiKeys.id eq keyId }
+                .where { (ApiKeys.id eq keyId) and (ApiKeys.organizationId eq orgId) }
                 .firstOrNull()?.get(ApiKeys.name)
 
             val updated = ApiKeys.update({

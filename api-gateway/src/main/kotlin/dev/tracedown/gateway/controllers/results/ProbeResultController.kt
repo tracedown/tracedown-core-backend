@@ -133,10 +133,20 @@ object ProbeResultController {
                 throw NotFoundException()
             }
 
-            val step = ProbeSteps.selectAll()
+            // probe_steps carries neither service_id nor organization_id, so the
+            // step id alone constrains nothing: authorizing the service above
+            // admits the caller, and an unscoped lookup then hands back any
+            // step in the installation. Bodies routinely hold tokens and PII.
+            // The owning result is where the scope lives — join through it and
+            // apply the same three terms the sibling `get` puts on the result.
+            val step = ProbeSteps
+                .join(ProbeResults, JoinType.INNER, ProbeSteps.probeResultId, ProbeResults.id)
+                .select(ProbeSteps.responseBodyStorageUrl)
                 .where {
                     (ProbeSteps.id eq stepId) and
-                        (ProbeSteps.probeResultId eq resultId)
+                        (ProbeSteps.probeResultId eq resultId) and
+                        (ProbeResults.serviceId eq serviceId) and
+                        (ProbeResults.organizationId eq orgId)
                 }
                 .firstOrNull() ?: throw NotFoundException()
 
