@@ -7,16 +7,20 @@ post("$baseUrl/api/v1/auth/login", {
 .expect(status: 200)
 .store({ "$$token": this.body.token })
 
-// Wrong password → 401
+// Wrong password → 400 incorrect_password (the same code every re-verified
+// action returns; see AuthController.verifyIdentity)
 delete("$baseUrl/api/v1/auth/account", {
   headers: { Authorization: "Bearer $$token" },
   body: json({ password: "wrong" })
 })
-.expect(status: 401)
+.expect(status: 400)
+.assert({ expect: [this.body.error eq "incorrect_password"] })
 
-// Correct password but admin owns an org → 400
+// Correct password but admin owns organizations with other members → 409,
+// naming what is in the way
 delete("$baseUrl/api/v1/auth/account", {
   headers: { Authorization: "Bearer $$token" },
   body: json({ password: "$adminPassword" })
 })
-.expect(status: 400)
+.expect(status: 409)
+.assert({ expect: [this.body.error eq "account_owns_organizations"] })

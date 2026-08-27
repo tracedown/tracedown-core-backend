@@ -230,6 +230,16 @@ class MeRoutesTest {
         return response.code to response.body!!.string()
     }
 
+    private fun delete(path: String, body: String, token: String): Pair<Int, String> {
+        val request = Request.Builder()
+            .url("http://localhost:$serverPort$path")
+            .header("Authorization", "Bearer $token")
+            .delete(body.toRequestBody(jsonType))
+            .build()
+        val response = client.newCall(request).execute()
+        return response.code to response.body!!.string()
+    }
+
     private fun json(raw: String): JsonObject = Json.parseToJsonElement(raw).jsonObject
 
     private fun login(email: String, password: String): String {
@@ -238,10 +248,28 @@ class MeRoutesTest {
         return json(raw)["token"]!!.jsonPrimitive.content
     }
 
+    /**
+     * A code the account has not spent yet.
+     *
+     * TotpPolicy.consumes accepts only a STRICTLY newer time step than the one
+     * the account last consumed, so a code is single-use and so is its whole
+     * 30-second window: a real user presenting a second code has necessarily
+     * waited for the window to roll. This suite runs several second factors per
+     * account within one window, so it clears the marker instead of sleeping —
+     * the same state a rolled window would leave, without the 30 seconds. The
+     * guard itself is covered by TotpPolicyTest.
+     */
+    private fun freshTotpCode(email: String, secret: ByteArray): String {
+        transaction {
+            Users.update({ Users.email eq email }) { it[totpLastStep] = null }
+        }
+        return TotpUtil.generateCode(secret)
+    }
+
     private fun loginTotp(email: String, password: String, secret: ByteArray): String {
         val (_, loginRaw) = post("/api/v1/auth/login", """{"email":"$email","password":"$password"}""")
         val challenge = json(loginRaw)["challenge"]!!.jsonPrimitive.content
-        val code = TotpUtil.generateCode(secret)
+        val code = freshTotpCode(email, secret)
         val (status, raw) = post("/api/v1/auth/login/totp", """{"challenge":"$challenge","code":"$code"}""")
         assertEquals(200, status, "TOTP login response: $raw")
         return json(raw)["token"]!!.jsonPrimitive.content
@@ -329,7 +357,7 @@ class MeRoutesTest {
     @Test
     fun `email change rejects an address already in use, case-insensitively`() {
         val token = loginTotp(EXPORT_USER_EMAIL, EXPORT_USER_PASSWORD, totpSecret)
-        val code = TotpUtil.generateCode(totpSecret)
+        val code = freshTotpCode(EXPORT_USER_EMAIL, totpSecret)
         val (status, raw) = post(
             "/api/v1/me/email",
             """{"newEmail":"${TAKEN_EMAIL.uppercase()}","currentPassword":"$EXPORT_USER_PASSWORD","code":"$code"}""",
@@ -337,6 +365,39 @@ class MeRoutesTest {
         )
         assertEquals(400, status)
         assertEquals("email_taken", json(raw)["error"]!!.jsonPrimitive.content)
+    }
+
+    // ── Account closure gate ──
+
+    @Test
+    fun `closing an account is refused before the password is looked at`() {
+        // `platform.allowAccountClosure` keeps its default (off) on this
+        // server, and AuthRoutes gates on it before AuthController.deleteAccount
+        // ever re-verifies identity. A switched-off endpoint has to answer
+        // identically whatever credentials arrive: verifying first would turn a
+        // disabled feature into a password oracle, and would spend a bcrypt
+        // comparison on every request to a route that can never do anything.
+        val token = login(TAKEN_EMAIL, "Taken12345!")
+
+        val (wrongStatus, wrongRaw) = delete(
+            "/api/v1/auth/account", """{"password":"NotThePassword1!"}""", token,
+        )
+        assertEquals(403, wrongStatus, "Closure response: $wrongRaw")
+        assertEquals("account_closure_disabled", json(wrongRaw)["error"]!!.jsonPrimitive.content)
+
+        val (rightStatus, rightRaw) = delete(
+            "/api/v1/auth/account", """{"password":"Taken12345!"}""", token,
+        )
+        assertEquals(403, rightStatus, "Closure response: $rightRaw")
+        assertEquals(
+            "account_closure_disabled",
+            json(rightRaw)["error"]!!.jsonPrimitive.content,
+            "the correct password must not be distinguishable from a wrong one here",
+        )
+
+        transaction {
+            assertFalse(Users.selectAll().where { Users.email eq TAKEN_EMAIL }.first()[Users.deleted])
+        }
     }
 
     @Test
@@ -353,7 +414,7 @@ class MeRoutesTest {
         assertEquals("invalid_totp_code", json(missingRaw)["error"]!!.jsonPrimitive.content)
 
         // With a valid code: accepted.
-        val code = TotpUtil.generateCode(totpChangeSecret)
+        val code = freshTotpCode(TOTP_CHANGE_USER_EMAIL, totpChangeSecret)
         val (status, raw) = post(
             "/api/v1/me/email",
             """{"newEmail":"totp-changed@tracedown.dev","currentPassword":"$TOTP_CHANGE_USER_PASSWORD","code":"$code"}""",

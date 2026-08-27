@@ -101,6 +101,9 @@ class DomainVerificationTest {
                 "redis.a.url" to TestRedis.url,
                 "redis.b.url" to TestRedis.url,
                 "redis.c.url" to "",
+                // These tests sign in as the bootstrap demo user; the bootstrap
+                // is off by default now (it is a dev/demo mode) so ask for it.
+                "platform.singleOrgMode" to "true",
             ))
             val mergedConfig = overrides.withFallback(ConfigFactory.load())
 

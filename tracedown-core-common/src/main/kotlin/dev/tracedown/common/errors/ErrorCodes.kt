@@ -69,6 +69,16 @@ object ErrorCodes {
     const val PROFILE_EDIT_DISABLED = "profile_edit_disabled"
     const val EMAIL_TAKEN = "email_taken"
 
+    // ── Account closure ──
+    /** Self-service account closure is switched off on this platform. */
+    const val ACCOUNT_CLOSURE_DISABLED = "account_closure_disabled"
+    /**
+     * The account still owns organizations, so it cannot be closed. The error
+     * carries their names in `details.organizations`: hand each one to another
+     * owner, or ask for it to be deleted along with the account.
+     */
+    const val ACCOUNT_OWNS_ORGANIZATIONS = "account_owns_organizations"
+
     // ── General ──
     const val INTERNAL_ERROR = "internal_error"
     const val NOT_SUPPORTED = "not_supported"

@@ -141,8 +141,16 @@ own schema on boot:
 DATABASE_URL=jdbc:postgresql://localhost:5432/tracedown \
 DATABASE_USER=tracedown DATABASE_PASSWORD=... \
 REDIS_A_URL=redis://localhost:6379 \
+SINGLE_ORG_MODE=true \
 java -jar tracedown-monolith-<version>-all.jar
 ```
+
+`SINGLE_ORG_MODE` creates the first organization and its owner on an empty
+database — this edition is invite-only, so nothing else can make the first
+account. It is off by default and only needed on the first run. Under
+`DEPLOYMENT_ENV=production` the gateway refuses to start with it on unless
+`DEMO_USER_EMAIL` and `DEMO_USER_PASSWORD` have been set to real values,
+because their defaults are published in this repository.
 
 Grab the jar from the releases page (it ships with the frontend baked in), or
 build it yourself — pass `-PmonolithFrontend=latest` (or a `vX.Y.Z` tag, or a

@@ -120,6 +120,7 @@ class AgentRegistrationTest {
                 it[slug] = "test-agent-1"
                 it[label] = "Test Agent 1"
                 it[AgentBootstrapTokens.tokenHash] = tokenHash
+                it[AgentBootstrapTokens.tokenLookup] = dev.tracedown.common.auth.TokenHasher.sha256Hex(token)
                 it[expiresAt] = Instant.now().plus(1, ChronoUnit.HOURS)
                 it[createdAt] = Instant.now()
             }
@@ -342,6 +343,7 @@ class AgentRegistrationTest {
                 it[AgentBootstrapTokens.slug] = slug
                 it[label] = slug
                 it[AgentBootstrapTokens.tokenHash] = tokenHash
+                it[AgentBootstrapTokens.tokenLookup] = dev.tracedown.common.auth.TokenHasher.sha256Hex(token)
                 it[expiresAt] = Instant.now().plus(1, ChronoUnit.HOURS)
                 it[createdAt] = Instant.now()
             }
