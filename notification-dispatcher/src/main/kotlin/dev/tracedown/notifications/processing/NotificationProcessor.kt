@@ -1,5 +1,6 @@
 package dev.tracedown.notifications.processing
 
+import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.Services
@@ -12,6 +13,7 @@ import dev.tracedown.notifications.templates.NotificationBuilder
 import dev.tracedown.notifications.templates.RenderedNotification
 import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.*
+import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
@@ -25,6 +27,20 @@ import java.util.UUID
  * 2. Groups and renders notifications via NotificationBuilder
  * 3. Resolves eligible recipients
  * 4. Delivers via email and webhooks
+ *
+ * ## Failing one channel must not re-send the other
+ *
+ * The outbox row is marked published only when [process] returns normally, so a
+ * throw anywhere re-runs the whole event on the next poll. Email and webhook
+ * used to share that fate: a webhook-side error left the event unpublished and
+ * the same email went out again five seconds later, and again, and again.
+ *
+ * Two things fix that. Each channel is now attempted independently, so one
+ * failing does not skip the other; and each channel is idempotent per probe
+ * result, because `notification_log` already records exactly who was dispatched
+ * to for a result and is consulted before dispatching. A re-run therefore
+ * completes what was missed and repeats nothing. The event is still left
+ * unpublished when a channel fails, which is what makes the re-run happen.
  */
 class NotificationProcessor(
     private val emailDeliveryService: EmailDeliveryService,
@@ -91,7 +107,7 @@ class NotificationProcessor(
             workspaceId = workspaceId,
             projectId = projectId,
             serviceId = serviceId,
-            channel = "email",
+            channel = EMAIL_CHANNEL,
         )
 
         // One dispatch per service per run \u2014 NOT per failure event. A single run
@@ -106,36 +122,81 @@ class NotificationProcessor(
         val webhookVars = staticVars + buildRuntimeVars(primary, context) + mapOf("text" to combinedText)
 
         // Anti-storm cooldown: drop recipients still within the per-recipient
-        // cooldown for this service+channel. Suppression is silent (no log row),
-        // like silenced/quiet-hours filtering upstream.
+        // cooldown for this service+channel+kind. The kind matters: a recovery
+        // is not a repeat of the failure before it, and must never be swallowed
+        // by that failure's window (see RecipientCooldown). Suppression is
+        // silent (no log row), like silenced/quiet-hours filtering upstream.
+        val kind = RecipientCooldown.kindOf(recovered)
         val eligible = recipients.filter {
-            !recipientCooldown.isOnCooldown(it.orgUserId, serviceId, "email")
+            !recipientCooldown.isOnCooldown(it.orgUserId, serviceId, EMAIL_CHANNEL, kind)
         }
 
-        if (eligible.isNotEmpty()) {
-            // combinedText is already fully rendered \u2014 deliver it as the body.
-            emailDeliveryService.deliver(
-                recipients = eligible,
-                template = combinedText,
-                vars = emptyMap(),
-                subject = subject,
+        // Re-processing guard: anyone already logged for this probe result was
+        // dispatched to on an earlier pass that failed on the other channel.
+        // They are not mailed twice.
+        val alreadyEmailed = newSuspendedTransaction(Dispatchers.IO) {
+            loggedRecipients(resultId, EMAIL_CHANNEL)
+        }
+        val toEmail = eligible.filterNot { it.email in alreadyEmailed }
+
+        // Each channel stands on its own: one throwing must not skip the other,
+        // and must not undo what the other already did.
+        var firstFailure: Exception? = null
+
+        try {
+            if (toEmail.isNotEmpty()) {
+                // combinedText is already fully rendered \u2014 deliver it as the body.
+                emailDeliveryService.deliver(
+                    recipients = toEmail,
+                    template = combinedText,
+                    vars = emptyMap(),
+                    subject = subject,
+                    orgId = orgId,
+                    serviceId = serviceId,
+                    probeResultId = resultId,
+                )
+            }
+            // Open the cooldown window for everyone this result was dispatched
+            // to \u2014 the ones just mailed, and the ones an earlier pass mailed.
+            eligible.forEach { recipientCooldown.markDispatched(it.orgUserId, serviceId, EMAIL_CHANNEL, kind) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e // shutdown, not a delivery failure
+        } catch (e: Exception) {
+            log.error("email delivery failed for result {}: {}", resultId, e.message, e)
+            firstFailure = e
+        }
+
+        try {
+            webhookDeliveryService.deliver(
                 orgId = orgId,
+                workspaceId = workspaceId,
+                projectId = projectId,
                 serviceId = serviceId,
                 probeResultId = resultId,
+                vars = webhookVars,
             )
-            // Open the cooldown window only for recipients actually dispatched to.
-            eligible.forEach { recipientCooldown.markDispatched(it.orgUserId, serviceId, "email") }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e // shutdown, not a delivery failure
+        } catch (e: Exception) {
+            log.error("webhook dispatch failed for result {}: {}", resultId, e.message, e)
+            if (firstFailure == null) firstFailure = e
         }
 
-        webhookDeliveryService.deliver(
-            orgId = orgId,
-            workspaceId = workspaceId,
-            projectId = projectId,
-            serviceId = serviceId,
-            probeResultId = resultId,
-            vars = webhookVars,
-        )
+        // Leaving the event unpublished is what schedules the retry. The two
+        // guards above are what make that retry safe.
+        firstFailure?.let { throw it }
     }
+
+    /** Email addresses already logged for this probe result on [channel]. */
+    private fun loggedRecipients(probeResultId: UUID, channel: String): Set<String> =
+        NotificationLog
+            .select(NotificationLog.recipient)
+            .where {
+                (NotificationLog.probeResultId eq probeResultId) and
+                    (NotificationLog.channel eq channel)
+            }
+            .map { it[NotificationLog.recipient] }
+            .toSet()
 
     private fun buildRuntimeVars(
         notification: RenderedNotification,
@@ -237,4 +298,14 @@ class NotificationProcessor(
         "s.name" to context.serviceName,
         "s.schedule" to context.serviceSchedule,
     )
+
+    private companion object {
+        /**
+         * The only channel recipient resolution runs for. Silences and quiet
+         * hours are per-user controls and so apply to mail alone; webhooks are
+         * bound to resources, not to people, and are resolved independently by
+         * [WebhookDeliveryService].
+         */
+        const val EMAIL_CHANNEL = "email"
+    }
 }

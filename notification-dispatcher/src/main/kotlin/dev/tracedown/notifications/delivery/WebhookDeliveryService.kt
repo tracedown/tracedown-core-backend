@@ -7,8 +7,12 @@ import dev.tracedown.common.models.WebhookDeliveries
 import dev.tracedown.common.models.WebhookVariables
 import dev.tracedown.common.util.VariableCrypto
 import dev.tracedown.notifications.templates.TemplateRenderer
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -38,10 +42,55 @@ import java.util.concurrent.TimeUnit
  * renders the body template with the variable context, and dispatches HTTP requests.
  * Logs each delivery to notification_log.
  *
- * Delivery is resilient: each webhook is attempted up to its own configured
- * `attempt_count` times with exponential backoff, retrying only on transient
- * failures (network error / timeout / HTTP 5xx). A 4xx response is a client
- * error and is never retried.
+ * ## Delivery is asynchronous, and deliberately so
+ *
+ * [deliver] does the database work — resolve the bound webhooks, decrypt the
+ * variables they reference, render the body — and then **hands each webhook to a
+ * worker pool and returns**. It never sleeps.
+ *
+ * That split is the whole point. Retry backoff used to run inline: a serial loop
+ * over a run's webhooks, inside the outbox consumer's serial loop over events,
+ * inside the poll mutex. One unreachable endpoint on the default ladder is ~42
+ * seconds of pure sleep per event (2s + 8s + 32s), so a batch of fifty events
+ * bound to it held the single poll for well over half an hour — and during that
+ * time no other organization's failure mail moved either, because there is only
+ * one pipeline. The sleeps now happen on [workerCount] dedicated workers, and a
+ * dead endpoint occupies at most one of them per event instead of the pipeline.
+ *
+ * Two further bounds keep a dead endpoint from eating the pool as well:
+ *
+ * - A [WebhookCircuitBreaker] fast-fails a webhook that has failed repeatedly,
+ *   so from the fourth consecutive failure onward its events cost no sleep at
+ *   all until the circuit's window expires and one probe is let through.
+ * - The queue is bounded ([queueCapacity]). If it ever fills, the delivery is
+ *   recorded as failed rather than blocking the caller — shedding load is the
+ *   correct answer for an alerting pipeline whose value is timeliness.
+ *
+ * The module runs single-instance (see `OutboxConsumer`), so the pool is
+ * in-process by design: there is no second replica for a shared queue to
+ * balance across, and adding one would be a horizontal-scaling change the rest
+ * of the module does not support.
+ *
+ * The cost of queueing is that a shutdown mid-flight abandons whatever is still
+ * queued, and the outbox event that produced it has already been marked
+ * published. Those deliveries are not lost silently: their `notification_log`
+ * rows stay at `queued`, which is exactly the thing to look for after an
+ * unclean restart.
+ *
+ * ## Idempotency
+ *
+ * A `notification_log` row is written as `queued` **before** the job is enqueued
+ * and updated to `sent`/`failed` by the worker, mirroring the email path. That
+ * row is also the idempotency record: if the same outbox event is processed
+ * again — its other channel threw, so the event was never marked published —
+ * the webhooks already logged for that probe result are skipped instead of being
+ * re-delivered.
+ *
+ * ## Retry and SSRF
+ *
+ * Each webhook is attempted up to its own configured `attempt_count` times with
+ * exponential backoff, retrying only on transient failures (network error /
+ * timeout / HTTP 5xx). A 4xx response is a client error and is never retried.
  *
  * The per-webhook `config` JSONB augments the request. Its shape is:
  * ```
@@ -59,9 +108,18 @@ import java.util.concurrent.TimeUnit
 class WebhookDeliveryService(
     /** Base backoff in seconds; the wait before retry N is base × 4^(N-1). */
     private val retryBaseSeconds: Long = 2L,
+    /** Workers draining the delivery queue. Caps concurrent outbound webhooks. */
+    private val workerCount: Int = 4,
+    /** Bound on queued deliveries. Overflow is shed, never blocked on. */
+    private val queueCapacity: Int = 1000,
+    /** Fast-fail for endpoints that have failed repeatedly. */
+    private val breaker: WebhookCircuitBreaker = WebhookCircuitBreaker(),
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
+
+    private val queue = Channel<WebhookJob>(capacity = queueCapacity)
+    private var workers: List<Job> = emptyList()
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -74,8 +132,37 @@ class WebhookDeliveryService(
         .followSslRedirects(false)
         .build()
 
+    /** Starts the delivery workers. Must be called before the outbox consumer. */
+    fun start(scope: CoroutineScope) {
+        if (workers.isNotEmpty()) return
+        workers = (1..workerCount).map { n ->
+            scope.launch {
+                log.debug("webhook delivery worker {} started", n)
+                for (job in queue) {
+                    try {
+                        runJob(job)
+                    } catch (e: Exception) {
+                        // A worker must never die: it is the only thing draining
+                        // the queue, and a dead worker would silently strand
+                        // every delivery routed to it.
+                        log.error("webhook delivery worker error for webhook {}: {}", job.webhookId, e.message, e)
+                    }
+                }
+            }
+        }
+        log.info("webhook delivery pool started ({} workers, queue {})", workerCount, queueCapacity)
+    }
+
+    /** Stops the delivery workers. */
+    fun stop() {
+        queue.close()
+        workers.forEach { it.cancel() }
+        workers = emptyList()
+    }
+
     /**
-     * Finds and dispatches webhooks for the given resource hierarchy.
+     * Finds webhooks for the given resource hierarchy and queues one delivery
+     * for each. Returns as soon as the jobs are queued — see the class comment.
      *
      * @param orgId the organization ID
      * @param workspaceId the workspace containing the service
@@ -92,9 +179,27 @@ class WebhookDeliveryService(
         probeResultId: UUID,
         vars: Map<String, String>,
     ) {
-        val webhooks = newSuspendedTransaction(Dispatchers.IO) {
-            findBoundWebhooks(orgId, workspaceId, projectId, serviceId)
+        val (webhooks, alreadyLogged) = newSuspendedTransaction(Dispatchers.IO) {
+            findBoundWebhooks(orgId, workspaceId, projectId, serviceId) to
+                loggedRecipients(probeResultId, CHANNEL)
         }
+
+        // Re-processing guard: this event may have been through here already and
+        // failed on the other channel. Anything with a notification_log row for
+        // this probe result was queued once and is not queued again. Counted
+        // rather than set-tested, so two bindings that happen to share a URL
+        // template are each matched exactly once.
+        val pending = webhooks.filter { webhook ->
+            val seen = alreadyLogged[logRecipient(webhook.url)] ?: 0
+            if (seen > 0) {
+                alreadyLogged[logRecipient(webhook.url)] = seen - 1
+                log.debug("webhook {} already logged for result {} — not re-delivering", webhook.webhookId, probeResultId)
+                false
+            } else {
+                true
+            }
+        }
+        if (pending.isEmpty()) return
 
         // Webhook URLs (and config header/query values) may embed org-variable
         // ($o.key) and webhook-variable ($h.key) references so secrets like a
@@ -104,7 +209,7 @@ class WebhookDeliveryService(
         // decrypted (e.g. key mismatch) is skipped — the ref stays unresolved
         // and only that webhook fails, rather than taking down every
         // notification for this result.
-        val referencedKeys = webhooks
+        val referencedKeys = pending
             .flatMap { webhook -> webhook.referencedKeys(ORG_VAR_RE) }
             .toSet()
         val orgVars = if (referencedKeys.isNotEmpty()) {
@@ -113,7 +218,7 @@ class WebhookDeliveryService(
             emptyMap()
         }
 
-        for (webhook in webhooks) {
+        for (webhook in pending) {
             // $h. variables are scoped to the single webhook, so their map is
             // loaded per webhook (AAD-bound to webhook:<id> — a ciphertext
             // copied to another webhook's row will not decrypt).
@@ -129,33 +234,116 @@ class WebhookDeliveryService(
             val renderedBody = TemplateRenderer.renderJson(webhook.bodyTemplate, vars)
             val resolvedUrl = resolveUrl(webhook.url, orgVars, hookVars)
 
-            val outcome = dispatchWithRetry(webhook, resolvedUrl, renderedBody, orgVars, hookVars, probeResultId)
-
-            // `attempt_count` is the operator-configured retry ceiling, not a
-            // counter — the per-delivery outcome (including attempts consumed) is
-            // recorded in notification_log, so we never write back over the config.
+            // Log first, then queue: the row is both the audit record and the
+            // re-processing guard above, so it must exist before the job can be
+            // picked up (and before this method can be re-entered for the same
+            // probe result).
+            val logId = UUID.randomUUID()
             newSuspendedTransaction(Dispatchers.IO) {
                 NotificationLog.insert {
-                    it[id] = UUID.randomUUID()
+                    it[id] = logId
                     it[NotificationLog.organizationId] = orgId
                     it[NotificationLog.serviceId] = serviceId
                     it[NotificationLog.probeResultId] = probeResultId
-                    it[channel] = "webhook"
-                    it[recipient] = webhook.url
-                    it[NotificationLog.status] = outcome.status
-                    it[NotificationLog.error] = outcome.error
+                    it[channel] = CHANNEL
+                    it[recipient] = logRecipient(webhook.url)
+                    it[NotificationLog.status] = "queued"
                     it[createdAt] = Instant.now()
                 }
+            }
+
+            val job = WebhookJob(
+                logId = logId,
+                webhook = webhook,
+                webhookId = webhook.webhookId,
+                resolvedUrl = resolvedUrl,
+                renderedBody = renderedBody,
+                orgVars = orgVars,
+                hookVars = hookVars,
+                probeResultId = probeResultId,
+            )
+
+            if (queue.trySend(job).isFailure) {
+                // Bounded queue full (or the pool is stopped). Shed rather than
+                // block the outbox pipeline behind an endpoint's backlog.
+                log.error(
+                    "webhook delivery queue full — dropping delivery for webhook {} result {}",
+                    webhook.webhookId, probeResultId,
+                )
+                recordOutcome(logId, DeliveryOutcome("failed", "delivery queue full", 0, retriable = false))
             }
         }
     }
 
-    private data class DeliveryOutcome(val status: String, val error: String?, val attempts: Int)
+    /** One queued delivery. Everything it needs is already resolved. */
+    private data class WebhookJob(
+        val logId: UUID,
+        val webhook: BoundWebhook,
+        val webhookId: UUID,
+        val resolvedUrl: String,
+        val renderedBody: String,
+        val orgVars: Map<String, String>,
+        val hookVars: Map<String, String>,
+        val probeResultId: UUID,
+    )
+
+    /** Runs one queued delivery on a worker: breaker, HTTP with retries, log. */
+    private suspend fun runJob(job: WebhookJob) {
+        if (breaker.isOpen(job.webhookId)) {
+            log.warn(
+                "webhook {} circuit open ({} consecutive failures) — not dialled for result {}",
+                job.webhookId, breaker.failureCount(job.webhookId), job.probeResultId,
+            )
+            recordOutcome(
+                job.logId,
+                DeliveryOutcome("failed", "circuit open: endpoint failing repeatedly, no attempt made", 0, retriable = false),
+            )
+            return
+        }
+
+        val outcome = dispatchWithRetry(
+            job.webhook, job.resolvedUrl, job.renderedBody, job.orgVars, job.hookVars, job.probeResultId,
+        )
+
+        when {
+            outcome.status == "sent" -> breaker.recordSuccess(job.webhookId)
+            // Only failures that actually consumed backoff arm the breaker. A
+            // 4xx or an SSRF block is instant and costs the pool nothing, so
+            // fast-failing it would only make the log less informative.
+            outcome.retriable -> breaker.recordFailure(job.webhookId)
+        }
+
+        recordOutcome(job.logId, outcome)
+    }
+
+    /** Transitions the `queued` log row to its final state. */
+    private suspend fun recordOutcome(logId: UUID, outcome: DeliveryOutcome) {
+        newSuspendedTransaction(Dispatchers.IO) {
+            NotificationLog.update({ NotificationLog.id eq logId }) {
+                it[NotificationLog.status] = outcome.status
+                it[NotificationLog.error] = outcome.error
+                // Unlike the webhook's own `attempt_count` (an operator-set
+                // ceiling that is never written back), this column records what
+                // this one delivery actually consumed.
+                it[NotificationLog.attemptCount] =
+                    outcome.attempts.coerceIn(0, Short.MAX_VALUE.toInt()).toShort()
+            }
+        }
+    }
+
+    private data class DeliveryOutcome(
+        val status: String,
+        val error: String?,
+        val attempts: Int,
+        /** True when the failure was of the kind that consumes retry backoff. */
+        val retriable: Boolean = false,
+    )
 
     /**
      * Attempts a single webhook, retrying transient failures (network / timeout /
      * 5xx) up to the webhook's own attempt ceiling with exponential backoff.
-     * Never retries 4xx.
+     * Never retries 4xx. Runs on a delivery worker — this is the only place that
+     * sleeps, and it is off the outbox pipeline.
      */
     private suspend fun dispatchWithRetry(
         webhook: BoundWebhook,
@@ -220,7 +408,9 @@ class WebhookDeliveryService(
                 return DeliveryOutcome("failed", lastError, attempt)
             }
         }
-        return DeliveryOutcome("failed", lastError, attempt)
+        // Exhausted the ladder on transient failures — this is the outcome the
+        // circuit breaker exists for.
+        return DeliveryOutcome("failed", lastError, attempt, retriable = true)
     }
 
     /** Builds the OkHttp request, applying config headers/query and body rules. */
@@ -330,6 +520,22 @@ class WebhookDeliveryService(
     }
 
     /**
+     * Recipients already logged on [channel] for this probe result, with how
+     * many rows each has. The multiset is the re-processing guard in [deliver].
+     */
+    private fun loggedRecipients(probeResultId: UUID, channel: String): MutableMap<String, Int> {
+        val counts = mutableMapOf<String, Int>()
+        NotificationLog
+            .select(NotificationLog.recipient)
+            .where {
+                (NotificationLog.probeResultId eq probeResultId) and
+                    (NotificationLog.channel eq channel)
+            }
+            .forEach { row -> counts.merge(row[NotificationLog.recipient], 1, Int::plus) }
+        return counts
+    }
+
+    /**
      * Substitutes `$o.<key>` (org variable) and `$h.<key>` (webhook variable)
      * references in a string with their values. Unknown references are left
      * intact (the request then fails as a misconfiguration rather than
@@ -412,7 +618,10 @@ class WebhookDeliveryService(
         return result
     }
 
-    private companion object {
+    internal companion object {
+        /** notification_log.channel value for this service's rows. */
+        const val CHANNEL = "webhook"
+
         /** Org-scoped variable reference: `$o.key`. */
         val ORG_VAR_RE = Regex("\\\$o\\.([a-zA-Z_][a-zA-Z0-9_]*)")
 
@@ -421,6 +630,13 @@ class WebhookDeliveryService(
 
         /** HTTP methods that must never carry a request body. */
         val BODILESS_METHODS = setOf("GET", "HEAD")
+
+        /**
+         * `notification_log.recipient` is `VARCHAR(255)`. A longer webhook URL
+         * would fail the insert and, with it, the whole event. Truncate on both
+         * the write and the idempotency read so the two always agree.
+         */
+        fun logRecipient(url: String): String = if (url.length <= 255) url else url.take(255)
 
         /** 4^exp for small non-negative exponents (backoff growth factor). */
         fun pow4(exp: Int): Long {
