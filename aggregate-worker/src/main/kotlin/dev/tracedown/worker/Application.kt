@@ -1,6 +1,10 @@
 package dev.tracedown.worker
 
 import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.config.SecretGuard
+import dev.tracedown.common.health.databaseCheck
+import dev.tracedown.common.health.installHealthEndpoints
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.storage.BodyStorageClient
 import dev.tracedown.worker.config.WorkerConfig
@@ -37,6 +41,13 @@ fun main(args: Array<String>) = EngineMain.main(args)
 fun Application.module() {
     val config = WorkerConfig.load(environment)
 
+    // No insecure defaults of its own to guard; still reports the resolved
+    // deployment environment so a misspelt DEPLOYMENT_ENV is visible here too.
+    SecretGuard.announce(
+        environment.config.propertyOrNull("deployment.environment")?.getString(),
+        "aggregate-worker",
+    )
+
     // Database
     val dataSource = DatabaseFactory.init(
         jdbcUrl = config.database.url,
@@ -59,20 +70,52 @@ fun Application.module() {
     val jobScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val intervals = config.jobIntervals
 
-    jobScope.launchJob(HourlyAggregationJob(intervalSeconds = intervals.hourlyAggregationSeconds, redisB = { redisB }))
-    jobScope.launchJob(DailyAggregationJob(intervalSeconds = intervals.dailyAggregationSeconds))
+    // Aggregation is watermarked: it resumes from where it stopped instead of
+    // assuming a fixed lookback covers every gap. Retention bounds how far a
+    // backfill may reach — buckets whose raw rows are already gone cannot be
+    // rebuilt from them.
+    jobScope.launchJob(
+        HourlyAggregationJob(
+            intervalSeconds = intervals.hourlyAggregationSeconds,
+            redisB = { redisB },
+            resultRetentionDays = config.resultRetentionDays,
+        )
+    )
+    jobScope.launchJob(
+        DailyAggregationJob(
+            intervalSeconds = intervals.dailyAggregationSeconds,
+            resultRetentionDays = config.resultRetentionDays,
+        )
+    )
     jobScope.launchJob(RetentionJob(defaultRetentionDays = config.resultRetentionDays, storageClient = storageClient, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(AggregateRetentionJob(hourlyRetentionDays = config.hourlyAggregateRetentionDays, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(PurgeJob(storageClient = storageClient, intervalSeconds = intervals.purgeSeconds))
     jobScope.launchJob(OrphanUserPurgeJob())
     jobScope.launchJob(ExpiredInviteSweepJob(intervalSeconds = intervals.retentionSeconds))
-    jobScope.launchJob(OutboxPurgeJob(intervalSeconds = intervals.retentionSeconds))
+    jobScope.launchJob(
+        OutboxPurgeJob(
+            intervalSeconds = intervals.retentionSeconds,
+            staleHorizon = config.outboxCursorStaleHorizon,
+        )
+    )
     jobScope.launchJob(SessionCleanupJob(intervalSeconds = intervals.sessionCleanupSeconds))
     jobScope.launchJob(AgentHealthCleanupJob(retentionDays = config.agentHealthRetentionDays, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(AuditLogRetentionJob(retentionDays = config.auditLogRetentionDays, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(NotificationLogRetentionJob(retentionDays = config.notificationLogRetentionDays, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(ExpiredTokenCleanupJob(intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(DomainReverifyJob(verifier = HttpDnsDomainVerifier(), enabled = !config.trustedDomainMode))
+
+    // Postgres is required — every job here is a database job. Redis B is not:
+    // it only caches aggregation percentiles, and the jobs run without it. The
+    // check is a provider so it does not force the lazy connection open on a
+    // deployment that never touches it.
+    installHealthEndpoints(
+        "aggregate-worker",
+        listOf(
+            databaseCheck(dataSource),
+            redisCheck("redis-b", required = false) { redisB },
+        ),
+    )
 
     log.info(
         "aggregate-worker started (resultRetentionDays={}, hourlyAggregateRetentionDays={})",

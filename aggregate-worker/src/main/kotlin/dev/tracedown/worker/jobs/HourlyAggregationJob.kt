@@ -1,5 +1,6 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.worker.data.JobWatermarks
 import io.lettuce.core.api.sync.RedisCommands
 import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
@@ -12,9 +13,16 @@ private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.HourlyAggre
 /**
  * Rolls up raw probe_results into hourly buckets in probe_aggregates.
  *
- * Runs every 15 minutes, looking back 3 hours to capture late-arriving results.
+ * Runs every 15 minutes. The window comes from [AggregationWindow]: the last
+ * [TRAILING_BUCKETS] hours every time (to pick up late-arriving results), plus
+ * everything back to the watermark left by the previous run, so downtime of any
+ * length is backfilled instead of leaving a permanent hole. See
+ * [AggregationWindow] for the reasoning and the bounds.
+ *
  * Produces per-agent rows and an all-agents rollup (probe_agent_id IS NULL).
- * Uses idempotent upserts — safe to re-run or overlap.
+ * Both are idempotent upserts — safe to re-run, to overlap, and to re-derive
+ * a window whose raw rows retention has since removed (such a window updates
+ * nothing rather than deleting the aggregate that is now the only record of it).
  *
  * After aggregation, pushes response time percentiles to Redis B so the
  * API gateway can serve them from cache without querying the database.
@@ -22,15 +30,31 @@ private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.HourlyAggre
 class HourlyAggregationJob(
     override val intervalSeconds: Long = 900L,
     private val redisB: () -> RedisCommands<String, String>,
+    /** Raw-result retention, in days; bounds how far a backfill may reach. */
+    private val resultRetentionDays: Int = 90,
+    private val clock: () -> Instant = Instant::now,
 ) : ScheduledJob {
 
     override val name = "HourlyAggregationJob"
 
     override suspend fun execute() {
-        val windowEnd = Instant.now().truncatedTo(ChronoUnit.HOURS)
-        val windowStart = windowEnd.minus(3, ChronoUnit.HOURS)
-        val tsStart = java.sql.Timestamp.from(windowStart)
-        val tsEnd = java.sql.Timestamp.from(windowEnd)
+        val watermark = newSuspendedTransaction(Dispatchers.IO) { JobWatermarks.read(name) }
+
+        val window = AggregationWindow.nextWindow(
+            now = clock(),
+            unit = ChronoUnit.HOURS,
+            lastWatermark = watermark,
+            trailingBuckets = TRAILING_BUCKETS,
+            maxBucketsPerRun = MAX_BUCKETS_PER_RUN,
+            maxBacklogBuckets = AggregationWindow.backlogBuckets(resultRetentionDays, ChronoUnit.HOURS),
+        )
+        if (window == null) {
+            log.debug("Hourly aggregation: no closed bucket to build yet")
+            return
+        }
+
+        val tsStart = java.sql.Timestamp.from(window.start)
+        val tsEnd = java.sql.Timestamp.from(window.end)
 
         newSuspendedTransaction(Dispatchers.IO) {
             val conn = this.connection.connection as java.sql.Connection
@@ -42,18 +66,20 @@ class HourlyAggregationJob(
                 stmt.executeUpdate()
             }
 
-            // All-agents rollup — probe_agent_id is NULL, so ON CONFLICT won't match.
-            // Delete existing rollup rows in the window, then re-insert.
-            conn.prepareStatement(DELETE_ROLLUP_SQL).use { stmt ->
+            // All-agents rollup. probe_agent_id IS NULL, which the ordinary
+            // unique index cannot constrain (Postgres treats NULLs as
+            // distinct), so this used to be delete-then-insert. A partial
+            // unique index over exactly those rows makes it a real upsert:
+            // nothing is removed before the replacement is known to exist, and
+            // a bucket cannot end up represented twice.
+            conn.prepareStatement(UPSERT_ROLLUP_SQL).use { stmt ->
                 stmt.setTimestamp(1, tsStart)
                 stmt.setTimestamp(2, tsEnd)
                 stmt.executeUpdate()
             }
-            conn.prepareStatement(INSERT_ROLLUP_SQL).use { stmt ->
-                stmt.setTimestamp(1, tsStart)
-                stmt.setTimestamp(2, tsEnd)
-                stmt.executeUpdate()
-            }
+
+            // Same transaction as the work it describes — see JobWatermarks.
+            JobWatermarks.write(name, window.watermark)
 
             // Push percentiles to Redis B cache
             try {
@@ -63,7 +89,15 @@ class HourlyAggregationJob(
             }
         }
 
-        log.info("Hourly aggregation completed for window [{}, {})", windowStart, windowEnd)
+        val buckets = ChronoUnit.HOURS.between(window.start, window.end)
+        if (buckets > TRAILING_BUCKETS + 1) {
+            log.info(
+                "Hourly aggregation backfilled {} buckets for window [{}, {}) — resuming from watermark",
+                buckets, window.start, window.end,
+            )
+        } else {
+            log.info("Hourly aggregation completed for window [{}, {})", window.start, window.end)
+        }
     }
 
     /**
@@ -96,6 +130,16 @@ class HourlyAggregationJob(
     }
 
     companion object {
+        /** Recent buckets rebuilt on every run, so late-arriving results land. */
+        const val TRAILING_BUCKETS = 3L
+
+        /**
+         * Widest window one run may build. A day of hourly buckets per 15-minute
+         * run works off a week of downtime in a few minutes of ticks, without
+         * any single query scanning a month of raw results.
+         */
+        const val MAX_BUCKETS_PER_RUN = 24L
+
         private val PER_AGENT_SQL = """
             INSERT INTO probe_aggregates (id, service_id, probe_agent_id, bucket_start, bucket_type,
                                           p50_ms, p95_ms, p99_ms, error_rate, uptime_pct, probe_count)
@@ -124,14 +168,6 @@ class HourlyAggregationJob(
                 probe_count = EXCLUDED.probe_count
         """.trimIndent()
 
-        private val DELETE_ROLLUP_SQL = """
-            DELETE FROM probe_aggregates
-            WHERE probe_agent_id IS NULL
-              AND bucket_type = 'hourly'
-              AND bucket_start >= ?
-              AND bucket_start < ?
-        """.trimIndent()
-
         /** Computes weighted-average percentiles across all hourly rollup buckets per service. */
         private val PERCENTILES_SQL = """
             SELECT
@@ -146,7 +182,11 @@ class HourlyAggregationJob(
             GROUP BY service_id
         """.trimIndent()
 
-        private val INSERT_ROLLUP_SQL = """
+        /**
+         * The conflict target repeats the partial index's predicate, which is
+         * how Postgres is told to infer `idx_probe_aggregates_rollup_unique`.
+         */
+        private val UPSERT_ROLLUP_SQL = """
             INSERT INTO probe_aggregates (id, service_id, probe_agent_id, bucket_start, bucket_type,
                                           p50_ms, p95_ms, p99_ms, error_rate, uptime_pct, probe_count)
             SELECT
@@ -164,6 +204,14 @@ class HourlyAggregationJob(
             FROM probe_results
             WHERE started_at >= ? AND started_at < ? AND status != 'skipped'
             GROUP BY service_id, date_trunc('hour', started_at)
+            ON CONFLICT (service_id, bucket_start, bucket_type) WHERE probe_agent_id IS NULL
+            DO UPDATE SET
+                p50_ms = EXCLUDED.p50_ms,
+                p95_ms = EXCLUDED.p95_ms,
+                p99_ms = EXCLUDED.p99_ms,
+                error_rate = EXCLUDED.error_rate,
+                uptime_pct = EXCLUDED.uptime_pct,
+                probe_count = EXCLUDED.probe_count
         """.trimIndent()
     }
 }
