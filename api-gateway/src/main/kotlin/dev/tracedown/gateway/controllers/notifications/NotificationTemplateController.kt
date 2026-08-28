@@ -231,6 +231,9 @@ object NotificationTemplateController {
         return transaction {
             requireOrgWrite(orgId, userId) { it.notifications }
             requireExists(templateId, orgId)
+            // `projectId` is a bare route parameter and the binding table has no
+            // path to an org of its own — same guard the two binding writers use.
+            requireProjectInOrg(projectId, orgId)
 
             val deleted = ProjectNotificationTemplates.deleteWhere {
                 (ProjectNotificationTemplates.notificationTemplateId eq templateId) and

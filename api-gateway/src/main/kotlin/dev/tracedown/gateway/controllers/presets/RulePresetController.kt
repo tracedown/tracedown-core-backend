@@ -1,9 +1,12 @@
 package dev.tracedown.gateway.controllers.presets
 
 import dev.tracedown.common.audit.AuditService
+import dev.tracedown.common.auth.CachedPermissions
+import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWriteResource
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.OrgRulePresets
+import dev.tracedown.common.models.Workspaces
 import dev.tracedown.gateway.data.presets.CreateRulePresetRequest
 import dev.tracedown.gateway.data.presets.RulePresetSummary
 import dev.tracedown.gateway.util.BadRequestException
@@ -34,8 +37,13 @@ object RulePresetController {
     /** Org presets visible in the given workspace context. */
     fun list(orgId: UUID, requestingUserId: UUID, workspaceId: UUID?): List<RulePresetSummary> {
         return transaction {
-            // Membership check only — presets are readable by every member.
-            requireCachedPermissions(orgId, requestingUserId)
+            // Org-wide presets are readable by every member. A workspace-scoped
+            // preset is not: its script is workspace content, and membership
+            // alone was letting any member name a workspace they hold no grant
+            // on and read what is stored there. Reading the scope takes the
+            // same grant as writing into it takes in [requireScopeWrite].
+            val cached = requireCachedPermissions(orgId, requestingUserId)
+            val scope = visibleWorkspaceScope(cached, workspaceId) { inOrg(orgId, it) }
 
             OrgRulePresets.selectAll()
                 .where {
@@ -43,13 +51,44 @@ object RulePresetController {
                     (OrgRulePresets.deleted eq false) and
                     (
                         (OrgRulePresets.workspaceId eq null) or
-                        (if (workspaceId != null) OrgRulePresets.workspaceId eq workspaceId else OrgRulePresets.workspaceId eq null)
+                        (if (scope != null) OrgRulePresets.workspaceId eq scope else OrgRulePresets.workspaceId eq null)
                     )
                 }
                 .orderBy(OrgRulePresets.displayName)
                 .map { toSummary(it) }
         }
     }
+
+    /**
+     * The workspace whose scoped presets [cached] may see, or null for the
+     * org-wide list only.
+     *
+     * A workspace outside the org, and one the caller holds no grant on, both
+     * degrade to null rather than to an error — the listing never reports
+     * whether the named workspace exists.
+     *
+     * Pure on purpose: [inOrg] is the only part that touches the database, so
+     * the decision itself is unit-testable.
+     */
+    internal fun visibleWorkspaceScope(
+        cached: CachedPermissions,
+        workspaceId: UUID?,
+        inOrg: (UUID) -> Boolean,
+    ): UUID? {
+        if (workspaceId == null) return null
+        if (!inOrg(workspaceId)) return null
+        return workspaceId.takeIf { canAccessResource(cached, "workspace", it) }
+    }
+
+    /** Whether the workspace is a live workspace of this org. */
+    private fun inOrg(orgId: UUID, workspaceId: UUID): Boolean =
+        Workspaces.selectAll()
+            .where {
+                (Workspaces.id eq workspaceId) and
+                (Workspaces.organizationId eq orgId) and
+                (Workspaces.deleted eq false)
+            }
+            .any()
 
     /** Saves a preset into its scope. The script must be valid Lace. */
     fun create(orgId: UUID, requestingUserId: UUID, request: CreateRulePresetRequest): RulePresetSummary {

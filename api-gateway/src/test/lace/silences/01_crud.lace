@@ -68,10 +68,27 @@ get("$baseUrl/api/v1/silences/$$silenceId", {
 // Update silence channel
 patch("$baseUrl/api/v1/silences/$$silenceId", {
   headers: { Authorization: "Bearer $$token" },
-  body: json({ channel: "webhook" })
+  body: json({ channel: "email" })
 })
 .expect(status: 200)
-.assert({ expect: [this.body.channel eq "webhook"] })
+.assert({ expect: [this.body.channel eq "email"] })
+
+// A channel nothing enforces is refused rather than stored and ignored:
+// webhooks are bound to a resource, not to a person, so no personal silence
+// can reach them (see SilenceChannels).
+patch("$baseUrl/api/v1/silences/$$silenceId", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ channel: "webhook" })
+})
+.expect(status: 400)
+.assert({ expect: [this.body.error eq "field_invalid"] })
+
+// The refused update changed nothing
+get("$baseUrl/api/v1/silences/$$silenceId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.channel eq "email"] })
 
 // Delete silence
 delete("$baseUrl/api/v1/silences/$$silenceId2", {
