@@ -57,7 +57,12 @@ object ResourceAccessController {
             else -> throw BadRequestException(ErrorCodes.FIELD_INVALID)
         }
 
-    private fun requireResourceWrite(orgId: UUID, userId: UUID, resourceType: String, resourceId: UUID) {
+    /**
+     * Write access to the resource itself — the right to hand out access to it.
+     * [PermissionController] shares this: editing a principal's grants is the
+     * same act from the other end, so it takes the same guard.
+     */
+    internal fun requireResourceWrite(orgId: UUID, userId: UUID, resourceType: String, resourceId: UUID) {
         val chain = parentChain(resourceType, resourceId, orgId)
         val cached = requireCachedPermissions(orgId, userId)
         if (!canWriteResource(cached, resourceType, resourceId, chain)) {

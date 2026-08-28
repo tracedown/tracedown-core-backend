@@ -27,6 +27,9 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.orgGroupSections
+import dev.tracedown.gateway.util.orgUserSections
+import dev.tracedown.gateway.util.requireGrantable
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.sql.JoinType
@@ -160,17 +163,11 @@ object PermissionController {
                 .firstOrNull() ?: throw NotFoundException()
 
             val now = Instant.now()
-            OrgUserGroups.deleteWhere { orgUserId eq row[OrgUsers.id] }
-            // Direct resource grants must not outlive the membership: they key on
-            // this org_user id (no FK/cascade), so leaving them would silently
-            // restore the member's old access if the id is later resurrected by a
-            // re-invite — and would otherwise linger forever (the purge job never
-            // clears resource_permissions).
-            ResourcePermissions.deleteWhere {
-                (ResourcePermissions.orgId eq orgId) and
-                (ResourcePermissions.principalType eq "org_user") and
-                (ResourcePermissions.principalId eq row[OrgUsers.id])
-            }
+            // Nothing this member held may outlive the membership: sections,
+            // groups and direct resource grants all go, in the same transaction
+            // as the soft delete. See [MembershipAccess] for why removal — and
+            // not the later re-invite — is where that has to happen.
+            MembershipAccess.revokeAll(orgId, row[OrgUsers.id])
             OrgUsers.update({ OrgUsers.id eq row[OrgUsers.id] }) {
                 it[deleted] = true
                 it[deletedAt] = now
@@ -228,13 +225,17 @@ object PermissionController {
      */
     fun updateUserPermissions(orgId: UUID, userId: UUID, request: UpdatePermissionsRequest, requestingUserId: UUID): PermissionSet {
         return transaction {
-            requireOrgWrite(orgId, requestingUserId) { it.users }
+            val caller = requireOrgWrite(orgId, requestingUserId) { it.users }
+            // Its siblings (setUserActive, removeUser) have always used this;
+            // skipping it here is what let a member edit their own row.
+            requireManageableTarget(orgId, userId, requestingUserId)
 
             val orgUser = findOrgUser(orgId, userId)
             val orgUserId = orgUser[OrgUsers.id]
 
             if (request.org != null) {
                 validateOrgSections(request.org)
+                requireGrantable(caller, orgUserSections(orgUser), sectionMap(request.org))
                 OrgUsers.update({ OrgUsers.id eq orgUserId }) {
                     it[orgUserList] = request.org.users
                     it[orgSettings] = request.org.settings
@@ -248,7 +249,7 @@ object PermissionController {
             }
 
             if (request.resources != null) {
-                syncResourceGrants(orgId, "org_user", orgUserId, request.resources)
+                syncResourceGrants(orgId, "org_user", orgUserId, request.resources, requestingUserId)
             }
 
             PermissionCacheService.recomputeForUser(orgUserId)
@@ -318,7 +319,7 @@ object PermissionController {
      */
     fun updateGroupPermissions(orgId: UUID, groupId: UUID, request: UpdatePermissionsRequest, requestingUserId: UUID): PermissionSet {
         return transaction {
-            requireOrgWrite(orgId, requestingUserId) { it.users }
+            val caller = requireOrgWrite(orgId, requestingUserId) { it.users }
 
             val group = OrgGroups.selectAll()
                 .where { (OrgGroups.id eq groupId) and (OrgGroups.organizationId eq orgId) }
@@ -327,6 +328,9 @@ object PermissionController {
 
             if (request.org != null) {
                 validateOrgSections(request.org)
+                // Raising a group raises every member of it, the caller included
+                // if they belong — the same grant, one indirection away.
+                requireGrantable(caller, orgGroupSections(group), sectionMap(request.org))
                 OrgGroups.update({ OrgGroups.id eq groupId }) {
                     it[orgUserList] = request.org.users
                     it[orgSettings] = request.org.settings
@@ -340,7 +344,7 @@ object PermissionController {
             }
 
             if (request.resources != null) {
-                syncResourceGrants(orgId, "org_group", groupId, request.resources)
+                syncResourceGrants(orgId, "org_group", groupId, request.resources, requestingUserId)
             }
 
             PermissionCacheService.recomputeForGroup(groupId)
@@ -390,7 +394,13 @@ object PermissionController {
      * Syncs resource permission grants to match the desired list (diff-based).
      * Deletes all existing grants for the principal and inserts the new set.
      */
-    private fun syncResourceGrants(orgId: UUID, principalType: String, principalId: UUID, desired: List<ResourceGrant>) {
+    private fun syncResourceGrants(
+        orgId: UUID,
+        principalType: String,
+        principalId: UUID,
+        desired: List<ResourceGrant>,
+        requestingUserId: UUID,
+    ) {
         for (grant in desired) {
             if (grant.resourceType !in validResourceTypes) {
                 throw BadRequestException(ErrorCodes.FIELD_INVALID)
@@ -398,6 +408,30 @@ object PermissionController {
             if (grant.permissions !in 0..2) {
                 throw BadRequestException(ErrorCodes.FIELD_INVALID)
             }
+        }
+
+        // Handing out access to a workspace/project/service takes write on that
+        // resource — the same guard ResourceAccessController applies when the
+        // grant is edited from the resource's end. Only grants that are new or
+        // raised are checked: resending what the principal already holds is not
+        // a grant, and the client sends the whole list on every PATCH.
+        val existing = ResourcePermissions.selectAll()
+            .where {
+                (ResourcePermissions.orgId eq orgId) and
+                (ResourcePermissions.principalType eq principalType) and
+                (ResourcePermissions.principalId eq principalId)
+            }
+            .associate {
+                "${it[ResourcePermissions.resourceType]}::${it[ResourcePermissions.resourceId]}" to
+                    it[ResourcePermissions.permissions]
+            }
+        for (grant in desired) {
+            val held = existing["${grant.resourceType}::${grant.resourceId}"] ?: 0
+            if (grant.permissions <= held) continue
+            val resourceId = try { UUID.fromString(grant.resourceId) } catch (e: Exception) {
+                throw BadRequestException(ErrorCodes.INVALID_UUID)
+            }
+            ResourceAccessController.requireResourceWrite(orgId, requestingUserId, grant.resourceType, resourceId)
         }
 
         // Delete existing grants for this principal
@@ -423,6 +457,18 @@ object PermissionController {
                 it[permissions] = grant.permissions
             }
         }
+    }
+
+    /** The requested section levels, keyed the way [dev.tracedown.gateway.util.GrantPolicy] wants them. */
+    private fun sectionMap(sections: OrgSectionPermissions): Map<String, Short> = buildMap {
+        put("users", sections.users)
+        put("settings", sections.settings)
+        put("domains", sections.domains)
+        put("webhooks", sections.webhooks)
+        put("notifications", sections.notifications)
+        put("admin", sections.admin)
+        put("workspaces", sections.workspaces)
+        putAll(sections.extra)
     }
 
     private fun validateOrgSections(sections: OrgSectionPermissions) {
