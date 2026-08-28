@@ -18,6 +18,36 @@ import java.util.UUID
  *
  * Polls the outbox table on interval and subscribes to Redis pub/sub
  * "notify:nudge" for immediate pickup when new events are written.
+ *
+ * ## notification-dispatcher runs exactly one instance. This is why.
+ *
+ * [poll] selects `published = false` rows with no claim of any kind: no
+ * `FOR UPDATE SKIP LOCKED`, no advisory lock, no claim column, no consumer
+ * cursor. [markPublished] runs *after* delivery, so the rows stay visible to
+ * every reader for the whole duration of the batch. The nudge that wakes the
+ * poller is Redis pub/sub, which is a broadcast — every subscriber receives it,
+ * and [pollMutex] only serialises polls **within one process**.
+ *
+ * Run a second replica and both read the same unpublished rows and both
+ * deliver: every recipient is emailed twice and every bound webhook is called
+ * twice, for every alert, indefinitely. Nothing errors and nothing in the data
+ * records that it happened — the duplicate is only visible in the inbox and in
+ * two `notification_log` rows. The per-recipient cooldown narrows the second
+ * email but does not prevent it (the two replicas can pass the Redis check
+ * before either has set the key), and webhooks are not cooldown-gated at all.
+ *
+ * Single-instance is the documented deployment: the operator guide's replica
+ * safety table lists notification-dispatcher as **"Exactly one"** with this
+ * reason, and its "Why the dispatcher and metrics-service are not" section
+ * spells it out (`tracedown-wiki/docs/admin/scaling.md` — the replica table and
+ * the section below it). The dev and deploy compose files each define the
+ * service once with no replica count, and the dev one pins
+ * `container_name: tracedown-dispatcher`, which makes `--scale` fail outright.
+ *
+ * If this ever has to scale horizontally, the fix is a claim on the read — a
+ * `FOR UPDATE SKIP LOCKED` select, or a `claimed_by`/`claimed_at` pair updated
+ * in the same statement that reads — not tighter cooldowns. Until that exists,
+ * treat replicating this service as a correctness change, not a capacity knob.
  */
 class OutboxConsumer(
     private val processor: NotificationProcessor,
@@ -97,6 +127,10 @@ class OutboxConsumer(
         }
     }
 
+    /**
+     * Reads the next batch of unpublished events. Deliberately unclaimed — see
+     * the single-instance note on the class before adding a replica.
+     */
     private suspend fun poll(): List<Pair<UUID, JsonObject>> {
         return newSuspendedTransaction(Dispatchers.IO) {
             Outbox.selectAll()

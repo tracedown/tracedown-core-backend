@@ -23,6 +23,14 @@ data class DispatcherConfig(
     val webhookRetryBaseSeconds: Long,
     /** Per-recipient anti-storm cooldown (seconds) between notifications on a channel. */
     val recipientCooldownSeconds: Long,
+    /** Workers draining the webhook delivery queue; caps concurrent outbound webhooks. */
+    val webhookWorkers: Int,
+    /** Bound on queued webhook deliveries; overflow is shed rather than blocked on. */
+    val webhookQueueCapacity: Int,
+    /** Consecutive failed deliveries that open a webhook's circuit. */
+    val webhookBreakerFailures: Int,
+    /** How long an open circuit fast-fails a webhook before probing it again. */
+    val webhookBreakerOpenSeconds: Long,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -46,6 +54,14 @@ data class DispatcherConfig(
                     ?.getString()?.toLong() ?: 2L,
                 recipientCooldownSeconds = config.propertyOrNull("dispatcher.recipientCooldownSeconds")
                     ?.getString()?.toLong() ?: 300L,
+                webhookWorkers = config.propertyOrNull("dispatcher.webhookWorkers")
+                    ?.getString()?.toInt()?.coerceAtLeast(1) ?: 4,
+                webhookQueueCapacity = config.propertyOrNull("dispatcher.webhookQueueCapacity")
+                    ?.getString()?.toInt()?.coerceAtLeast(1) ?: 1000,
+                webhookBreakerFailures = config.propertyOrNull("dispatcher.webhookBreakerFailures")
+                    ?.getString()?.toInt()?.coerceAtLeast(1) ?: 3,
+                webhookBreakerOpenSeconds = config.propertyOrNull("dispatcher.webhookBreakerOpenSeconds")
+                    ?.getString()?.toLong()?.coerceAtLeast(0L) ?: 60L,
             )
         }
     }
