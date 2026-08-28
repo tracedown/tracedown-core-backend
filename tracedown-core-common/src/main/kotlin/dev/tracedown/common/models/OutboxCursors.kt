@@ -41,6 +41,18 @@ data class OutboxRecord(
     val createdAt: Instant,
 )
 
+/** One consumer's position in the log, and when it last moved. */
+data class OutboxCursorState(
+    val consumerName: String,
+    val lastId: Long,
+    /**
+     * When the cursor last advanced. A consumer that is caught up does not
+     * advance, so this is only evidence of a stall when read together with the
+     * consumer's distance from the head.
+     */
+    val updatedAt: Instant,
+)
+
 /**
  * Cursor-based reader over the [Outbox] for independent consumers.
  *
@@ -127,10 +139,40 @@ object OutboxStream {
      * Lowest offset across every registered cursor, or null when there are no
      * cursor consumers at all. Retention uses this as a floor: nothing above it
      * may be deleted, because some consumer has not yet read it.
+     *
+     * Callers that must tolerate a consumer which has stopped advancing should
+     * use [states] instead and decide for themselves — an unconditional floor
+     * lets one stalled consumer pin the whole log.
      */
     fun minCursor(): Long? = transaction {
         OutboxCursors.selectAll()
             .mapNotNull { it[OutboxCursors.lastId] }
             .minOrNull()
+    }
+
+    /** Every registered cursor, with the last time it advanced. */
+    fun states(): List<OutboxCursorState> = transaction {
+        OutboxCursors.selectAll().map {
+            OutboxCursorState(
+                consumerName = it[OutboxCursors.consumerName],
+                lastId = it[OutboxCursors.lastId],
+                updatedAt = it[OutboxCursors.updatedAt],
+            )
+        }
+    }
+
+    /**
+     * Highest `seq` currently in the outbox, or 0 when it is empty.
+     *
+     * Paired with [states] this is what separates a consumer that is idle
+     * because it is caught up from one that has stopped: the first sits at the
+     * head, the second falls behind it.
+     */
+    fun headSeq(): Long = transaction {
+        var head = 0L
+        TransactionManager.current().exec("SELECT COALESCE(MAX(seq), 0) AS head FROM outbox") { rs ->
+            if (rs.next()) head = rs.getLong("head")
+        }
+        head
     }
 }

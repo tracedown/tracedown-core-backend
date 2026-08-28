@@ -70,6 +70,9 @@ object AccountService {
             it[totpSecretIv] = null
             it[totpEnrolledAt] = null
             it[totpLastUsedAt] = null
+            it[totpLastStep] = null
+            it[totpFailedAttempts] = 0
+            it[totpLockedUntil] = null
             it[totpEnabled] = false
             it[selectedOrgId] = null
             it[Users.isActive] = isActive

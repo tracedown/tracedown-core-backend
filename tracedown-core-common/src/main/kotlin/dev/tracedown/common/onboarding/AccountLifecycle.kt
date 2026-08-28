@@ -36,7 +36,19 @@ import java.util.UUID
  */
 object AccountLifecycle {
 
-    /** Grace window before an orphaned (0-membership) account becomes purgeable. */
+    /**
+     * Grace window before an *orphaned* (0-membership) account becomes purgeable.
+     *
+     * This is the window for an account that lost its last membership without
+     * asking to be closed — the last org it belonged to was deleted, or an admin
+     * removed it. Nobody at that keyboard requested anything, and a re-invite
+     * within the window revives the row, so the account is held rather than
+     * dropped.
+     *
+     * It is deliberately NOT the window for a deliberate self-service closure:
+     * that is a request, and the operator's own retention setting governs how
+     * long a deleted thing is kept. See the [reconcile] `graceSeconds` override.
+     */
     const val ORPHAN_GRACE_SECONDS: Long = 7 * 86_400L
 
     /**
@@ -69,12 +81,23 @@ object AccountLifecycle {
      * Reconciles an account against its current memberships after a membership
      * gain or loss:
      *  - no non-deleted membership  → soft-delete the account (three-tier), with
-     *    [ORPHAN_GRACE_SECONDS] before it becomes purgeable.
+     *    [graceSeconds] before it becomes purgeable.
      *  - has a membership again, but the account was soft-deleted → revive it.
+     *
+     * [graceSeconds] defaults to [ORPHAN_GRACE_SECONDS], which is right for every
+     * caller that reaches here because a membership went away underneath the
+     * account. A caller acting on the account holder's own explicit request
+     * passes the operator's configured retention instead — see
+     * `systemLimits.purgeRetentionDays`, whose whole point is that zero means
+     * "gone means gone". A grace window nobody asked for would quietly defeat it.
      *
      * No-op when the account is already in the correct state, or does not exist.
      */
-    fun reconcile(userId: UUID, now: Instant = Instant.now()) {
+    fun reconcile(
+        userId: UUID,
+        now: Instant = Instant.now(),
+        graceSeconds: Long = ORPHAN_GRACE_SECONDS,
+    ) {
         val user = Users.selectAll().where { Users.id eq userId }.firstOrNull() ?: return
         val alreadyDeleted = user[Users.deleted]
 
@@ -85,7 +108,7 @@ object AccountLifecycle {
             Users.update({ Users.id eq userId }) {
                 it[deleted] = true
                 it[deletedAt] = now
-                it[purgeAfter] = now.plusSeconds(ORPHAN_GRACE_SECONDS)
+                it[purgeAfter] = now.plusSeconds(graceSeconds)
                 it[isActive] = false
             }
         }
@@ -199,6 +222,9 @@ object AccountLifecycle {
             it[totpSecretIv] = null
             it[totpEnrolledAt] = null
             it[totpLastUsedAt] = null
+            it[totpLastStep] = null
+            it[totpFailedAttempts] = 0
+            it[totpLockedUntil] = null
             it[totpEnabled] = false
             it[selectedOrgId] = null
             it[isActive] = false
