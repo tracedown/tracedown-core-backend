@@ -1,7 +1,9 @@
 package dev.tracedown.gateway.routes.v1.agents
 
 import at.favre.lib.crypto.bcrypt.BCrypt
+import dev.tracedown.common.agents.AgentVisibility
 import dev.tracedown.common.audit.AuditService
+import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.gateway.controllers.agents.CaService
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.interceptors.InterceptorContext
@@ -11,10 +13,9 @@ import dev.tracedown.common.models.AgentCertificates
 import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ProbeAgents
-import dev.tracedown.common.realtime.RealtimePublisher
+import dev.tracedown.common.agents.FleetAudience
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
-import dev.tracedown.gateway.controllers.agents.AgentRegistrationController
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
@@ -117,14 +118,27 @@ class AgentAdmin {
 }
 
 fun Route.agentAdminRoutes() {
-    /** Lists all registered agents, active and inactive. */
+    /**
+     * Lists the registered agents the caller may see, active and inactive.
+     *
+     * Two gates, and both matter. The `settings` grant is the infrastructure
+     * permission — an org member without it has no business reading the fleet's
+     * configuration at all. [AgentVisibility] is the second: this response
+     * carries each agent's `agentUri`, the address of the machine that runs
+     * probes, so a deployment that gives agents owners must be able to narrow
+     * the list before it is serialized. Core owns no agents and returns
+     * everything; see [AgentVisibility] for what an overlay adds.
+     */
     get<AgentAdmin.List> {
         val (principal, orgId) = requireAuthWithOrg(call)
         val agents = transaction {
             requireOrgRead(orgId, principal.userId) { it.settings }
-            ProbeAgents.selectAll()
+            val rows = ProbeAgents.selectAll()
                 .where { ProbeAgents.deleted eq false }
                 .orderBy(ProbeAgents.slug)
+                .toList()
+            val visible = AgentVisibility.visible(orgId, principal.userId, rows.map { it[ProbeAgents.slug] })
+            rows.filter { it[ProbeAgents.slug] in visible }
                 .map { row ->
                     AgentSummary(
                         slug = row[ProbeAgents.slug],
@@ -184,6 +198,9 @@ fun Route.agentAdminRoutes() {
                 it[AgentBootstrapTokens.slug] = slug
                 it[AgentBootstrapTokens.label] = label
                 it[AgentBootstrapTokens.tokenHash] = tokenHash
+                // Indexed locator — enrolment looks the row up by this digest
+                // instead of bcrypting every outstanding token.
+                it[AgentBootstrapTokens.tokenLookup] = TokenHasher.sha256Hex(token)
                 it[AgentBootstrapTokens.expiresAt] = expiresAt
                 it[createdBy] = principal.userId
                 it[createdAt] = Instant.now()
@@ -194,13 +211,23 @@ fun Route.agentAdminRoutes() {
         call.respond(BootstrapTokenResponse(slug = slug, token = token, expiresAt = expiresAt.toString()))
     }
 
-    /** Health-check history for one agent, most recent window first-to-last. */
+    /**
+     * Health-check history for one agent, most recent window first-to-last.
+     *
+     * The slug is resolved against the whole fleet, so an agent the caller
+     * cannot see must answer as though it does not exist — otherwise this
+     * endpoint hands back, one slug at a time, exactly what the list gate
+     * withholds. Not-found rather than forbidden: the absence of an agent and
+     * the invisibility of one must be indistinguishable, or the 403 confirms
+     * the slug.
+     */
     get<AgentAdmin.BySlug.Checks> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val hours = resource.hours.coerceIn(1, 24 * 30)
         val cutoff = Instant.now().minus(hours.toLong(), ChronoUnit.HOURS)
         val checks = transaction {
             requireOrgRead(orgId, principal.userId) { it.settings }
+            if (!AgentVisibility.canSee(orgId, principal.userId, resource.parent.slug)) throw NotFoundException()
             val agentId = ProbeAgents.selectAll()
                 .where { ProbeAgents.slug eq resource.parent.slug }
                 .firstOrNull()?.get(ProbeAgents.id) ?: throw NotFoundException()
@@ -257,11 +284,13 @@ fun Route.agentAdminRoutes() {
             AuditService.log(orgId, principal.userId, "delete.agent", "agent", resource.slug, entityDisplayName = resource.slug)
         }
 
-        // Same channels the health feed uses — live clients drop the agent
-        // without waiting for a poll.
+        // Same channels and the same audience the health feed uses — live
+        // clients drop the agent without waiting for a poll. Addressed after the
+        // row is gone, which is why the audience is resolved from the slug: a
+        // deployment with agent ownership must be able to answer for an agent it
+        // has just lost, and the slug is what both sides key on.
         val removedEvent = buildJsonObject { put("agentSlug", resource.slug) }
-        RealtimePublisher.publish("agents:summary", AgentRegistrationController.GLOBAL_ORG, "agent.removed", removedEvent)
-        RealtimePublisher.publish("agents", AgentRegistrationController.GLOBAL_ORG, "agent.removed", removedEvent)
+        FleetAudience.publish(resource.slug, "agent.removed", removedEvent)
 
         call.respond(mapOf("ok" to true))
     }

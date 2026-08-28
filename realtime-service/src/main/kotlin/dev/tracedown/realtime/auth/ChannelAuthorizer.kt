@@ -24,14 +24,42 @@ import java.util.UUID
  * session already proves) is NOT sufficient for these — the caller must hold
  * the resource grant, with the same downward inheritance the gateway applies.
  *
- * Non-resource channels (`org:`, `agents:`, `session:`) are governed elsewhere
- * (org scope / global / self) and are not gated here.
+ * The fleet channels (`agents`, `agents:summary`) are the one global feed, and
+ * they ARE gated here — see [canSubscribe].
+ *
+ * The remaining non-resource channels (`org:`, `session:`) are governed
+ * elsewhere (org scope / self) and are not gated here.
  */
 object ChannelAuthorizer {
 
-    /** True if [userId] may subscribe (read) to [channel] within [orgId]. */
-    fun canSubscribe(userId: UUID, orgId: UUID, channel: String): Boolean =
-        checkResourceChannel(userId, orgId, channel, requireWrite = false)
+    /**
+     * True if [userId] may subscribe (read) to [channel] within [orgId].
+     *
+     * The fleet feed (`agents`, `agents:*`) carries every registered agent's
+     * slug and liveness, and it is fanned out globally rather than per org —
+     * the broadcast path exempts it from the org filter precisely because in
+     * Core the fleet is shared platform infrastructure. It had no check of any
+     * kind, so any established socket could subscribe to it, including one
+     * whose session names an organization the user is no longer in. It now
+     * requires the same thing the REST fleet endpoints require: that the
+     * subscriber actually be a member of the org their session names.
+     *
+     * That is the whole of the correct answer for Core, where every agent
+     * genuinely belongs to every org in the install. A deployment that gives
+     * agents owners has a second problem this cannot solve from here — the
+     * events themselves would still name other orgs' agents — and closes it by
+     * filtering the fan-out; see `AgentVisibility`.
+     */
+    fun canSubscribe(userId: UUID, orgId: UUID, channel: String): Boolean {
+        if (isFleetChannel(channel)) {
+            return transaction { resolveCachedPermissions(orgId, userId) != null }
+        }
+        return checkResourceChannel(userId, orgId, channel, requireWrite = false)
+    }
+
+    /** The global probe-agent feed: `agents` and its `agents:<view>` variants. */
+    fun isFleetChannel(channel: String): Boolean =
+        channel == "agents" || channel.startsWith("agents:")
 
     /** True if [userId] may relay (write) into [channel] within [orgId]. */
     fun canRelay(userId: UUID, orgId: UUID, channel: String): Boolean =
