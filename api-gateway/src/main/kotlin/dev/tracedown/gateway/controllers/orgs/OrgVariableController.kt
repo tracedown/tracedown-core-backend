@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.controllers.orgs
 
+import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.pfs.Page
@@ -16,8 +17,10 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
+import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.VariableCrypto
+import dev.tracedown.gateway.util.VariableRevealPolicy
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.sql.and
@@ -115,10 +118,13 @@ object OrgVariableController {
         }
     }
 
-    /** Reveals a variable's decrypted value. Secrets cannot be revealed. */
+    /**
+     * Reveals a variable's decrypted value. Secrets cannot be revealed, and
+     * reveal is a write-level operation — see [VariableRevealPolicy].
+     */
     fun reveal(orgId: UUID, varId: UUID, userId: UUID): VariableSummary {
         return transaction {
-            requireOrgRead(orgId, userId) { it.settings }
+            val perms = requireOrgRead(orgId, userId) { it.settings }
 
             val row = OrgVariables.selectAll()
                 .where {
@@ -128,7 +134,13 @@ object OrgVariableController {
                 }
                 .firstOrNull() ?: throw NotFoundException()
 
-            if (row[OrgVariables.secret]) throw BadRequestException(ErrorCodes.FORBIDDEN)
+            when (VariableRevealPolicy.decide(row[OrgVariables.secret], perms.settings.canWrite())) {
+                VariableRevealPolicy.Decision.REFUSED_SECRET ->
+                    throw BadRequestException(ErrorCodes.FORBIDDEN)
+                VariableRevealPolicy.Decision.REFUSED_READ_ONLY ->
+                    throw ForbiddenException(ErrorCodes.INSUFFICIENT_PERMISSIONS)
+                VariableRevealPolicy.Decision.REVEAL -> Unit
+            }
 
             val value = if (row[OrgVariables.encrypted]) {
                 VariableCrypto.decrypt(orgId, row[OrgVariables.value], row[OrgVariables.valueIv], "org", row[OrgVariables.key])

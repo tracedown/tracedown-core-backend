@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.controllers.webhooks
 
+import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.common.models.OutboxEmit
@@ -12,8 +13,10 @@ import dev.tracedown.gateway.data.parseVariableType
 import dev.tracedown.gateway.data.variableTypeName
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
+import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.VariableCrypto
+import dev.tracedown.gateway.util.VariableRevealPolicy
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import kotlinx.serialization.json.buildJsonObject
@@ -123,13 +126,22 @@ object WebhookVariableController {
         }
     }
 
-    /** Reveals a variable's decrypted value. Secrets cannot be revealed. */
+    /**
+     * Reveals a variable's decrypted value. Secrets cannot be revealed, and
+     * reveal is a write-level operation — see [VariableRevealPolicy].
+     */
     fun reveal(orgId: UUID, webhookId: UUID, varId: UUID, userId: UUID): VariableSummary {
         return transaction {
-            requireOrgRead(orgId, userId) { it.webhooks }
+            val perms = requireOrgRead(orgId, userId) { it.webhooks }
 
             val row = variableRow(orgId, webhookId, varId)
-            if (row[WebhookVariables.secret]) throw BadRequestException(ErrorCodes.FORBIDDEN)
+            when (VariableRevealPolicy.decide(row[WebhookVariables.secret], perms.webhooks.canWrite())) {
+                VariableRevealPolicy.Decision.REFUSED_SECRET ->
+                    throw BadRequestException(ErrorCodes.FORBIDDEN)
+                VariableRevealPolicy.Decision.REFUSED_READ_ONLY ->
+                    throw ForbiddenException(ErrorCodes.INSUFFICIENT_PERMISSIONS)
+                VariableRevealPolicy.Decision.REVEAL -> Unit
+            }
 
             val value = if (row[WebhookVariables.encrypted]) {
                 VariableCrypto.decrypt(
