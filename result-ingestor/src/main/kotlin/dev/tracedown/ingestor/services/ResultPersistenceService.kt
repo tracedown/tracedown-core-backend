@@ -18,6 +18,7 @@ import org.jetbrains.exposed.sql.update
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
+import java.time.format.DateTimeParseException
 import java.util.UUID
 
 /**
@@ -26,10 +27,104 @@ import java.util.UUID
  * In a single transaction: inserts the probe_results row, inserts
  * probe_steps rows, updates the service's status tracking columns,
  * and writes an outbox event for downstream consumers.
+ *
+ * **Idempotent by identity.** Delivery from the queue is at-least-once (see
+ * [dev.tracedown.ingestor.consumers.ProbeResultConsumer]), so the same envelope
+ * can arrive twice: once for a persist that was interrupted after the commit,
+ * once for a replica reclaiming a dead consumer's in-flight message. The
+ * envelope's `resultId` — minted by the publisher before the message was ever
+ * queued — is used as the `probe_results` primary key, so a second delivery is
+ * recognised and dropped, and the key itself refuses it if two consumers race.
+ * Nothing here may become non-idempotent without that guarantee moving with it:
+ * the status counters in step 3 in particular would double-count.
  */
 object ResultPersistenceService {
 
     private val log = LoggerFactory.getLogger(javaClass)
+
+    /** What a persist attempt did, so the caller knows whether it is the first. */
+    enum class PersistOutcome {
+        /** This delivery wrote the row. */
+        PERSISTED,
+
+        /** An earlier delivery already wrote it; this one changed nothing. */
+        ALREADY_PERSISTED,
+    }
+
+    /**
+     * The row identity for an envelope.
+     *
+     * Normally the publisher's `resultId`. A random id is minted only for an
+     * envelope that predates the field — i.e. one queued by an older scheduler
+     * and still in flight across a rolling upgrade. Such a message is persisted
+     * as before and is the one shape that is *not* redelivery-safe; the window
+     * is one queue drain long, and the alternative (refusing it) would drop
+     * exactly the results this whole path exists to keep.
+     */
+    fun resultIdOf(envelope: JsonObject): UUID {
+        val raw = envelope["resultId"]?.jsonPrimitive?.contentOrNull
+        if (raw.isNullOrBlank()) {
+            log.warn("envelope carries no resultId — persisting it without redelivery protection")
+            return UUID.randomUUID()
+        }
+        return UUID.fromString(raw)
+    }
+
+    /**
+     * When the run this envelope describes actually happened.
+     *
+     * Persistence used to stamp `Instant.now()` and use it for the result row,
+     * every step row, the status-since marker, the outbox row and the hourly
+     * aggregation bucket key. That is ingest time, not probe time, and the two
+     * differ by exactly the depth of the result queue: under any backlog the
+     * results landed in the wrong bucket and the downtime computed from
+     * `last_status_since` was inflated by however long the queue was.
+     *
+     * The scheduler stamps `startedAt` on the envelope before it is queued —
+     * the instant it handed the script to the executor, or the instant it shed
+     * the tick. That is the closest instant to the run that anything in the
+     * platform actually knows: the agent does not report its own clock, and
+     * trusting one that did would let a skewed agent file results into
+     * arbitrary buckets. It is also stable across redelivery, where
+     * `Instant.now()` gave the same run a different time per delivery.
+     *
+     * Falls back to now only for an envelope queued by an older scheduler and
+     * still in flight across a rolling upgrade — the same one-drain window as
+     * [resultIdOf].
+     */
+    fun startedAtOf(envelope: JsonObject, now: Instant = Instant.now()): Instant {
+        val raw = envelope["startedAt"]?.jsonPrimitive?.contentOrNull
+        if (raw.isNullOrBlank()) return now
+        return try {
+            Instant.parse(raw)
+        } catch (e: DateTimeParseException) {
+            log.warn("envelope carries an unparseable startedAt '{}' — falling back to ingest time", raw)
+            now
+        }
+    }
+
+    /**
+     * Whether a failure is Postgres refusing a second insert of a result row we
+     * already hold — the race between two consumers handed the same message.
+     *
+     * Matched on the primary key by name so that a *different* unique violation
+     * (a concurrent variable writeback, say) is not mistaken for a harmless
+     * duplicate and quietly swallowed.
+     */
+    fun isDuplicateResult(t: Throwable): Boolean {
+        var cause: Throwable? = t
+        while (cause != null) {
+            val message = cause.message
+            if (message != null &&
+                message.contains("probe_results_pkey") &&
+                message.contains("duplicate key", ignoreCase = true)
+            ) {
+                return true
+            }
+            cause = cause.cause?.takeIf { it !== cause }
+        }
+        return false
+    }
 
     /**
      * Relocates agent-uploaded bodies to server-derived, tenant-scoped keys.
@@ -58,9 +153,10 @@ object ResultPersistenceService {
      * Persists a single probe result envelope.
      *
      * @param envelope the JSON envelope as published by ResultPublisher
+     * @return whether this delivery wrote the row or found it already written
      */
-    fun persist(envelope: JsonObject) {
-        val resultId = UUID.randomUUID()
+    fun persist(envelope: JsonObject): PersistOutcome {
+        val resultId = resultIdOf(envelope)
         val serviceId = UUID.fromString(envelope["serviceId"]!!.jsonPrimitive.content)
         // Absent for skipped probes — they never reached an agent.
         val agentId = envelope["probeAgentId"]?.jsonPrimitive?.longOrNull
@@ -71,20 +167,41 @@ object ResultPersistenceService {
 
         // Attribute every log line from this persistence pass to its org (and
         // the finer ids), so per-org log files capture the ingest trail too.
-        LogContext.scoped(
+        return LogContext.scoped(
             org = organizationId,
             workspace = workspaceId,
             project = projectId,
             service = serviceId,
         ) {
 
+        // Redelivery check, before any work: the same envelope reaches here a
+        // second time whenever a consumer died between committing and removing
+        // the message from its processing list. Re-running the body relocation
+        // and the transaction would be wasted at best; the status counters in
+        // step 3 would double-count at worst.
+        val alreadyPersisted = transaction {
+            ProbeResults.selectAll().where { ProbeResults.id eq resultId }.limit(1).any()
+        }
+        if (alreadyPersisted) {
+            log.info("result {} for service {} was already persisted — redelivery ignored", resultId, serviceId)
+            return PersistOutcome.ALREADY_PERSISTED
+        }
+
         val outcome = rawResult["outcome"]?.jsonPrimitive?.content ?: "error"
         val status = normalizeStatus(outcome)
 
-        // Drop executor errors — only persist valid probe outcomes
+        // `error` covers everything that is not a ProbeResult the executor
+        // could produce: a script that failed to run, an executor that raised,
+        // an agent answering with a diagnostic instead of a result. Spec §9
+        // knows only success/failure/timeout as run outcomes, so anything else
+        // lands here by construction.
+        //
+        // These used to be dropped with a warning: a broken script produced no
+        // history row, no status change and nothing the person who wrote it
+        // could see. They are persisted now — the whole payload goes into
+        // raw_result, and errorDetail() pulls out the message worth reading.
         if (status == "error") {
-            log.warn("dropping result with error outcome for service {}", serviceId)
-            return
+            log.warn("persisting errored run for service {}: {}", serviceId, errorDetail(rawResult))
         }
 
         // Extract timing from rawResult (Lace ProbeResult uses "elapsedMs")
@@ -95,7 +212,9 @@ object ResultPersistenceService {
                 val resp = call.jsonObject["response"]
                 if (resp is JsonObject) resp["responseTimeMs"]?.jsonPrimitive?.intOrNull ?: 0 else 0
             } ?: 0
-        val startedAt = Instant.now()
+        // Probe time, carried on the envelope — not the time this consumer got
+        // around to reading it. See startedAtOf.
+        val startedAt = startedAtOf(envelope)
 
         // Take ownership of every stored body BEFORE persisting: relocate the
         // agent-uploaded bytes to a server-derived, tenant-scoped key and record
@@ -122,6 +241,11 @@ object ResultPersistenceService {
             }
         }
 
+        // The primary key is the backstop behind the redelivery check above: two
+        // consumers handed the same message (a reclaim racing the consumer that
+        // was thought dead) both pass the check and one of them loses here. That
+        // is the intended outcome, not an error — the row exists either way.
+        try {
         transaction {
             // 1. Insert probe_results
             ProbeResults.insert {
@@ -207,7 +331,13 @@ object ResultPersistenceService {
                 val statusChanged = previousStatus != status
 
                 Services.update({ Services.id eq serviceId }) {
-                    it[lastRunId] = resultId
+                    // An errored run is not a ProbeResult (spec §9 has no such
+                    // outcome), so it must never become `prev` for the next
+                    // run — a script reading prev.calls[0] would be handed a
+                    // diagnostic envelope. last_status still moves: leaving it
+                    // green for a check that did not evaluate is the same
+                    // silence this whole path exists to remove.
+                    if (status != "error") it[lastRunId] = resultId
                     it[lastStatus] = status
                     if (statusChanged) {
                         it[lastStatusSince] = startedAt
@@ -310,6 +440,13 @@ object ResultPersistenceService {
                 it[createdAt] = startedAt
             }
         }
+        } catch (e: Exception) {
+            if (isDuplicateResult(e)) {
+                log.info("result {} for service {} was persisted concurrently — redelivery ignored", resultId, serviceId)
+                return PersistOutcome.ALREADY_PERSISTED
+            }
+            throw e
+        }
 
         log.debug("persisted result {} for service {} status={}", resultId, serviceId, status)
 
@@ -319,12 +456,29 @@ object ResultPersistenceService {
         // host redirects shared-infra alerts. It is offered to the routing seam all
         // the same, so a host could reroute it too if it chose.
         if (status == "skipped") {
+            val reason = rawResult["reason"]?.jsonPrimitive?.contentOrNull ?: "unknown"
             val data = buildJsonObject {
-                put("reason", rawResult["reason"]?.jsonPrimitive?.contentOrNull ?: "unknown")
+                put("reason", reason)
+            }
+            // Not every skip is a capacity problem. A tick that found no
+            // executor to run on is a fleet-health problem, and telling the org
+            // to "reduce probe frequency" would send them the wrong way.
+            val alertType = when (reason) {
+                "no_eligible_agent" -> SystemAlertService.NO_ELIGIBLE_AGENT
+                // Agents were there and none of them took the run. Neither a
+                // capacity problem nor an empty fleet — telling the org to
+                // reduce probe frequency or check allowlists would send them
+                // past the actual fault.
+                "agent_unreachable", "agent_rejected" -> SystemAlertService.AGENT_DISPATCH_FAILED
+                // The scheduler itself faulted (its database was unreachable,
+                // its trigger was dropped). Nothing about the fleet or the
+                // org's own settings would explain it.
+                "dispatch_error", "trigger_misfired" -> SystemAlertService.SCHEDULER_ERROR
+                else -> SystemAlertService.DISPATCH_CAPACITY
             }
             val handled = SystemAlertRouting.handled(
                 AlertContext(
-                    alertType = SystemAlertService.DISPATCH_CAPACITY,
+                    alertType = alertType,
                     subject = "",
                     orgId = organizationId,
                     orgScoped = true,
@@ -335,13 +489,32 @@ object ResultPersistenceService {
             if (!handled) {
                 SystemAlertService.raise(
                     orgId = organizationId,
-                    alertType = SystemAlertService.DISPATCH_CAPACITY,
+                    alertType = alertType,
                     severity = "warning",
                     data = data,
                 )
             }
         }
+
+        PersistOutcome.PERSISTED
         } // LogContext.scoped
+    }
+
+    /**
+     * The most useful line of diagnostic an errored run carries.
+     *
+     * A ProbeResult (spec §9) puts non-assertion failure detail on the call
+     * record's `error`; a run that never got as far as a call carries it at the
+     * top level instead. Both are checked, top level first, so an agent- or
+     * executor-level message wins over a per-call one.
+     */
+    fun errorDetail(rawResult: JsonObject): String {
+        (rawResult["error"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }?.let { return it }
+        val callError = (rawResult["calls"] as? JsonArray)
+            ?.firstNotNullOfOrNull { call ->
+                ((call as? JsonObject)?.get("error") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+            }
+        return callError ?: "no detail reported"
     }
 
     /** Maps ProbeResult outcome to DB status enum. */
