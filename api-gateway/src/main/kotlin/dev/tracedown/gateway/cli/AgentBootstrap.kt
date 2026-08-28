@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.cli
 
 import at.favre.lib.crypto.bcrypt.BCrypt
+import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.AgentBootstrapTokens
 import dev.tracedown.gateway.controllers.agents.CaService
@@ -79,6 +80,9 @@ object AgentBootstrap {
                     it[AgentBootstrapTokens.slug] = slug
                     it[AgentBootstrapTokens.label] = label
                     it[AgentBootstrapTokens.tokenHash] = tokenHash
+                    // Indexed locator — enrolment looks the row up by this
+                    // digest instead of bcrypting every outstanding token.
+                    it[tokenLookup] = TokenHasher.sha256Hex(token)
                     it[expiresAt] = Instant.now().plus(TOKEN_TTL_HOURS, ChronoUnit.HOURS)
                     it[createdAt] = Instant.now()
                 }

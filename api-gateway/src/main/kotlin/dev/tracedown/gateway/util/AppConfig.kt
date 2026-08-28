@@ -58,6 +58,7 @@ data class PlatformConfig(
     val defaultGroups: List<DefaultGroupConfig>,
     val trustedDomainMode: Boolean,
     val allowProfileEdit: Boolean,
+    val allowAccountClosure: Boolean,
     val metricsPublicUrl: String,
     val seed: SeedConfig,
 )
@@ -148,6 +149,7 @@ data class AppConfig(
                     defaultGroups = loadDefaultGroups(config),
                     trustedDomainMode = config.property("platform.trustedDomainMode").getString().toBoolean(),
                     allowProfileEdit = config.property("platform.allowProfileEdit").getString().toBoolean(),
+                    allowAccountClosure = config.property("platform.allowAccountClosure").getString().toBoolean(),
                     metricsPublicUrl = config.property("platform.metricsPublicUrl").getString(),
                     seed = SeedConfig(
                         enabled = config.property("platform.seed.enabled").getString().toBoolean(),

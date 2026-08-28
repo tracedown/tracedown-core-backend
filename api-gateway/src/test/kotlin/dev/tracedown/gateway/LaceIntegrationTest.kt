@@ -135,6 +135,13 @@ class LaceIntegrationTest {
                 "redis.a.url" to TestRedis.url,
                 "redis.b.url" to TestRedis.url,
                 "redis.c.url" to "",
+                // auth/20_delete_account.lace exercises the closure endpoint's
+                // own validation (identity, then owned organizations). The
+                // switch is off by default and its gate runs before any of
+                // that, so the script needs it on to reach what it tests. The
+                // gate itself is pinned in MeRoutesTest, whose server leaves
+                // the default in place.
+                "platform.allowAccountClosure" to "true",
             ))
             val mergedConfig = overrides.withFallback(ConfigFactory.load())
 
