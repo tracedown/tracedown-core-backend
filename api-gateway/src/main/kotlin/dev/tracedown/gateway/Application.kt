@@ -53,6 +53,9 @@ import dev.tracedown.gateway.routes.internal.internalAgentRoutes
 import dev.tracedown.gateway.routes.internal.internalHealthTokenRoutes
 import dev.tracedown.gateway.util.ApiException
 import dev.tracedown.gateway.util.AppConfig
+import dev.tracedown.common.health.databaseCheck
+import dev.tracedown.common.health.readinessRoute
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.gateway.util.RateLimitConfig
 import dev.tracedown.gateway.util.RateLimiter
 import dev.tracedown.gateway.util.ResourceResolver
@@ -109,7 +112,7 @@ fun Application.module() {
         ),
     )
 
-    DatabaseFactory.init(
+    val dataSource = DatabaseFactory.init(
         jdbcUrl = appConfig.database.url,
         username = appConfig.database.user,
         password = appConfig.database.password
@@ -143,11 +146,16 @@ fun Application.module() {
     ServiceController.init { redisA }
     dev.tracedown.common.realtime.RealtimePublisher.init { redisA }
 
-    // Redis C (resource hierarchy cache) — optional, disabled if not configured
+    // Redis C (resource hierarchy cache) — optional, disabled if not configured.
+    // Lazy like A and B: the cache is an optimisation, and connecting to it
+    // during module init let an unreachable instance stop Ktor from binding.
     val resourceCache = if (appConfig.redis.cUrl != null) {
-        val redisCConn = RedisFactory.createConnection(appConfig.redis.cUrl!!)
-        monitor.subscribe(io.ktor.server.application.ApplicationStopped) { redisCConn.close() }
-        dev.tracedown.common.cache.ResourceCache(redisCConn.sync(), appConfig.redis.cacheTtlSeconds)
+        val redisC by lazy {
+            val conn = RedisFactory.createConnection(appConfig.redis.cUrl!!)
+            monitor.subscribe(io.ktor.server.application.ApplicationStopped) { conn.close() }
+            conn.sync()
+        }
+        dev.tracedown.common.cache.ResourceCache({ redisC }, appConfig.redis.cacheTtlSeconds)
     } else {
         log.info("Redis C not configured — resource cache disabled (DB-only mode)")
         dev.tracedown.common.cache.ResourceCache.DISABLED
@@ -162,7 +170,11 @@ fun Application.module() {
     }
 
     val rateLimitConfig = RateLimitConfig.load(environment.config)
-    val rateLimiter = RateLimiter(redis = { redisB }, config = rateLimitConfig)
+    // The auth tier fails CLOSED, so the limiter's store has to be the durable
+    // operational instance rather than the evictable cache: an allkeys-lru
+    // Redis B is allowed to drop counters, and losing it locks logins out.
+    // In the default single-instance setup this is the same server either way.
+    val rateLimiter = RateLimiter(redis = { redisA }, config = rateLimitConfig)
 
     dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.init { redisB }
     dev.tracedown.gateway.controllers.metrics.UsageController.init({ redisB }, appConfig.systemLimits.resultRetentionDays)
@@ -193,7 +205,9 @@ fun Application.module() {
         )
     )
 
-    val emailPublisher = EmailPublisher(redisA)
+    // Provider, not an instance: constructing it must not force the lazy
+    // connection and drag Redis into module init (see EmailPublisher).
+    val emailPublisher = EmailPublisher { redisA }
 
     if (appConfig.platform.singleOrgMode) {
         bootstrapSingleOrg(appConfig)
@@ -264,7 +278,17 @@ fun Application.module() {
             )
         }
         exception<ApiException> { call, cause ->
-            call.respond(cause.status, mapOf("error" to cause.code))
+            // Most codes stand alone; the few that cannot carry `details` with
+            // the specifics the client needs to say what is in the way.
+            val details = cause.details
+            if (details == null) {
+                call.respond(cause.status, mapOf("error" to cause.code))
+            } else {
+                call.respond(cause.status, kotlinx.serialization.json.buildJsonObject {
+                    put("error", kotlinx.serialization.json.JsonPrimitive(cause.code))
+                    put("details", details)
+                })
+            }
         }
         // A PFS filter/sort naming a non-allowlisted table/column is a bad
         // request, not a server error — surface the neutral code.
@@ -368,6 +392,19 @@ fun Application.module() {
         auditRoutes()
         internalAgentRoutes()
         internalHealthTokenRoutes { redisA }
+
+        // Readiness alongside the existing static /ping (liveness). The
+        // database is required — the gateway cannot answer anything without
+        // it. Redis A is reported but not required: rate limiting and email
+        // queueing both degrade rather than stop, and failing readiness on a
+        // Redis blip is the restart loop this pass is removing.
+        readinessRoute(
+            "api-gateway",
+            listOf(
+                databaseCheck(dataSource),
+                redisCheck("redis-a", required = false) { redisA },
+            ),
+        )
     }
 }
 

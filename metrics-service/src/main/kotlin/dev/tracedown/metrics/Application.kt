@@ -1,6 +1,10 @@
 package dev.tracedown.metrics
 
 import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.config.SecretGuard
+import dev.tracedown.common.health.databaseCheck
+import dev.tracedown.common.health.installHealthEndpoints
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.metrics.cache.MetricsWriter
@@ -25,6 +29,13 @@ fun main(args: Array<String>) = EngineMain.main(args)
 /** Ktor module — wires DB, Redis A (pub/sub), Redis B (metrics), and routes. */
 fun Application.module() {
     val config = MetricsConfig.load(environment)
+
+    // No insecure defaults of its own to guard; still reports the resolved
+    // deployment environment so a misspelt DEPLOYMENT_ENV is visible here too.
+    SecretGuard.announce(
+        environment.config.propertyOrNull("deployment.environment")?.getString(),
+        "metrics-service",
+    )
 
     // Database (for integration/scope lookups)
     val dataSource = DatabaseFactory.init(
@@ -52,10 +63,22 @@ fun Application.module() {
     val nudgeListener = NudgeListener(pubSubConnection, metricsWriter, listenerScope)
     nudgeListener.start()
 
-    // Routes
+    // Routes. The bearer-authenticated /metrics/{id} scrape endpoint is not a
+    // health signal — an unauthenticated liveness path and a real readiness
+    // check are added here. Postgres and Redis B are required (scope lookups
+    // and the metric store); Redis A only carries the nudge subscription, and
+    // the service still serves the last written values without it.
     routing {
         metricsRoutes(metricsReader)
     }
+    installHealthEndpoints(
+        "metrics-service",
+        listOf(
+            databaseCheck(dataSource),
+            redisCheck("redis-b") { redisB },
+            redisCheck("redis-a", required = false) { redisAConn.sync() },
+        ),
+    )
 
     log.info("metrics-service started (metricsTtl={}s, hourlyBucketTtl={}s)", config.metricsTtlSeconds, config.hourlyBucketTtlSeconds)
 

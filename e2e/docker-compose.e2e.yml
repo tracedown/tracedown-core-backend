@@ -87,6 +87,11 @@ services:
       GATEWAY_URL: http://gateway:8080
       SCHEDULER_SWEEP_INTERVAL: "10"
       SCHEDULER_THREAD_POOL_SIZE: "4"
+      # The scheduler sizes its connection pool from its dispatch concurrency,
+      # so the production default of 50 workers would ask this stack's Postgres
+      # for more backends than it has. The suite probes a handful of services;
+      # 8 in flight is more than it ever needs.
+      SCHEDULER_DISPATCH_WORKERS: "8"
       TRUSTED_DOMAIN_MODE: "true"
       PORT: 8081
     depends_on:

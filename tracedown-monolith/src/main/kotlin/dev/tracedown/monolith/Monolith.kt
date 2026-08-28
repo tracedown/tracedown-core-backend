@@ -153,6 +153,15 @@ private fun serviceConfig(
                 "scheduler.gatewayUrl",
                 ConfigValueFactory.fromAnyRef(System.getenv("GATEWAY_URL") ?: "http://127.0.0.1:$gatewayPort"),
             )
+            // The scheduler sizes its connection pool from its dispatch
+            // concurrency, and the standalone default (50 in flight) is aimed at
+            // a fleet of agents. Here probes run in-process on one box, so a
+            // pool of that size would take connections from every other service
+            // sharing this database for concurrency the host cannot use anyway.
+            // An explicit env override still wins.
+            if (System.getenv("SCHEDULER_DISPATCH_WORKERS") == null) {
+                cfg = cfg.withValue("scheduler.dispatchWorkers", ConfigValueFactory.fromAnyRef(8))
+            }
         }
     }
     return cfg

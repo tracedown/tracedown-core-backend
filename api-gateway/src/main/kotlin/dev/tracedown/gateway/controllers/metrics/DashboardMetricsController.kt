@@ -176,8 +176,14 @@ object DashboardMetricsController {
         )
 
         val db = transaction {
+            // Skipped rows are history-only: a tick that never ran is not a
+            // probe that failed. Counting them would put them in the uptime
+            // denominator and quietly drag the number down every time the
+            // platform sheds a tick or finds no agent to run on — and the
+            // live Redis counters (which the ingestor never increments for a
+            // skipped result) would then disagree with this DB backfill.
             val results = ProbeResults.selectAll()
-                .where { ProbeResults.serviceId eq serviceId }
+                .where { (ProbeResults.serviceId eq serviceId) and (ProbeResults.status neq "skipped") }
                 .toList()
 
             if (results.isEmpty()) return@transaction null
@@ -461,6 +467,11 @@ object DashboardMetricsController {
             WHERE service_id IN ($idArray)
               AND started_at >= '${sqlTsFormatter.format(start)}'
               AND started_at < '${sqlTsFormatter.format(end)}'
+              -- A skipped tick never ran, so it belongs in neither the
+              -- numerator nor the denominator of this hour's uptime. The
+              -- Redis hourly buckets exclude it as well; without this the DB
+              -- fallback for the same hour would return a different number.
+              AND status != 'skipped'
             GROUP BY 1
         """.trimIndent()
 
