@@ -6,10 +6,13 @@ import dev.tracedown.common.alerts.SystemAlertService
 import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.ProbeAgents
-import dev.tracedown.common.realtime.RealtimePublisher
+import dev.tracedown.common.agents.FleetAudience
 import dev.tracedown.scheduler.crypto.AgentMtlsClientFactory
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.CIO
+import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
@@ -24,8 +27,9 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
-import kotlinx.serialization.json.int
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
@@ -56,6 +60,68 @@ class HealthChallengeJob : Job {
         private const val TOKEN_BYTES = 32
         private const val TOKEN_TTL_SECONDS = 30L
         private const val CHALLENGE_TIMEOUT_MS = 10_000L
+
+        /** Path the agent is told to fetch its token from. */
+        private const val TOKEN_PATH = "/internal/health/token"
+
+        /**
+         * Budget for the scheduler's own check of the token endpoint. Short: it
+         * only runs when a challenge already failed, and the answer is only
+         * needed to decide whether the failure can be blamed on the agent.
+         */
+        private const val TOKEN_PROBE_TIMEOUT_MS = 3_000L
+
+        /** The only result that counts as a healthy round. */
+        const val RESULT_PASS = "pass"
+
+        /**
+         * The round observed nothing about the agent — the token endpoint (or
+         * the store behind it) was down for the scheduler too. Kept as history,
+         * never as a verdict: it neither sets `last_status` nor counts toward
+         * the consecutive-failure total.
+         */
+        const val RESULT_INCONCLUSIVE = "inconclusive"
+
+        /**
+         * Consecutive non-pass rounds required before an agent is marked
+         * `failure`. Recovery is immediate on the first pass — fail slow,
+         * recover fast, so a single blip does not empty the fleet and a
+         * genuine outage is still caught inside two minutes.
+         */
+        const val FAILURE_THRESHOLD = 2
+
+        /**
+         * Decides what `probe_agents.last_status` should become, given this
+         * round's [result] and the [priorResult] of the last round that
+         * observed anything (inconclusive rounds excluded). `null` means leave
+         * the current status alone.
+         *
+         * Pure so the hysteresis can be tested without a database.
+         */
+        fun nextStatus(result: String, priorResult: String?): String? = when {
+            // Recover fast: one good round is enough to put an agent back.
+            result == RESULT_PASS -> "success"
+            // Fail slow: a single non-pass round is a blip, not a verdict.
+            // With FAILURE_THRESHOLD = 2 the previous round has to have been
+            // non-pass as well. No prior round at all counts as "not yet".
+            priorResult != null && priorResult != RESULT_PASS -> "failure"
+            else -> null
+        }
+
+        /**
+         * Stable alert subject for the token endpoint: the per-challenge id is
+         * deliberately left off, or every minute would open a new alert episode
+         * instead of refreshing the one that is already showing.
+         */
+        fun tokenEndpointSubject(gatewayUrl: String): String =
+            "$gatewayUrl$TOKEN_PATH".take(128)
+
+        /**
+         * Plain (non-mTLS) client used only to ask the gateway whether it is
+         * serving health tokens. Shared: Quartz builds a fresh job instance per
+         * fire, and a per-instance client would leak a connection pool a minute.
+         */
+        private val tokenProbeClient: HttpClient by lazy { HttpClient(CIO) }
     }
 
     override fun execute(context: JobExecutionContext) {
@@ -95,11 +161,30 @@ class HealthChallengeJob : Job {
         val challengeId = generateHex(32)
         val token = generateHex(TOKEN_BYTES)
         val challengedAt = Instant.now()
+        val tokenUrl = "$gatewayUrl$TOKEN_PATH/$challengeId"
 
-        // Store token in Redis A
-        redis.set("health:token:$challengeId", token, SetArgs().ex(TOKEN_TTL_SECONDS))
-
-        val tokenUrl = "$gatewayUrl/internal/health/token/$challengeId"
+        // Store token in Redis A. Guarded rather than bare: this used to throw
+        // straight out of the round, abandoning every other agent's challenge
+        // along with this one.
+        try {
+            redis.set("health:token:$challengeId", token, SetArgs().ex(TOKEN_TTL_SECONDS))
+        } catch (e: Exception) {
+            // The agent was never contacted, so this round learned nothing
+            // about it. Blaming it here would take the whole fleet out of
+            // rotation over a store the agents do not even talk to.
+            log.warn("health challenge for agent {} could not store its token: {}", agent.slug, e.message)
+            recordInconclusive(
+                agent = agent,
+                challengeId = challengeId,
+                challengedAt = challengedAt,
+                respondedAt = null,
+                roundTripMs = null,
+                gatewayUrl = gatewayUrl,
+                stage = "token_store",
+                detail = e.message,
+            )
+            return
+        }
 
         try {
             // Pin the challenge to this agent's certificate identity — a health
@@ -127,8 +212,34 @@ class HealthChallengeJob : Job {
 
             val result = when {
                 !success -> "fail"
-                returnedToken == token -> "pass"
+                returnedToken == token -> RESULT_PASS
                 else -> "wrong_token"
+            }
+
+            // The agent answered and said it could not complete the challenge.
+            // Passing requires it to fetch a token from the gateway, so before
+            // that is held against it, check whether the endpoint answers the
+            // scheduler either. If it does not, the failure belongs to the
+            // platform: every agent would otherwise be convicted in the same
+            // round and dispatch would find nothing left to run on.
+            if (!success && !tokenEndpointReachable(tokenUrl)) {
+                // The agent's own explanation — reported all along, never read.
+                val agentError = body["error"]?.jsonPrimitive?.contentOrNull
+                log.warn(
+                    "health challenge for agent {} is inconclusive: {} is unreachable from the scheduler too (agent reported: {})",
+                    agent.slug, tokenEndpointSubject(gatewayUrl), agentError ?: "no detail",
+                )
+                recordInconclusive(
+                    agent = agent,
+                    challengeId = challengeId,
+                    challengedAt = challengedAt,
+                    respondedAt = respondedAt,
+                    roundTripMs = roundTripMs,
+                    gatewayUrl = gatewayUrl,
+                    stage = "token_endpoint",
+                    detail = agentError,
+                )
+                return
             }
 
             recordResult(agent.id, agent.slug, challengeId, challengedAt, respondedAt, roundTripMs, result, supportsSealed)
@@ -146,8 +257,72 @@ class HealthChallengeJob : Job {
         }
     }
 
-    /** Global UUID used for agent health events (agents are not org-scoped). */
-    private val GLOBAL_ORG = UUID(0, 0)
+    /**
+     * Asks the gateway whether it is serving health tokens at all.
+     *
+     * Reading a token does not delete it (the endpoint just reads the key,
+     * which lives out its 30 s TTL), so this second GET does not consume the
+     * one the agent was sent. Only a 200 counts: a 404 or a 5xx means the token
+     * path is not serving, which is equally not the agent's doing.
+     */
+    private suspend fun tokenEndpointReachable(tokenUrl: String): Boolean = try {
+        withTimeout(TOKEN_PROBE_TIMEOUT_MS) {
+            tokenProbeClient.get(tokenUrl).status.value == 200
+        }
+    } catch (e: Exception) {
+        log.debug("health token endpoint unreachable from the scheduler: {}", e.message)
+        false
+    }
+
+    /**
+     * Records a round that observed nothing about the agent.
+     *
+     * The history row is kept — an operator looking at agent health should see
+     * that a check was attempted — but `probe_agents` is left completely
+     * untouched, so `last_status` survives and the agent stays in rotation. The
+     * alert names the endpoint that was down, not the agent that could not
+     * reach it.
+     */
+    private fun recordInconclusive(
+        agent: AgentInfo,
+        challengeId: String,
+        challengedAt: Instant,
+        respondedAt: Instant?,
+        roundTripMs: Int?,
+        gatewayUrl: String,
+        stage: String,
+        detail: String?,
+    ) {
+        try {
+            transaction {
+                AgentHealthChecks.insert {
+                    it[id] = UUID.randomUUID()
+                    it[probeAgentId] = agent.id
+                    it[AgentHealthChecks.challengeId] = challengeId
+                    it[AgentHealthChecks.challengedAt] = challengedAt
+                    it[AgentHealthChecks.respondedAt] = respondedAt
+                    it[AgentHealthChecks.roundTripMs] = roundTripMs
+                    it[AgentHealthChecks.result] = RESULT_INCONCLUSIVE
+                    it[createdAt] = Instant.now()
+                }
+            }
+        } catch (e: Exception) {
+            log.debug("failed to record inconclusive health check for {}: {}", agent.slug, e.message)
+        }
+
+        raisePlatformAgentAlert(
+            SystemAlertService.HEALTH_TOKEN_UNAVAILABLE,
+            tokenEndpointSubject(gatewayUrl),
+            "error",
+            buildJsonObject {
+                put("endpoint", tokenEndpointSubject(gatewayUrl))
+                put("stage", stage)
+                put("at", challengedAt.toString())
+                put("agentSlug", agent.slug)
+                if (detail != null) put("detail", detail)
+            },
+        )
+    }
 
     private fun recordResult(
         agentId: Long,
@@ -159,8 +334,26 @@ class HealthChallengeJob : Job {
         result: String,
         supportsSealed: Boolean?,
     ) {
-        val status = if (result == "pass") "success" else "failure"
+        // The status actually in force after this round — either what we wrote
+        // or, while hysteresis is holding, whatever was there already.
+        var status = "success"
+        var convicted = false
+
         transaction {
+            // The previous round that observed anything, read in the same
+            // transaction as the insert so two overlapping rounds cannot both
+            // read "first failure" and both decline to convict. Inconclusive
+            // rows are skipped: they are not evidence either way.
+            val priorResult = AgentHealthChecks.selectAll()
+                .where {
+                    (AgentHealthChecks.probeAgentId eq agentId) and
+                        (AgentHealthChecks.result neq RESULT_INCONCLUSIVE)
+                }
+                .orderBy(AgentHealthChecks.createdAt to SortOrder.DESC)
+                .limit(1)
+                .firstOrNull()
+                ?.get(AgentHealthChecks.result)
+
             AgentHealthChecks.insert {
                 it[id] = UUID.randomUUID()
                 it[probeAgentId] = agentId
@@ -172,12 +365,33 @@ class HealthChallengeJob : Job {
                 it[createdAt] = Instant.now()
             }
 
+            val newStatus = nextStatus(result, priorResult)
+            convicted = newStatus == "failure"
+
             ProbeAgents.update({ ProbeAgents.id eq agentId }) {
                 it[lastPing] = challengedAt
-                it[lastStatus] = status
+                // Null means hysteresis is holding: the observation fields are
+                // still current, but one non-pass round does not change the
+                // verdict — and it is the verdict that decides whether the
+                // agent stays eligible for dispatch.
+                if (newStatus != null) it[lastStatus] = newStatus
                 it[lastPingDelayMs] = 0
                 it[lastPongDeltaMs] = roundTripMs
                 if (supportsSealed != null) it[supportsEncryptedPayload] = supportsSealed
+            }
+
+            status = newStatus
+                ?: ProbeAgents.selectAll()
+                    .where { ProbeAgents.id eq agentId }
+                    .firstOrNull()
+                    ?.get(ProbeAgents.lastStatus)
+                ?: "success"
+
+            if (newStatus == null) {
+                log.info(
+                    "health challenge for agent {} returned {} — holding at {} pending {} consecutive failures",
+                    agentSlug, result, status, FAILURE_THRESHOLD,
+                )
             }
         }
 
@@ -188,20 +402,22 @@ class HealthChallengeJob : Job {
             put("lastCheck", respondedAt.toString())
             put("lastResponseMs", roundTripMs)
         }
-        RealtimePublisher.publish("agents:summary", GLOBAL_ORG, "health.updated", eventData)
-        RealtimePublisher.publish("agents", GLOBAL_ORG, "health.updated", eventData)
+        FleetAudience.publish(agentSlug, "health.updated", eventData)
 
         // Admin banner on agent trouble. Agents are platform-global, so absent a
         // router the alert goes to every org (typically a single org, self-hosted).
         // A host that operates shared agents can intercept it — its infra health is
         // not each customer's concern — via the [SystemAlertRouting] seam.
-        if (result != "pass") {
+        // Raised on conviction, not on the first blip: the banner and
+        // `probe_agents.last_status` should never disagree about whether an
+        // agent is down.
+        if (convicted) {
             raisePlatformAgentAlert(SystemAlertService.AGENT_DOWN, agentSlug, "error", buildJsonObject {
                 put("agentSlug", agentSlug)
                 put("at", challengedAt.toString())
                 put("result", result)
             })
-        } else if (roundTripMs > SystemAlertService.DEGRADED_RTT_MS) {
+        } else if (result == RESULT_PASS && roundTripMs > SystemAlertService.DEGRADED_RTT_MS) {
             raisePlatformAgentAlert(SystemAlertService.AGENT_DEGRADED, agentSlug, "warning", buildJsonObject {
                 put("agentSlug", agentSlug)
                 put("at", challengedAt.toString())

@@ -11,11 +11,10 @@ import dev.tracedown.scheduler.results.ResultRedactor
 import dev.tracedown.scheduler.scheduling.QuartzManager
 import dev.tracedown.scheduler.variables.VariableResolver
 import dev.tracedown.scheduler.window.ServiceWindowEvaluator
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -26,8 +25,12 @@ import kotlinx.serialization.json.put
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.slf4j.LoggerFactory
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -36,6 +39,21 @@ import java.util.concurrent.atomic.AtomicLong
  * Quartz jobs enqueue service IDs instantly (non-blocking). A fixed pool of dispatcher
  * coroutines drains the queue at the rate agents can handle. This prevents thread pool
  * starvation when many cron triggers fire at the same second.
+ *
+ * **Nothing a Quartz thread calls here may block.** There are only ten of them,
+ * and they are the clock: a thread of theirs spent inside a transaction is a
+ * trigger that fires late or, past the pool, misfires and is dropped. Both
+ * [enqueue] and [recordMisfire] therefore hand off to [shedChannel] and return;
+ * the database and Redis work happens on this queue's own threads.
+ *
+ * **The workers get their own threads, sized to the connection pool.** They ran
+ * on [kotlinx.coroutines.Dispatchers.Default], whose parallelism is the CPU
+ * count — so `workers = 50` bought perhaps eight concurrent dispatches on a
+ * small host, each one holding a CPU thread through a blocking transaction, and
+ * the consistency sweep sharing what was left. A dedicated pool of exactly
+ * [workers] threads makes the configured number the real number, and the
+ * scheduler sizes its Hikari pool from the same figure so a worker that reaches
+ * for a connection finds one instead of timing out after 30 seconds.
  *
  * @param capacity maximum number of pending dispatches in the queue
  * @param workers number of concurrent dispatcher coroutines
@@ -54,6 +72,39 @@ class DispatchQueue(
     private val log = LoggerFactory.getLogger(javaClass)
     private val channel = Channel<UUID>(capacity)
     private val droppedCount = AtomicLong(0)
+    private val unrecordedSheds = AtomicLong(0)
+
+    /**
+     * A tick that will not run, waiting to be written down.
+     *
+     * [at] is captured where the decision was made, not where the row is
+     * written, so a shed recorded a second later is still filed at the minute it
+     * belonged to.
+     */
+    private data class ShedRecord(val serviceId: UUID, val reason: String, val at: Instant)
+
+    /**
+     * Sheds waiting to be recorded, drained off the Quartz threads.
+     *
+     * Buffered and non-suspending: an offer that does not fit is refused rather
+     * than made to wait, because the caller may be a Quartz thread and blocking
+     * the clock to write bookkeeping is what this whole change exists to stop.
+     * A refusal is counted and logged — an invisible loss here would be the same
+     * failure the skipped row exists to make visible.
+     */
+    private val shedChannel = Channel<ShedRecord>(SHED_BUFFER)
+
+    /**
+     * Threads for the dispatch workers and the shed recorders.
+     *
+     * Daemon threads, and deliberately never shut down: [close] closes the
+     * channels, which ends the loops, and a dispatch already in flight keeps its
+     * thread until it finishes rather than having its continuation rejected by a
+     * pool shutting down underneath it. The JVM is exiting either way.
+     */
+    private val dispatchThreads: CoroutineDispatcher =
+        Executors.newFixedThreadPool(workers + SHED_RECORDERS, DispatchThreadFactory())
+            .asCoroutineDispatcher()
 
     /**
      * Services currently waiting in the channel. A second tick for a service
@@ -63,7 +114,17 @@ class DispatchQueue(
      */
     private val queuedServices: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
 
-    /** Enqueues a service for dispatch. Returns false if the tick was shed (recorded as skipped). */
+    /**
+     * Enqueues a service for dispatch. Returns false if the tick was shed
+     * (recorded as skipped).
+     *
+     * Called on a Quartz thread. Does no I/O — a shed is queued for recording,
+     * not recorded here. The path that exists to make overload visible used to
+     * open a transaction (three queries) plus a Redis push on the way past, so
+     * the exact overload it handles saturated the ten-thread Quartz pool and the
+     * next triggers misfired: dropped with no row and no log, which is the
+     * opposite of visible.
+     */
     fun enqueue(serviceId: UUID): Boolean {
         if (!queuedServices.add(serviceId)) {
             shed(serviceId, "dispatch_backlog")
@@ -78,52 +139,87 @@ class DispatchQueue(
         return true
     }
 
+    /**
+     * Records a trigger Quartz dropped without firing.
+     *
+     * The probe triggers use `withMisfireHandlingInstructionDoNothing`, which is
+     * the right policy — a cron probe that is late is not worth running twice —
+     * but on its own it is silent, and silence on a monitoring dashboard reads
+     * as "all fine". This makes the dropped tick a `skipped` row like any other
+     * shed. Also called on a Quartz thread; also does no I/O.
+     */
+    fun recordMisfire(serviceId: UUID) {
+        shed(serviceId, "trigger_misfired")
+    }
+
     private fun shed(serviceId: UUID, reason: String) {
         val count = droppedCount.incrementAndGet()
         if (count % 100 == 1L) {
             log.warn("Dispatch over capacity ({}), shed service {}. Total sheds: {}", reason, serviceId, count)
         }
-        recordSkipped(serviceId, reason)
+        recordSkipped(serviceId, reason, Instant.now())
     }
 
     /**
-     * Records a shed probe as a `skipped` result row so the drop is visible in
-     * the service's probe history instead of silently thinning coverage.
+     * Queues a shed probe to be written down as a `skipped` result row, so the
+     * drop is visible in the service's probe history instead of silently
+     * thinning coverage.
+     *
+     * Non-blocking by contract: the channel refuses rather than suspends, so this
+     * is safe to call from a Quartz thread, from a dispatch worker, or from the
+     * error path of either.
      */
-    private fun recordSkipped(serviceId: UUID, reason: String) {
+    private fun recordSkipped(serviceId: UUID, reason: String, at: Instant) {
+        val result = shedChannel.trySend(ShedRecord(serviceId, reason, at))
+        if (result.isFailure) {
+            val lost = unrecordedSheds.incrementAndGet()
+            if (lost % 100 == 1L) {
+                log.warn("shed recorder is not keeping up — {} sheds not written to history", lost)
+            }
+        }
+    }
+
+    /** Writes one queued shed to the result queue. Runs on this queue's own threads. */
+    private fun writeSkipped(record: ShedRecord) {
         try {
-            val ctx = transaction { resolveContext(serviceId) } ?: return
+            val ctx = transaction { resolveContext(record.serviceId) } ?: return
             resultPublisher.publish(
                 jobId = UUID.randomUUID(),
-                serviceId = serviceId,
+                serviceId = record.serviceId,
                 agentId = null,
                 projectId = ctx.projectId,
                 workspaceId = ctx.workspaceId,
                 organizationId = ctx.orgId,
                 rawResult = buildJsonObject {
                     put("outcome", "skipped")
-                    put("reason", reason)
+                    put("reason", record.reason)
                     put("elapsedMs", 0)
                 },
+                // The instant the tick was shed, not the instant this recorder
+                // got to it — the row belongs to the minute it was due.
+                startedAt = record.at,
                 agentEgressBytes = 0L, // nothing was dispatched to an agent
             )
         } catch (e: Exception) {
             // Never let bookkeeping break the scheduling path.
-            log.debug("failed to record skipped probe for {}: {}", serviceId, e.message)
+            log.debug("failed to record skipped probe for {}: {}", record.serviceId, e.message)
         }
     }
 
     /** Starts the dispatcher worker pool. Call once at startup. */
     fun start(scope: CoroutineScope) {
         repeat(workers) { workerId ->
-            scope.launch {
+            scope.launch(dispatchThreads) {
                 log.debug("Dispatcher worker {} started", workerId)
                 for (serviceId in channel) {
-                    try {
-                        dispatch(serviceId)
-                    } catch (e: Exception) {
-                        log.error("Dispatcher worker {} failed for service {}: {}", workerId, serviceId, e.message, e)
-                    }
+                    dispatch(serviceId, workerId)
+                }
+            }
+        }
+        repeat(SHED_RECORDERS) {
+            scope.launch(dispatchThreads) {
+                for (record in shedChannel) {
+                    writeSkipped(record)
                 }
             }
         }
@@ -133,12 +229,35 @@ class DispatchQueue(
     /** Shuts down the queue, cancelling pending items. */
     fun close() {
         channel.close()
+        shedChannel.close()
     }
 
     /** Returns the number of dropped dispatches since startup. */
     fun droppedTotal(): Long = droppedCount.get()
 
-    private suspend fun dispatch(serviceId: UUID) {
+    /**
+     * Runs one tick, and guarantees it leaves a trace either way.
+     *
+     * A failure inside [runDispatch] — the connection pool timing out under
+     * contention was the observed one — used to be caught by the worker loop and
+     * logged, and the probe then produced no result row at all, not even a
+     * skipped one. The service's history simply thinned. Anything that fails
+     * before a result was published is now written down as a skipped tick naming
+     * the scheduler as the cause, which is the honest attribution: nothing was
+     * learned about the target, and nothing about the target or the agents
+     * explains it.
+     */
+    private suspend fun dispatch(serviceId: UUID, workerId: Int) {
+        val accounted = AtomicBoolean(false)
+        try {
+            runDispatch(serviceId, accounted)
+        } catch (e: Exception) {
+            log.error("Dispatcher worker {} failed for service {}: {}", workerId, serviceId, e.message, e)
+            if (!accounted.get()) recordSkipped(serviceId, "dispatch_error", Instant.now())
+        }
+    }
+
+    private suspend fun runDispatch(serviceId: UUID, accounted: AtomicBoolean) {
         // Off the queue — the next tick for this service may enqueue again
         // (concurrent-run protection is the probe_active lock, not this set).
         queuedServices.remove(serviceId)
@@ -231,6 +350,12 @@ class DispatchQueue(
             // (simultaneous mode); each carries the bytes it sent, so the
             // usage buckets sum them into the run total.
             val jobId = UUID.randomUUID()
+            // The run starts here. This instant — not the time the ingestor
+            // happens to read the result — is what every row derived from this
+            // tick is filed under. It is the closest thing the platform knows to
+            // when the probe actually happened: the agent is about to be handed
+            // the script, and it does not report a clock of its own.
+            val startedAt = Instant.now()
             val executions = executionBackend.execute(
                 ProbeExecutionBackend.Request(
                     serviceId = serviceId,
@@ -250,12 +375,24 @@ class DispatchQueue(
                 ),
             )
             if (executions.isEmpty()) {
+                // Nothing ran, and silence on a monitoring dashboard reads as
+                // "all fine". Record the tick as skipped so the gap is visible
+                // in the service's probe history — the one condition under
+                // which the whole fleet can drop out at once (every agent
+                // failing its health challenge) used to produce a log line and
+                // nothing else.
                 log.warn("service {} has no eligible probe executor", serviceId)
+                recordSkipped(serviceId, "no_eligible_agent", startedAt)
+                accounted.set(true)
                 return
             }
 
+            var published = 0
             for (execution in executions) {
-                // Executor unreachable — logged by the backend, nothing to persist.
+                // No result: the backend exhausted every agent it was allowed
+                // to re-run on. Handled after the loop — in `simultaneous` mode
+                // a sibling execution may still have produced one, and one
+                // agent failing is not the same as the tick observing nothing.
                 val result = execution.result ?: continue
                 // Strip any secret plaintext the executor echoed back (e.g. a
                 // secret placed in a request URL/header) before it is persisted.
@@ -268,13 +405,40 @@ class DispatchQueue(
                     workspaceId = ctx.workspaceId,
                     organizationId = ctx.orgId,
                     rawResult = redacted,
+                    startedAt = startedAt,
                     agentEgressBytes = execution.egressBytes,
                 )
+                published++
+                accounted.set(true)
+            }
+
+            if (published == 0) {
+                // Agents were selected and every one of them failed at the
+                // agent level — the case an agent container killed between
+                // health rounds produces. Nothing was learned about the target,
+                // so this is recorded as a skipped tick naming the cause, not
+                // as a failure the service did not have: a synthetic failure
+                // would flip last_status and count as downtime for a service
+                // that may be perfectly healthy. The alert is what makes it
+                // loud; the row is what makes the gap visible.
+                val reason = executions.firstNotNullOfOrNull { it.failureReason } ?: "agent_unreachable"
+                log.warn("service {} produced no result from {} execution(s): {}", serviceId, executions.size, reason)
+                recordSkipped(serviceId, reason, startedAt)
+                accounted.set(true)
+                return
             }
 
             log.info("dispatched service {} ({} execution(s))", serviceId, executions.size)
         } finally {
-            val hasPending = queuePolicy.release(serviceId, lockToken)
+            // A lock release that fails must not be mistaken for a tick that
+            // produced nothing — by this point the results are already on the
+            // queue.
+            val hasPending = try {
+                queuePolicy.release(serviceId, lockToken)
+            } catch (e: Exception) {
+                log.warn("failed to release lock for service {}: {}", serviceId, e.message)
+                false
+            }
             if (hasPending) {
                 log.debug("service {} has pending run — re-enqueueing", serviceId)
                 enqueue(serviceId)
@@ -315,6 +479,30 @@ class DispatchQueue(
             workspaceId = project[Projects.workspaceId],
             orgId = workspace[Workspaces.organizationId],
         )
+    }
+
+    /** Names the dispatch threads so a thread dump says which pool is busy. */
+    private class DispatchThreadFactory : ThreadFactory {
+        private val seq = AtomicLong(0)
+        override fun newThread(r: Runnable): Thread = Thread(r, "dispatch-${seq.incrementAndGet()}").apply {
+            isDaemon = true
+        }
+    }
+
+    companion object {
+        /**
+         * Sheds buffered for recording. Generous: one entry is a UUID, a short
+         * string and an instant, and the buffer only fills if the recorders are
+         * behind — precisely when the sheds are most worth keeping.
+         */
+        const val SHED_BUFFER = 10_000
+
+        /**
+         * Threads writing shed rows. Two is enough — each write is one small
+         * transaction and one Redis push — and keeping it small leaves the
+         * connection pool to the dispatchers.
+         */
+        const val SHED_RECORDERS = 2
     }
 
     /** The owning org's default timezone (project -> workspace -> org). */

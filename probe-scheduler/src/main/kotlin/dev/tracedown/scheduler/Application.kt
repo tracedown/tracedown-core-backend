@@ -1,6 +1,9 @@
 package dev.tracedown.scheduler
 
 import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.health.databaseCheck
+import dev.tracedown.common.health.installHealthEndpoints
+import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.util.VariableCrypto
 import dev.tracedown.scheduler.config.SchedulerConfig
@@ -43,11 +46,18 @@ fun Application.module() {
         mapOf("PLATFORM_AES_KEY (all-zero dev default)" to (config.aesKey == "0".repeat(64))),
     )
 
-    // Database
+    // Database. The pool is sized to the dispatch concurrency rather than left
+    // at its default — fifty workers sharing ten connections spend the tick
+    // waiting on Hikari and then time out. See SchedulerConfig.poolSizeFor.
     val dataSource = DatabaseFactory.init(
         jdbcUrl = config.database.url,
         username = config.database.user,
         password = config.database.password,
+        maximumPoolSize = config.dbPoolSize,
+    )
+    log.info(
+        "database pool sized to {} connections (dispatchWorkers={}, quartzThreads={})",
+        config.dbPoolSize, config.dispatchWorkers, config.threadPoolSize,
     )
 
     // Redis A
@@ -99,8 +109,11 @@ fun Application.module() {
     // Result publishing
     val resultPublisher = ResultPublisher(redis)
 
-    // Coroutine scope for async work
-    val schedulerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // Coroutine scope for async work. Dispatchers.IO, not Default: everything
+    // launched here — the consistency sweep above all — runs blocking JDBC, and
+    // on Default it competed for CPU-count threads with the dispatch workers.
+    // The workers themselves run on the dispatch queue's own fixed pool.
+    val schedulerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // Quartz scheduler
     val quartzManager = QuartzManager(config.threadPoolSize)
@@ -118,6 +131,10 @@ fun Application.module() {
         trustedDomainMode = config.trustedDomainMode,
     )
     dispatchQueue.start(schedulerScope)
+
+    // A trigger Quartz drops for lateness is coverage lost. Record it like any
+    // other shed instead of letting it vanish.
+    quartzManager.onProbeMisfire(dispatchQueue::recordMisfire)
 
     // ProbeJob dependencies
     ProbeJobContext.init(dispatchQueue = dispatchQueue)
@@ -148,6 +165,19 @@ fun Application.module() {
     syncService.startPubSub()
 
     syncService.startSweep(schedulerScope)
+
+    // Liveness + readiness. Both dependencies are required: without Postgres
+    // there is nothing to schedule, and without Redis A there is no dispatch
+    // lock, no agent selection and nowhere to publish a result — a scheduler
+    // that has lost either produces no coverage at all, which is exactly what
+    // readiness is for saying out loud.
+    installHealthEndpoints(
+        "probe-scheduler",
+        listOf(
+            databaseCheck(dataSource),
+            redisCheck("redis-a") { redis },
+        ),
+    )
 
     log.info("probe-scheduler started")
 
