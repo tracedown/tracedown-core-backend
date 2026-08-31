@@ -19,6 +19,7 @@ dependencies {
     implementation(libs.ktor.server.request.validation)
     implementation(libs.ktor.server.call.logging)
     implementation(libs.ktor.server.resources)
+    implementation(libs.ktor.server.cors)
 
     // RRule validation (service maintenance windows)
     implementation(libs.lib.recur)

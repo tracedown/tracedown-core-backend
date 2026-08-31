@@ -146,6 +146,12 @@ private fun serviceConfig(
             val modules = cfg.getStringList("ktor.application.modules") +
                 "dev.tracedown.monolith.FrontendModuleKt.monolithFrontend"
             cfg = cfg.withValue("ktor.application.modules", ConfigValueFactory.fromIterable(modules))
+            // …which makes this edition same-origin by construction: the app and
+            // the API are one process on one port, so no request from the
+            // dashboard is cross-origin and no CORS header answers anything.
+            // Nothing to configure — the gateway emits no CORS headers unless
+            // API_CORS_ORIGINS names an origin, which an operator serving the
+            // dashboard from somewhere else can still do.
         }
         "probe-scheduler" -> {
             val gatewayPort = System.getenv("GATEWAY_PORT")?.toIntOrNull() ?: 20714

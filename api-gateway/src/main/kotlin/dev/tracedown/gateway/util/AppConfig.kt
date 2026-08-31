@@ -1,13 +1,6 @@
 package dev.tracedown.gateway.util
 
-import dev.tracedown.common.email.EmailConfig
 import dev.tracedown.common.onboarding.DefaultGroupConfig
-import dev.tracedown.common.email.ConsoleConfig
-import dev.tracedown.common.email.FileConfig
-import dev.tracedown.common.email.MailgunConfig
-import dev.tracedown.common.email.ResendConfig
-import dev.tracedown.common.email.SmtpConfig
-import dev.tracedown.common.email.TlsMode
 import dev.tracedown.common.util.processUri
 import dev.tracedown.common.variables.VariableLimits
 import io.ktor.server.application.ApplicationEnvironment
@@ -61,6 +54,13 @@ data class PlatformConfig(
     val allowAccountClosure: Boolean,
     val metricsPublicUrl: String,
     val seed: SeedConfig,
+    /**
+     * Which addresses a probe may target, as configured (`auto`,
+     * `allow-private`, `public-only`). The effective mode also depends on
+     * [trustedDomainMode] and the deployment environment — see
+     * [dev.tracedown.common.net.ProbeTargetPolicy.resolveMode].
+     */
+    val probeTargetPolicy: String,
 )
 
 data class PasswordPolicyConfig(
@@ -99,12 +99,25 @@ data class AppConfig(
     val redis: RedisConfig,
     val jwt: JwtConfig,
     val auth: AuthConfig,
-    val email: EmailConfig,
     val platform: PlatformConfig,
     val requestLimits: RequestLimitsConfig,
     val systemLimits: SystemLimitsConfig,
+    /**
+     * Largest request body the API accepts, in bytes. Field-level limits run
+     * after a body is received and deserialized; this bounds what can be sent.
+     */
+    val maxRequestBodyBytes: Long,
 ) {
     companion object {
+        /**
+         * 1 MiB. The largest legitimate body is a probe script (capped at 64 KB
+         * by field validation) inside a service payload, so this leaves well
+         * over an order of magnitude of headroom, and it matches what the
+         * bundled reverse proxy already enforces — a deployment without one
+         * behaves the same as a deployment with it.
+         */
+        const val DEFAULT_MAX_REQUEST_BODY_BYTES = 1L * 1024 * 1024
+
         fun load(environment: ApplicationEnvironment): AppConfig {
             val config = environment.config
             return AppConfig(
@@ -133,7 +146,6 @@ data class AppConfig(
                     ),
                     totpIssuer = config.property("auth.totpIssuer").getString(),
                 ),
-                email = loadEmailConfig(config),
                 platform = PlatformConfig(
                     uri = UriConfig(
                         appUrl = processUri(config.property("platform.uri.appUrl").getString()),
@@ -158,6 +170,9 @@ data class AppConfig(
                         targetUrl = config.property("platform.seed.targetUrl").getString(),
                         schedule = config.property("platform.seed.schedule").getString(),
                     ),
+                    probeTargetPolicy = config.propertyOrNull("probe.targetPolicy")
+                        ?.getString()?.takeIf { it.isNotBlank() }
+                        ?: dev.tracedown.common.net.ProbeTargetPolicy.AUTO,
                 ),
                 requestLimits = RequestLimitsConfig(
                     requestTimeoutMs = config.property("requestLimits.requestTimeoutMs").getString().toLong(),
@@ -170,7 +185,9 @@ data class AppConfig(
                     resultRetentionDays = config.propertyOrNull("systemLimits.resultRetentionDays")?.getString()?.toInt() ?: 90,
                     maxVarsPerResource = config.propertyOrNull("systemLimits.maxVarsPerResource")?.getString()?.toInt()
                         ?: VariableLimits.DEFAULT_MAX_PER_RESOURCE,
-                )
+                ),
+                maxRequestBodyBytes = config.propertyOrNull("requestBody.maxBytes")
+                    ?.getString()?.toLongOrNull()?.takeIf { it > 0 } ?: DEFAULT_MAX_REQUEST_BODY_BYTES,
             )
         }
 
@@ -193,37 +210,6 @@ data class AppConfig(
                     workspaces = group.property("workspaces").getString().toShort(),
                 )
             }
-        }
-
-        private fun loadEmailConfig(config: io.ktor.server.config.ApplicationConfig): EmailConfig {
-            val provider = config.property("email.provider").getString()
-            return EmailConfig(
-                provider = provider,
-                fromAddress = config.property("email.fromAddress").getString(),
-                fromName = config.property("email.fromName").getString(),
-                smtp = if (provider == "smtp") SmtpConfig(
-                    host = config.property("email.smtp.host").getString(),
-                    port = config.property("email.smtp.port").getString().toInt(),
-                    username = config.property("email.smtp.username").getString(),
-                    password = config.property("email.smtp.password").getString(),
-                    tlsMode = TlsMode.valueOf(config.property("email.smtp.tlsMode").getString()),
-                ) else null,
-                resend = if (provider == "resend") ResendConfig(
-                    apiKey = config.property("email.resend.apiKey").getString(),
-                ) else null,
-                mailgun = if (provider == "mailgun") MailgunConfig(
-                    apiKey = config.property("email.mailgun.apiKey").getString(),
-                    domain = config.property("email.mailgun.domain").getString(),
-                    region = config.property("email.mailgun.region").getString(),
-                ) else null,
-                console = ConsoleConfig(
-                    attachmentDir = config.propertyOrNull("email.console.attachmentDir")?.getString()
-                        ?: "build/email-attachments",
-                ),
-                file = if (provider == "file") FileConfig(
-                    path = config.property("email.file.path").getString(),
-                ) else null,
-            )
         }
     }
 }

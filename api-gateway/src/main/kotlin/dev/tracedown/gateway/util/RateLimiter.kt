@@ -32,6 +32,7 @@ class RateLimiter(
         val tierConfig = when (tier) {
             Tier.GENERAL -> config.general
             Tier.AUTH -> config.auth
+            Tier.INTERNAL -> config.internal
         }
 
         val nowSeconds = System.currentTimeMillis() / 1000
@@ -81,8 +82,11 @@ class RateLimiter(
                         retryAfterSeconds = tierConfig.windowSeconds,
                     )
                 }
-                Tier.GENERAL -> {
-                    log.warn("Rate limiter Redis error on general tier, failing open: {}", e.message)
+                Tier.GENERAL, Tier.INTERNAL -> {
+                    // Open, like the general tier: an agent fleet that cannot
+                    // enrol or renew its certificates is an outage, and the
+                    // limiter store being down is not a reason to cause one.
+                    log.warn("Rate limiter Redis error on {} tier, failing open: {}", tier, e.message)
                     RateLimitResult(
                         allowed = true,
                         limit = tierConfig.maxRequests,
@@ -97,7 +101,43 @@ class RateLimiter(
     enum class Tier {
         GENERAL,
         AUTH,
+
+        /**
+         * Endpoints that are unauthenticated by design — agent enrolment and
+         * certificate renewal. They were exempt from metering entirely, on the
+         * reasoning that each one proves possession of a bootstrap token or a
+         * private key. That reasoning is about authentication and says nothing
+         * about cost: a registration runs a bcrypt-12 verification and signs an
+         * RSA CSR before it can decide the caller was a stranger. Their own
+         * budget keeps that bounded without spending the login tier a fleet
+         * coming up at once would otherwise exhaust.
+         */
+        INTERNAL,
     }
+}
+
+/**
+ * Which budget a request path is metered against.
+ *
+ * Only `/ping` is exempt, and only because a liveness probe that a limiter can
+ * refuse is not a liveness probe. Everything else is metered, including
+ * the `/internal/` routes: they are unauthenticated by design — they carry a
+ * bootstrap token or proof of possession of an agent's private key — and they
+ * used to be exempt from metering as well, on reasoning that was about
+ * authentication rather than cost. Each registration spends a bcrypt-12
+ * verification and an RSA signature before it can tell that the caller was a
+ * stranger, and on a deployment with no reverse proxy in front they are
+ * published straight to the internet.
+ */
+fun rateLimitTierFor(path: String): RateLimiter.Tier? = when {
+    path == "/ping" -> null
+    path.startsWith("/internal/") -> RateLimiter.Tier.INTERNAL
+    // The data export fans out over many per-user queries, so it shares the
+    // stricter auth tier rather than the general one.
+    path.startsWith("/api/v1/auth/login") ||
+        path.startsWith("/api/v1/auth/password-reset") ||
+        path.startsWith("/api/v1/me/export") -> RateLimiter.Tier.AUTH
+    else -> RateLimiter.Tier.GENERAL
 }
 
 data class TierConfig(
@@ -133,6 +173,8 @@ data class RateLimitConfig(
     val enabled: Boolean,
     val general: TierConfig,
     val auth: TierConfig,
+    /** Budget for the unauthenticated-by-design agent enrolment endpoints. */
+    val internal: TierConfig = TierConfig(maxRequests = 60, windowSeconds = 60),
     /**
      * Number of trusted reverse proxies in front of the gateway. The client IP
      * used for rate-limit keys is taken this many hops back from the TCP peer,
@@ -158,6 +200,15 @@ data class RateLimitConfig(
                     maxRequests = config.propertyOrNull("rateLimit.auth.maxRequests")
                         ?.getString()?.toInt() ?: 15,
                     windowSeconds = config.propertyOrNull("rateLimit.auth.windowSeconds")
+                        ?.getString()?.toLong() ?: 60L,
+                ),
+                // Generous next to the auth tier on purpose: a whole fleet may
+                // bootstrap in the same minute, and one agent retrying a failed
+                // renewal must not lock its neighbours out.
+                internal = TierConfig(
+                    maxRequests = config.propertyOrNull("rateLimit.internal.maxRequests")
+                        ?.getString()?.toInt() ?: 60,
+                    windowSeconds = config.propertyOrNull("rateLimit.internal.windowSeconds")
                         ?.getString()?.toLong() ?: 60L,
                 ),
             )

@@ -56,9 +56,14 @@ import dev.tracedown.gateway.util.AppConfig
 import dev.tracedown.common.health.databaseCheck
 import dev.tracedown.common.health.readinessRoute
 import dev.tracedown.common.health.redisCheck
+import dev.tracedown.gateway.util.CorsSettings
+import dev.tracedown.gateway.util.ProxyChainObserver
 import dev.tracedown.gateway.util.RateLimitConfig
+import dev.tracedown.gateway.util.installRequestBodyLimit
 import dev.tracedown.gateway.util.RateLimiter
 import dev.tracedown.gateway.util.ResourceResolver
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.openapi.*
 import io.ktor.serialization.kotlinx.json.json
@@ -67,6 +72,8 @@ import io.ktor.server.application.createApplicationPlugin
 import io.ktor.server.application.install
 import io.ktor.server.netty.EngineMain
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.plugins.PayloadTooLargeException
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.uri
@@ -100,15 +107,29 @@ fun main(args: Array<String>) {
 fun Application.module() {
     val appConfig = AppConfig.load(environment)
 
+    val deploymentEnv = environment.config.propertyOrNull("deployment.environment")?.getString()
+
+    // Which browser origins may call this API. Parsed before anything else
+    // touches state, so a malformed origin list fails the boot rather than
+    // registering a host nobody meant. Unset is a valid, working answer — see
+    // CorsSettings.
+    val cors = CorsSettings.load(environment.config)
+
     // Fail fast in production if the insecure dev defaults are still configured.
-    // No-op in dev (see SecretGuard) — the all-zero key and dev JWT secret stay
+    // No-op in dev (see SecretGuard) — the dev key and dev JWT secret stay
     // usable there.
+    //
+    // The credentials go in by value rather than as a comparison against a
+    // literal: the values an operator is most likely to copy are whichever ones
+    // the tracked example files ship, and those have never been the two
+    // literals this once tested for. SecretGuard judges them structurally.
     dev.tracedown.common.config.SecretGuard.requireSecure(
-        environment.config.propertyOrNull("deployment.environment")?.getString(),
+        deploymentEnv,
         "api-gateway",
-        mapOf(
-            "PLATFORM_AES_KEY (all-zero dev default)" to (appConfig.platform.aesKey == "0".repeat(64)),
-            "JWT_SECRET (dev default)" to (appConfig.jwt.secret == "default-dev-secret-change-in-production"),
+        checks = emptyMap(),
+        credentials = mapOf(
+            "PLATFORM_AES_KEY" to appConfig.platform.aesKey,
+            "JWT_SECRET" to appConfig.jwt.secret,
         ),
     )
 
@@ -133,6 +154,16 @@ fun Application.module() {
     VariableLimits.init(appConfig.systemLimits.maxVarsPerResource)
 
     ServiceController.init(trustedDomainMode = appConfig.platform.trustedDomainMode)
+    // Same resolution the scheduler makes, from the same variable, so a script
+    // is refused where it is written rather than accepted and then skipped on
+    // every tick.
+    ServiceController.init(
+        probeTargetPolicy = dev.tracedown.common.net.ProbeTargetPolicy.resolveMode(
+            configured = appConfig.platform.probeTargetPolicy,
+            trustedDomainMode = appConfig.platform.trustedDomainMode,
+            production = dev.tracedown.common.config.SecretGuard.isProduction(deploymentEnv),
+        ),
+    )
     AuthController.init(trustedDomainMode = appConfig.platform.trustedDomainMode)
     GrafanaIntegrationController.init(appConfig.platform.metricsPublicUrl)
 
@@ -170,6 +201,16 @@ fun Application.module() {
     }
 
     val rateLimitConfig = RateLimitConfig.load(environment.config)
+    // A hop count that is too low is invisible from the inside: the limiter
+    // works perfectly, on a key shared by the entire deployment. Say so at
+    // startup when it was never configured, and watch the forwarded chains for
+    // the shape that proves it wrong.
+    ProxyChainObserver.warnIfDefaultInProduction(
+        production = dev.tracedown.common.config.SecretGuard.isProduction(deploymentEnv),
+        explicitlySet = System.getenv("TRUSTED_PROXIES") != null,
+        trustedProxies = rateLimitConfig.trustedProxies,
+    )
+    val proxyChainObserver = ProxyChainObserver(rateLimitConfig.trustedProxies)
     // The auth tier fails CLOSED, so the limiter's store has to be the durable
     // operational instance rather than the evictable cache: an allkeys-lru
     // Redis B is allowed to drop counters, and losing it locks logins out.
@@ -252,6 +293,72 @@ fun Application.module() {
 
     install(Resources)
 
+    // Cross-origin access. The dashboard sends credentials on every request, so
+    // the response has to name an exact origin — `*` is not usable with
+    // credentials — which is why the allowed origins are configured rather than
+    // inferred.
+    //
+    // Nothing configured installs nothing at all, and that is the default an
+    // operator who has never heard of this variable gets. The ordinary shape —
+    // the bundled Compose stack, the single-process edition, the dev proxy —
+    // serves the app and the API from one origin, where no request is
+    // cross-origin and no CORS header is an answer to anything. It is also the
+    // safe reading of silence: no origin is handed credentialed access because
+    // a variable went unset.
+    if (cors.enabled) {
+        install(CORS) {
+            cors.hosts.forEach { (host, scheme) -> allowHost(host, schemes = listOf(scheme)) }
+            log.info("CORS: allowing {} origin(s) with credentials", cors.hosts.size)
+            allowCredentials = true
+            allowHeader(HttpHeaders.Authorization)
+            allowHeader(HttpHeaders.ContentType)
+            allowMethod(HttpMethod.Get)
+            allowMethod(HttpMethod.Post)
+            allowMethod(HttpMethod.Put)
+            allowMethod(HttpMethod.Patch)
+            allowMethod(HttpMethod.Delete)
+            allowMethod(HttpMethod.Options)
+            // A cross-origin client cannot read a response header it was not
+            // told about, and these are the ones a client acts on.
+            exposeHeader("X-RateLimit-Limit")
+            exposeHeader("X-RateLimit-Remaining")
+            exposeHeader(HttpHeaders.RetryAfter)
+        }
+    } else {
+        log.info(
+            "CORS not installed: {} is unset, so no cross-origin headers are emitted. " +
+                "Set it only if the dashboard is served from a different origin than this API.",
+            CorsSettings.ORIGINS_VAR,
+        )
+        // A deployment that *is* cross-origin and never set the variable would
+        // otherwise learn about it only from a browser console. The browser
+        // tells us: a request carrying an Origin from somewhere other than the
+        // host it was sent to is exactly that deployment. Said once, then the
+        // latch closes — this is a hint, not a per-request warning.
+        val crossOriginHintGiven = java.util.concurrent.atomic.AtomicBoolean(false)
+        install(createApplicationPlugin("CorsOriginHint") {
+            onCall { call ->
+                if (crossOriginHintGiven.get()) return@onCall
+                val origin = call.request.headers[HttpHeaders.Origin]
+                val host = call.request.headers[HttpHeaders.XForwardedHost]?.substringBefore(',')?.trim()
+                    ?: call.request.headers[HttpHeaders.Host]
+                if (!CorsSettings.looksCrossOrigin(origin, host)) return@onCall
+                if (crossOriginHintGiven.compareAndSet(false, true)) {
+                    log.warn(
+                        "Received a request from origin {} for host {}, but {} is unset — " +
+                            "no CORS headers are being sent, so the browser will block the response. " +
+                            "List that origin in {} (comma-separated, scheme://host[:port]).",
+                        origin, host, CorsSettings.ORIGINS_VAR, CorsSettings.ORIGINS_VAR,
+                    )
+                }
+            }
+        })
+    }
+
+    // Before ContentNegotiation on purpose: both transform the received body and
+    // the first to run wins, so the cap has to see the raw channel.
+    installRequestBodyLimit(appConfig.maxRequestBodyBytes)
+
     install(ContentNegotiation) {
         json(Json {
             ignoreUnknownKeys = true
@@ -275,6 +382,16 @@ fun Application.module() {
             call.respond(
                 HttpStatusCode.BadRequest,
                 mapOf("error" to (cause.reasons.firstOrNull() ?: "invalid_request")),
+            )
+        }
+        // A body past the cap, discovered while reading it (a chunked request
+        // declares no length). Ktor's own type, so the plugin does not have to
+        // invent one — but it has to be mapped here or the catch-all below turns
+        // it into a 500.
+        exception<PayloadTooLargeException> { call, _ ->
+            call.respond(
+                HttpStatusCode.PayloadTooLarge,
+                mapOf("error" to dev.tracedown.common.errors.ErrorCodes.REQUEST_BODY_TOO_LARGE),
             )
         }
         exception<ApiException> { call, cause ->
@@ -320,28 +437,22 @@ fun Application.module() {
         onCall { call ->
             if (!rateLimitConfig.enabled) return@onCall
 
-            val path = call.request.local.uri
-            if (path == "/ping" || path.startsWith("/internal/")) return@onCall
+            val tier = dev.tracedown.gateway.util.rateLimitTierFor(call.request.local.uri) ?: return@onCall
 
             // Key on the real client IP, taken a trusted number of proxy hops
             // back from the TCP peer so a client-supplied XFF cannot spoof it.
+            val xff = call.request.headers["X-Forwarded-For"]
             val ip = dev.tracedown.gateway.util.resolveClientIp(
-                xff = call.request.headers["X-Forwarded-For"],
+                xff = xff,
                 directPeer = call.request.local.remoteAddress,
                 trustedProxies = rateLimitConfig.trustedProxies,
             )
-
-            // The data export fans out over many per-user queries, so it shares
-            // the stricter auth tier rather than the general one.
-            val tier = if (
-                path.startsWith("/api/v1/auth/login") ||
-                path.startsWith("/api/v1/auth/password-reset") ||
-                path.startsWith("/api/v1/me/export")
-            ) {
-                RateLimiter.Tier.AUTH
-            } else {
-                RateLimiter.Tier.GENERAL
-            }
+            // Whether that key is the caller's or a proxy's is invisible from
+            // any single request; this watches the shape across many of them.
+            proxyChainObserver.observe(
+                resolvedIp = ip,
+                forwarded = xff?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList(),
+            )
 
             val result = rateLimiter.check(ip, tier)
             call.response.headers.append("X-RateLimit-Limit", result.limit.toString())
