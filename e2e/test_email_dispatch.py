@@ -130,7 +130,7 @@ def test_named_template_email():
         "vars": {
             "userName": "E2E User",
             "expiryMinutes": "30",
-            "resetLink": "https://app.tracedown.io/reset/e2e-token",
+            "resetLink": "https://app.tracedown.dev/reset/e2e-token",
         },
         "source": "e2e-test",
         "createdAt": "2026-05-05T12:00:00Z",

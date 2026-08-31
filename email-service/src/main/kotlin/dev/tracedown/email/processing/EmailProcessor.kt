@@ -12,6 +12,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import org.slf4j.LoggerFactory
+import java.io.File
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -22,16 +23,62 @@ import java.util.concurrent.ConcurrentHashMap
  * Resolution logic:
  * 1. If `type` is present → load named template, render with vars, use as full email HTML
  * 2. If `type` is absent → insert `body` into layout.html wrapper
+ *
+ * ## Where templates come from
+ *
+ * Templates ship on the classpath under `/email-templates/`. A host that needs
+ * mail this service does not ship — or needs different wording in mail it does
+ * — can point [templateDir] at a directory laid out the same way. That
+ * directory is consulted **first** and the classpath is the fallback, so the
+ * same mechanism both adds new template types and overrides shipped ones: drop
+ * `system/invite.html` in there and the invite mail is yours; drop
+ * `reports/weekly.html` in there and `reports.weekly` becomes a type this
+ * service can render, with nothing in this module knowing what it is.
+ *
+ * Nothing about the directory is trusted. A `type` is turned into a relative
+ * path and the result must still resolve inside the root, an unreadable or
+ * missing file falls back to the classpath, and any failure at all falls back
+ * rather than throwing — one bad override must not stop every other mail on
+ * the platform from going out.
  */
 open class EmailProcessor(
     private val emailTransport: EmailTransport,
     private val redis: RedisCommands<String, String>?,
+    templateDir: String? = null,
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
     private val deliveryLog = LoggerFactory.getLogger("email.delivery")
     private val templateCache = ConcurrentHashMap<String, String>()
-    private val layoutHtml: String by lazy { loadResource("/email-templates/layout.html") }
+    private val layoutHtml: String by lazy {
+        readOverride(LAYOUT_FILE) ?: loadResource("/email-templates/$LAYOUT_FILE")
+    }
+
+    /**
+     * The canonical template root, or null when none is configured (or the
+     * configured one is unusable — which degrades to classpath-only rather than
+     * refusing to start).
+     */
+    private val templateRoot: File? = resolveRoot(templateDir)
+
+    init {
+        // Said once, at startup, so an operator who configured an override can
+        // see it took effect — and so one that silently did not is visible.
+        if (templateDir.isNullOrBlank()) {
+            log.info("email templates: packaged templates only (no template directory configured)")
+        } else if (templateRoot == null) {
+            log.warn(
+                "email templates: configured directory '{}' is not a readable directory — " +
+                    "falling back to the packaged templates only",
+                templateDir,
+            )
+        } else {
+            log.info(
+                "email templates: '{}' is consulted first, packaged templates are the fallback",
+                templateRoot,
+            )
+        }
+    }
 
     /**
      * Processes a single email job envelope.
@@ -167,12 +214,61 @@ open class EmailProcessor(
         return result != null
     }
 
+    /**
+     * The HTML for [type], from the configured directory if it has one and from
+     * the classpath otherwise, or null when neither does.
+     *
+     * The relative path is checked once, before either lookup. Both need it: the
+     * classloader silently collapses `//` and `.` segments, so a type of
+     * `..system..invite` ("//system//invite.html") resolves on the classpath to
+     * the very template a caller was not allowed to name that way.
+     */
     private fun loadTemplate(type: String): String? {
-        return templateCache.getOrPut(type) {
-            // type = "system.invite" → path = "/email-templates/system/invite.html"
-            val path = "/email-templates/${type.replace('.', '/')}.html"
-            val stream = javaClass.getResourceAsStream(path) ?: return null
-            stream.bufferedReader().readText()
+        templateCache[type]?.let { return it }
+        // type = "system.invite" → relative = "system/invite.html"
+        val relative = "${type.replace('.', '/')}.html"
+        if (!isSafeRelativePath(relative)) {
+            log.error("refusing template type '{}': '{}' is not a path inside the template tree", type, relative)
+            return null
+        }
+        val html = readOverride(relative)
+            ?: javaClass.getResourceAsStream("/email-templates/$relative")
+                ?.bufferedReader()?.readText()
+            ?: return null
+        templateCache[type] = html
+        return html
+    }
+
+    /**
+     * Reads [relativePath] from the configured template directory, or null when
+     * there is no directory, no such file, or anything at all goes wrong.
+     *
+     * The path is treated as untrusted even though only internal publishers name
+     * one: a `type` of `../../etc/passwd` would otherwise turn a queue message
+     * into an arbitrary-file read whose contents are then mailed to an address
+     * the same message chose. Two defences, because either alone has a way past
+     * it — the segments are checked before the file is touched, and the
+     * canonical result must still sit under the canonical root (which is what
+     * catches a symlink pointing out of the directory).
+     */
+    private fun readOverride(relativePath: String): String? {
+        val root = templateRoot ?: return null
+        // Belt and braces: every caller checks too, but this is the one that
+        // turns a path into a file read.
+        if (!isSafeRelativePath(relativePath)) return null
+        return try {
+            val file = File(root, relativePath).canonicalFile
+            if (!file.path.startsWith(root.path + File.separator)) {
+                log.error("refusing template path '{}': it resolves outside {}", relativePath, root)
+                return null
+            }
+            if (!file.isFile || !file.canRead()) return null
+            file.readText()
+        } catch (e: Exception) {
+            // A broken override is not allowed to take down the mail path: fall
+            // back to what this service shipped with and say why.
+            log.error("could not read template override '{}' under {}: {}", relativePath, root, e.message)
+            null
         }
     }
 
@@ -191,6 +287,37 @@ open class EmailProcessor(
             "<!-- FOOTER_START.*?FOOTER_END -->",
             setOf(RegexOption.DOT_MATCHES_ALL),
         )
+
+        /** The wrapper for body-mode mail, overridable like any other template. */
+        const val LAYOUT_FILE = "layout.html"
+
+        /**
+         * The configured directory as a canonical [File], or null when it is
+         * unset or unusable. Never throws: a template root that cannot be
+         * resolved leaves this service running on its packaged templates.
+         */
+        fun resolveRoot(configured: String?): File? {
+            if (configured.isNullOrBlank()) return null
+            return try {
+                File(configured).canonicalFile.takeIf { it.isDirectory }
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        /**
+         * True when [path] is a plain relative path that cannot walk out of the
+         * directory it is resolved against. Rejects absolute paths, drive
+         * letters, `..` segments, backslashes and embedded NULs.
+         */
+        fun isSafeRelativePath(path: String): Boolean {
+            if (path.isEmpty()) return false
+            if (path.contains('\u0000') || path.contains('\\')) return false
+            if (path.startsWith("/") || path.startsWith("~")) return false
+            if (Regex("^[A-Za-z]:").containsMatchIn(path)) return false
+            val segments = path.split('/')
+            return segments.all { it.isNotEmpty() && it != "." && it != ".." }
+        }
     }
 
     private fun loadResource(path: String): String {

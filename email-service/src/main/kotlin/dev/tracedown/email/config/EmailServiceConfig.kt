@@ -16,6 +16,13 @@ data class EmailServiceConfig(
     val redisAUrl: String,
     val email: EmailConfig,
     val popTimeoutSeconds: Long,
+    /**
+     * Optional filesystem directory of mail templates, laid out exactly like the
+     * packaged `email-templates/` tree. Consulted before the packaged templates,
+     * so it both adds new types and overrides shipped ones. Null (the default)
+     * means packaged templates only. See `EmailProcessor`.
+     */
+    val templateDir: String?,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -26,6 +33,8 @@ data class EmailServiceConfig(
                 email = loadEmailConfig(env),
                 popTimeoutSeconds = config.propertyOrNull("emailService.popTimeoutSeconds")
                     ?.getString()?.toLong() ?: 5L,
+                templateDir = config.propertyOrNull("emailService.templateDir")
+                    ?.getString()?.takeIf { it.isNotBlank() },
             )
         }
 

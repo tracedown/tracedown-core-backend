@@ -27,12 +27,20 @@ fun Application.module() {
     // Fail fast in production if no real provider is configured: the dev `console`
     // transport logs message contents (reset links, invite tokens) instead of
     // sending. No-op in dev, where console is the intended default.
+    //
+    // The provider's own secret goes in by value rather than as a comparison
+    // against the literal "console": exactly one of these is populated (see
+    // EmailServiceConfig), so a null here means the configured transport has no
+    // credential at all — which is either a dev transport (console, file) or a
+    // real one somebody stopped half-way through configuring. SecretGuard judges
+    // the value structurally, and catches the weak-key case a literal never would.
     dev.tracedown.common.config.SecretGuard.requireSecure(
         deployEnv,
         "email-service",
-        mapOf(
-            "EMAIL_PROVIDER (console/unset — dev transport)" to
-                (config.email.provider.isBlank() || config.email.provider == "console"),
+        checks = emptyMap(),
+        credentials = mapOf(
+            "EMAIL_PROVIDER credential (provider=${config.email.provider.ifBlank { "unset" }})" to
+                (config.email.smtp?.password ?: config.email.resend?.apiKey ?: config.email.mailgun?.apiKey),
         ),
     )
 
@@ -53,7 +61,7 @@ fun Application.module() {
     val consumerConn = RedisFactory.createBlockingConnection(config.redisAUrl, config.popTimeoutSeconds)
 
     // Processor + Consumer
-    val processor = EmailProcessor(emailTransport, redis)
+    val processor = EmailProcessor(emailTransport, redis, config.templateDir)
     val consumer = EmailQueueConsumer(consumerConn.sync(), processor, config.popTimeoutSeconds)
     val consumerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     consumer.start(consumerScope)
