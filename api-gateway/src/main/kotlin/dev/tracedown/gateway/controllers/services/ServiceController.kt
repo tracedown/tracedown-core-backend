@@ -87,6 +87,18 @@ object ServiceController {
         this.trustedDomainMode = trustedDomainMode
     }
 
+    /**
+     * Which addresses a probe may target. Set once at startup via [init]; the
+     * permissive mode by default so an embedding that never calls it keeps the
+     * behaviour a self-hosted install has always had.
+     */
+    private var probeTargetPolicy: dev.tracedown.common.net.ProbeTargetPolicy.Mode =
+        dev.tracedown.common.net.ProbeTargetPolicy.Mode.ALLOW_PRIVATE
+
+    fun init(probeTargetPolicy: dev.tracedown.common.net.ProbeTargetPolicy.Mode) {
+        this.probeTargetPolicy = probeTargetPolicy
+    }
+
     private val log = org.slf4j.LoggerFactory.getLogger(ServiceController::class.java)
     private val validProbeModes = setOf("consecutive", "simultaneous", "random")
     private val validQueuePolicies = setOf("skip", "enqueue_once")
@@ -346,6 +358,29 @@ object ServiceController {
             // of silently never running, and a schedule below the floor is
             // rejected rather than silently throttled. Bodies limits stay
             // dispatch-side — they don't make a script un-runnable.
+            // Save-time half of the probe-target policy. Syntactic only — no DNS
+            // in a request handler, and a host that is still a variable may
+            // simply not be set yet — so this catches the literal cases (an
+            // address, an internal-only name, a scheme that is not HTTP) and
+            // leaves the rest to dispatch, which judges the concrete URL. The
+            // point is that a script this install will never run says so when it
+            // is written, rather than being accepted and silently skipped on
+            // every tick.
+            if (request.script != null) {
+                val targets = dev.tracedown.common.net.ProbeTargetPolicy.evaluateSyntax(
+                    effectiveScript,
+                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
+                    probeTargetPolicy,
+                )
+                if (!targets.allowed) {
+                    log.info(
+                        "service {} script rejected: target {} ({})",
+                        serviceId, targets.url, targets.reason,
+                    )
+                    throw BadRequestException(ErrorCodes.BLOCKED_PROBE_TARGET)
+                }
+            }
+
             val intervalTooShort =
                 DomainPolicy.minIntervalMinutes(effectiveSchedule) < DomainPolicy.MIN_INTERVAL_MINUTES
             val policyRelevant = request.script != null ||

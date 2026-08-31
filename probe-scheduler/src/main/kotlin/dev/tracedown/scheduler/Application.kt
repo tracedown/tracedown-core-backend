@@ -38,12 +38,16 @@ fun main(args: Array<String>) = EngineMain.main(args)
 fun Application.module() {
     val config = SchedulerConfig.load(environment)
 
-    // Fail fast in production if the insecure all-zero platform key is still set.
-    // No-op in dev (see SecretGuard).
+    // Fail fast in production if a published dev credential is still in place.
+    // No-op in dev (see SecretGuard). The key goes in by value rather than as a
+    // comparison against one literal: the all-zero default is only one of the
+    // dev keys this repository ships, and it was never the one an operator
+    // copying from a tracked example file would end up with.
     dev.tracedown.common.config.SecretGuard.requireSecure(
         environment.config.propertyOrNull("deployment.environment")?.getString(),
         "probe-scheduler",
-        mapOf("PLATFORM_AES_KEY (all-zero dev default)" to (config.aesKey == "0".repeat(64))),
+        checks = emptyMap(),
+        credentials = mapOf("PLATFORM_AES_KEY" to config.aesKey),
     )
 
     // Database. The pool is sized to the dispatch concurrency rather than left
@@ -119,6 +123,22 @@ fun Application.module() {
     val quartzManager = QuartzManager(config.threadPoolSize)
     quartzManager.start()
 
+    // Which addresses probes may target. Resolved once here because it depends
+    // on the deployment environment as well as the setting itself, and logged
+    // unconditionally: an operator has to be able to see, from the boot log,
+    // whether this install will let a script reach the network its agents run in.
+    val targetPolicyMode = dev.tracedown.common.net.ProbeTargetPolicy.resolveMode(
+        configured = config.probe.targetPolicy,
+        trustedDomainMode = config.trustedDomainMode,
+        production = dev.tracedown.common.config.SecretGuard.isProduction(
+            environment.config.propertyOrNull("deployment.environment")?.getString(),
+        ),
+    )
+    log.info(
+        "probe target policy: {}",
+        dev.tracedown.common.net.ProbeTargetPolicy.describe(targetPolicyMode, config.probe.targetPolicy),
+    )
+
     // Dispatch queue — decouples Quartz triggers from agent HTTP dispatch
     val dispatchQueue = DispatchQueue(
         capacity = config.dispatchQueueSize,
@@ -129,6 +149,7 @@ fun Application.module() {
         resultPublisher = resultPublisher,
         probeConfig = config.probe,
         trustedDomainMode = config.trustedDomainMode,
+        targetPolicy = targetPolicyMode,
     )
     dispatchQueue.start(schedulerScope)
 

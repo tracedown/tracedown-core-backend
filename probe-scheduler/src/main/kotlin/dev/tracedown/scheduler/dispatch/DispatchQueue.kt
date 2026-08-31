@@ -1,6 +1,7 @@
 package dev.tracedown.scheduler.dispatch
 
 import dev.tracedown.common.domain.DomainPolicy
+import dev.tracedown.common.net.ProbeTargetPolicy
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.Services
@@ -67,6 +68,13 @@ class DispatchQueue(
     private val resultPublisher: ResultPublisher,
     private val probeConfig: SchedulerConfig.ProbeConfig,
     private val trustedDomainMode: Boolean = true,
+    /**
+     * Which addresses a probe may target. Defaults to the permissive mode so a
+     * host that constructs this queue without an opinion keeps the behaviour a
+     * self-hosted install has always had; Application resolves the real one
+     * from configuration.
+     */
+    private val targetPolicy: ProbeTargetPolicy.Mode = ProbeTargetPolicy.Mode.ALLOW_PRIVATE,
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -313,6 +321,28 @@ class DispatchQueue(
             // Resolve org context for result publishing (and domain policy)
             val ctx = transaction { resolveContext(serviceId) } ?: return
 
+            // The addresses this tick would actually hand an agent, judged with
+            // every variable already substituted — a script whose URL is
+            // assembled from `$o.endpoint` cannot be judged from its source.
+            // This is the authoritative check the platform can make; the agent
+            // makes the connection, so redirects and its own resolver are
+            // outside it (see ProbeTargetPolicy).
+            val resolvedVars = variables.mapValues { (_, v) -> v.jsonPrimitive.content }
+            val target = ProbeTargetPolicy.evaluate(script, resolvedVars, targetPolicy)
+            if (!target.allowed) {
+                log.warn(
+                    "service {} targets an address this install does not permit ({} — {}) — skipping",
+                    serviceId, target.url, target.reason,
+                )
+                // A skipped row, not a failure: nothing was learned about the
+                // target, and a synthetic failure would read as downtime for a
+                // service that may be perfectly healthy. The reason names the
+                // policy so the gap is explicable from the history alone.
+                recordSkipped(serviceId, target.reason ?: "target_blocked", Instant.now())
+                accounted.set(true)
+                return
+            }
+
             // Anti-abuse limits for unverified target domains (spec §18.4):
             // max 3 calls, no body saving, min 5-minute interval. The rule
             // below narrows the service's own setting — it never widens it, so
@@ -320,8 +350,7 @@ class DispatchQueue(
             // domains.
             var allowBodySave = service[Services.saveResponseBodies]
             if (!trustedDomainMode) {
-                val varsMap = variables.mapValues { (_, v) -> v.jsonPrimitive.content }
-                val policy = transaction { DomainPolicy.evaluate(script, varsMap, ctx.orgId) }
+                val policy = transaction { DomainPolicy.evaluate(script, resolvedVars, ctx.orgId) }
                 if (!policy.covered) {
                     if (policy.usesIncludes) {
                         log.warn(

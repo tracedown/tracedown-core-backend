@@ -47,6 +47,14 @@ data class SchedulerConfig(
          * rows, if it ever misbehaves in production.
          */
         val payloadEncryptionEnabled: Boolean = true,
+        /**
+         * How probe targets that resolve to private or internal addresses are
+         * treated: `auto` (the default), `allow-private` or `public-only`. Kept
+         * as the raw configured string — the effective mode also depends on the
+         * deployment environment, which is resolved at startup.
+         * See dev.tracedown.common.net.ProbeTargetPolicy.
+         */
+        val targetPolicy: String = dev.tracedown.common.net.ProbeTargetPolicy.AUTO,
     )
 
     companion object {
@@ -128,6 +136,9 @@ data class SchedulerConfig(
                         ?.getString()?.toIntOrNull() ?: 10,
                     payloadEncryptionEnabled = config.propertyOrNull("probe.payloadEncryptionEnabled")
                         ?.getString()?.toBooleanStrictOrNull() ?: true,
+                    targetPolicy = config.propertyOrNull("probe.targetPolicy")
+                        ?.getString()?.takeIf { it.isNotBlank() }
+                        ?: dev.tracedown.common.net.ProbeTargetPolicy.AUTO,
                 ),
             )
         }
