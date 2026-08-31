@@ -28,6 +28,19 @@ import java.util.UUID
  *
  * API keys are org-scoped, created with a plain key shown once on creation,
  * then only the hash is stored. Gated by org settings permission.
+ *
+ * **No verifier exists yet, so a key authenticates nothing.** Nothing in the
+ * request path ever reads [ApiKeys.keyHash]: `SessionAuthenticator` matches the
+ * session-token hash and only that, so a `td_…` key presented on any endpoint
+ * is rejected exactly like an unknown token. [ApiKeys.lastUsedAt] is written by
+ * nobody for the same reason and stays null for the life of every key.
+ *
+ * That is deliberate, not an oversight: this CRUD surface is deliberately ahead
+ * of the verification path, and the verifier is deferred. Nothing mints these
+ * keys today either — no UI reaches these routes — so no key is in circulation
+ * expecting to work. Do not read the presence of full CRUD, a bcrypt hash and a
+ * `last_used_at` column as evidence that key auth is wired up; it is not, and
+ * building on it will silently do nothing.
  */
 object ApiKeyController {
 

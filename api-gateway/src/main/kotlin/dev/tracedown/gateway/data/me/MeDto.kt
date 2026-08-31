@@ -68,10 +68,18 @@ data class ExportResourceGrant(
     val permissions: Short,
 )
 
+/**
+ * One audit entry the caller appears in. [role] says on which side: `"actor"`
+ * (they performed it), `"subject"` (it was performed on them — an invite, a
+ * removal, a group assignment, all recorded under someone else's actor id), or
+ * `"both"`. Subject-side entries are part of the disclosure precisely because
+ * they are the ones that tend to carry the caller's own email or display name.
+ */
 @Serializable
 data class ExportAuditEntry(
     val organizationId: String,
     val action: String,
+    val role: String,
     val entityType: String? = null,
     val entityId: String? = null,
     val entityDisplayName: String? = null,

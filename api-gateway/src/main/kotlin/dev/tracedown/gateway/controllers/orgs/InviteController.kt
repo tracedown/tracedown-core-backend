@@ -467,6 +467,9 @@ object InviteController {
                 .where { Users.id eq invite[OrgUsers.userId] }
                 .firstOrNull()?.get(Users.email)
 
+            // The entity is the invite, not the invitee — but entityDisplayName
+            // is the invitee's email address, which is what erasure matches on
+            // to reach this row (PurgeJob.SCRUB_AUDIT_SUBJECT).
             AuditService.log(orgId, requestingUserId, "revoke.invite", "invite", inviteId.toString(),
                 entityDisplayName = inviteEmail)
             RealtimePublisher.publish("org:$orgId", orgId, "invite.revoked")

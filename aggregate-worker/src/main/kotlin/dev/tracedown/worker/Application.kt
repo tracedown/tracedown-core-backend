@@ -18,6 +18,7 @@ import dev.tracedown.common.domain.HttpDnsDomainVerifier
 import dev.tracedown.worker.jobs.AggregateRetentionJob
 import dev.tracedown.worker.jobs.AgentHealthCleanupJob
 import dev.tracedown.worker.jobs.AuditLogRetentionJob
+import dev.tracedown.worker.jobs.BodyDeletionRetryJob
 import dev.tracedown.worker.jobs.DomainReverifyJob
 import dev.tracedown.worker.jobs.ExpiredInviteSweepJob
 import dev.tracedown.worker.jobs.ExpiredTokenCleanupJob
@@ -90,6 +91,10 @@ fun Application.module() {
     jobScope.launchJob(RetentionJob(defaultRetentionDays = config.resultRetentionDays, storageClient = storageClient, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(AggregateRetentionJob(hourlyRetentionDays = config.hourlyAggregateRetentionDays, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(PurgeJob(storageClient = storageClient, intervalSeconds = intervals.purgeSeconds))
+    // Finishes the body deletions retention and purge could not complete. Without
+    // it a storage failure during either left the object referenced by nothing —
+    // permanently outside retention and erasure.
+    jobScope.launchJob(BodyDeletionRetryJob(storageClient = storageClient, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(OrphanUserPurgeJob())
     jobScope.launchJob(ExpiredInviteSweepJob(intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(

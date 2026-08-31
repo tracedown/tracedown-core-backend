@@ -136,11 +136,24 @@ class RetentionJob(
             // Object-store round trips happen between transactions, not inside
             // one: a slow or unreachable store must not hold a pooled
             // connection open for the length of the page.
+            val failed = mutableListOf<Pair<String, String?>>()
             for (uri in bodyUris) {
                 try {
                     storageClient.delete(uri)
                 } catch (e: Exception) {
+                    failed.add(uri to e.message)
                     log.warn("Failed to delete body at {}: {}", uri, e.message)
+                }
+            }
+
+            // The rows below are deleted whether or not the objects went, which
+            // used to lose the only reference to a body still sitting in the
+            // bucket — bodies can carry personal data from the probed endpoint,
+            // so an unreferenced one is outside retention and erasure for good.
+            // Record the URI instead; BodyDeletionRetryJob finishes the job.
+            if (failed.isNotEmpty()) {
+                newSuspendedTransaction(Dispatchers.IO) {
+                    failed.forEach { (uri, error) -> PendingBodyDeletion.record(listOf(uri), error) }
                 }
             }
 

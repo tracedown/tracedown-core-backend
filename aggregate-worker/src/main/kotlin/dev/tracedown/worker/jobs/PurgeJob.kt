@@ -29,8 +29,16 @@ private fun Transaction.execCount(sql: String): Long =
  *
  * Stored response bodies referenced by probe_steps rows are deleted from body
  * storage *before* the rows are purged, mirroring [RetentionJob]. A failing
- * storage backend never blocks the database purge — failures are logged loudly
- * and the orphaned objects remain in the bucket.
+ * storage backend never blocks the database purge; the URI it could not delete
+ * is written to `pending_body_deletions` first, so the object stays referenced
+ * after the row naming it is gone and [BodyDeletionRetryJob] can finish the
+ * deletion later.
+ *
+ * Erasing an account reaches beyond its own rows: the audit entries *about* it
+ * are kept but stripped of its identifiers ([SCRUB_AUDIT_SUBJECT], which finds
+ * them by entity id and by the erased address itself), and the delivery log
+ * addressed to it is deleted — neither is FK-linked to the account, so neither
+ * was reached by the cascade alone.
  */
 class PurgeJob(
     private val storageClient: BodyStorageClient = BodyStorageClient(),
@@ -139,17 +147,27 @@ class PurgeJob(
             while (rs.next()) uris.add(rs.getString(1))
         }
 
-        var failed = 0
+        val failed = mutableListOf<Pair<String, String?>>()
         for (uri in uris) {
             try {
                 storageClient.delete(uri)
             } catch (e: Exception) {
-                failed++
-                log.error("Failed to delete stored response body {} — object is orphaned in storage: {}", uri, e.message)
+                failed.add(uri to e.message)
+                log.error("Failed to delete stored response body {}: {}", uri, e.message)
             }
         }
-        if (failed > 0) {
-            log.error("Purge: {} of {} stored bodies could not be deleted and are now orphaned", failed, uris.size)
+
+        // The rows naming these objects are about to go, so a failure here used
+        // to destroy the only reference to a live object — permanently, since
+        // nothing sweeps body storage. Hand the URI to [PendingBodyDeletion]
+        // first and [BodyDeletionRetryJob] finishes the job later.
+        failed.forEach { (uri, error) -> PendingBodyDeletion.record(listOf(uri), error) }
+
+        if (failed.isNotEmpty()) {
+            log.error(
+                "Purge: {} of {} stored bodies could not be deleted and were queued for retry",
+                failed.size, uris.size,
+            )
         }
     }
 
@@ -170,6 +188,11 @@ class PurgeJob(
                     "transfer ownership or delete the organization first",
                 blockedOwners.size, blockedOwners,
             )
+        }
+
+        val scrubbed = execCount(SCRUB_AUDIT_SUBJECT)
+        if (scrubbed > 0) {
+            log.info("User purge: scrubbed identifiers from {} audit entr(ies) about erased accounts", scrubbed)
         }
 
         return CASCADE_USERS.sumOf { execCount(it) }
@@ -308,6 +331,87 @@ class PurgeJob(
             "SELECT id FROM users WHERE $PURGE_DUE AND id NOT IN (SELECT owner_id FROM organizations)"
         private const val MEMBERSHIPS_OF_PURGEABLE_USERS =
             "SELECT id FROM org_users WHERE user_id IN ($PURGEABLE_USERS)"
+        private const val EMAILS_OF_PURGEABLE_USERS =
+            "SELECT lower(email) FROM users WHERE $PURGE_DUE AND id NOT IN (SELECT owner_id FROM organizations)"
+
+        /** The same accounts as [PURGEABLE_USERS], as text, to compare against entity_id. */
+        private const val PURGEABLE_USER_IDS_TEXT =
+            "SELECT id::text FROM users WHERE $PURGE_DUE AND id NOT IN (SELECT owner_id FROM organizations)"
+
+        /**
+         * A single regex alternation of every purging account's email address —
+         * `alice@x\.dev|bob@y\.dev` — with every non-alphanumeric character
+         * backslash-escaped so each address matches literally and nothing else.
+         * Aggregated rather than joined so one statement strips *all* purging
+         * addresses out of a comment that happens to name several. Yields one
+         * row always; `pattern` is NULL when no account is purging.
+         */
+        private const val PURGEABLE_EMAIL_PATTERN =
+            """SELECT string_agg(regexp_replace(email, '([^a-zA-Z0-9])', '\\\1', 'g'), '|') AS pattern """ +
+                "FROM users WHERE $PURGE_DUE AND id NOT IN (SELECT owner_id FROM organizations)"
+
+        /**
+         * Erasure reaching *into* the kept audit rows.
+         *
+         * Anonymizing the actor is not enough, because the actor is often
+         * someone else: an invite entry is written by the INVITER and carries the
+         * invitee's email in `entity_display_name` and again in the comment, so
+         * clearing `user_id` clears nothing about the person being erased. The
+         * account email change records both addresses in the diff. All of that
+         * outlived erasure, bounded only by an audit retention window an operator
+         * can switch off entirely.
+         *
+         * The subject is resolved from what the row already carries — no second
+         * link column, because the row already answers the question two ways:
+         *
+         *  1. `entity_type = 'user'` makes `entity_id` the subject's account id.
+         *     Exact, and true of every entry whose entity IS a person.
+         *  2. Everything else that names the person does so by spelling out
+         *     their **email address** (the invite entry's entity is the invite;
+         *     a group membership entry's entity is the group). The address is an
+         *     exact string, still resolvable here because this runs before
+         *     [CASCADE_USERS] deletes the `users` rows.
+         *
+         * What survives is the audit trail proper — organization, action, entity
+         * type, the entity id, the timestamp and the actor — so "who did what,
+         * when" is intact while the erased person's identifiers are gone. The
+         * comment keeps its wording minus the address ("Invited alice@x.dev"
+         * becomes "Invited"), and the diff keeps any non-identity field it
+         * carried (an `isActive` flip, say), nulled outright once removing the
+         * identity keys empties it.
+         *
+         * Not covered, deliberately: a row that names the person by display name
+         * alone, with no address anywhere and a non-user entity, matches neither
+         * rule. Group membership comments are of that shape — they carry the
+         * account's UUID, which after this pass resolves to nothing.
+         */
+        private const val SCRUB_AUDIT_SUBJECT = """
+            UPDATE org_audit_log a SET
+                entity_display_name = NULL,
+                -- Strip the address out rather than dropping the note: what the
+                -- entry says happened is audit, the address in it is not.
+                comment = CASE
+                    WHEN a.comment IS NULL OR p.pattern IS NULL THEN a.comment
+                    ELSE NULLIF(btrim(regexp_replace(a.comment, p.pattern, '', 'gi')), '')
+                END,
+                -- The `-` operator is only defined on a jsonb object; anything
+                -- else here is payload we cannot inspect, so it goes entirely
+                -- rather than raising and stalling the whole user purge.
+                diff = CASE jsonb_typeof(a.diff)
+                    WHEN 'object' THEN NULLIF(a.diff - 'email' - 'displayName' - 'name', '{}'::jsonb)
+                    ELSE NULL
+                END
+            FROM ($PURGEABLE_EMAIL_PATTERN) p
+            WHERE (a.entity_display_name IS NOT NULL OR a.comment IS NOT NULL OR a.diff IS NOT NULL)
+              AND (
+                    (a.entity_type = 'user' AND a.entity_id IN ($PURGEABLE_USER_IDS_TEXT))
+                 OR (p.pattern IS NOT NULL AND (
+                        a.entity_display_name ~* p.pattern
+                     OR a.comment ~* p.pattern
+                     OR a.diff::text ~* p.pattern
+                    ))
+              )
+        """
 
         private val CASCADE_USERS = listOf(
             // Strictly-owned children of the account's memberships.
@@ -320,6 +424,16 @@ class PurgeJob(
             // MEMBERSHIPS_OF_PURGEABLE_USERS still resolves. Org-scoped purges clear
             // these via the org cascade instead.
             "DELETE FROM resource_permissions WHERE principal_type = 'org_user' AND principal_id IN ($MEMBERSHIPS_OF_PURGEABLE_USERS)",
+            // Delivery history addressed to the erased account. notification_log
+            // carries the recipient's email address and has no user FK, so
+            // nothing brought it into the account's erasure — it was cleared
+            // only when the whole ORGANIZATION purged. An erased person's
+            // address therefore survived in every org they had ever been
+            // alerted in, bounded by a retention window that a `<= 0` setting
+            // disables outright. The address is the join key here precisely
+            // because the address is the personal datum being erased; this must
+            // run while the users rows still exist to resolve it.
+            "DELETE FROM notification_log WHERE lower(recipient) IN ($EMAILS_OF_PURGEABLE_USERS)",
             "DELETE FROM org_users WHERE user_id IN ($PURGEABLE_USERS)",
             // Strictly-owned credential and session material.
             "DELETE FROM sessions WHERE user_id IN ($PURGEABLE_USERS)",

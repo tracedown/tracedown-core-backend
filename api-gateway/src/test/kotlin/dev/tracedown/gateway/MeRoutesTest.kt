@@ -3,9 +3,11 @@ package dev.tracedown.gateway
 import at.favre.lib.crypto.bcrypt.BCrypt
 import com.typesafe.config.ConfigFactory
 import dev.tracedown.common.models.ApiKeys
+import dev.tracedown.common.models.OrgAuditLog
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.Organizations
+import dev.tracedown.common.models.ResourcePermissions
 import dev.tracedown.common.models.Users
 import dev.tracedown.gateway.controllers.auth.TotpUtil
 import io.ktor.server.config.HoconApplicationConfig
@@ -71,6 +73,12 @@ class MeRoutesTest {
         private const val TAKEN_EMAIL = "taken@tracedown.dev"
         private const val API_KEY_HASH = "supersecret-api-key-hash"
         private const val SECRET_VARIABLE_VALUE = "supersecret-variable-value"
+
+        /** The workspace the export user holds a direct grant on. */
+        private val GRANTED_RESOURCE_ID: UUID = UUID.randomUUID()
+
+        /** Whoever invited the export user — the ACTOR on the subject-side entry. */
+        private lateinit var inviterUserId: UUID
 
         private lateinit var totpSecret: ByteArray
 
@@ -190,6 +198,59 @@ class MeRoutesTest {
                 it[createdAt] = Instant.now()
                 it[updatedAt] = Instant.now()
             }
+
+            // A direct per-resource grant. resource_permissions never keys on an
+            // account: the principal is the MEMBERSHIP, under principal_type
+            // 'org_user' (the column's CHECK allows nothing else). The export
+            // used to look for principal_type 'user' and the account id, which
+            // the constraint makes impossible — so this row has to be here for
+            // the assertion to mean anything.
+            val membershipId = OrgUsers.selectAll()
+                .where { OrgUsers.userId eq userId }
+                .first()[OrgUsers.id]
+            // `orgId` and `userId` are also column names on the tables below, and
+            // the insert lambda's receiver shadows the outer values — bind them
+            // first or the statement silently writes the Column, not the value.
+            val grantOrgId = orgId
+            val subjectId = userId
+            ResourcePermissions.insert {
+                it[id] = UUID.randomUUID()
+                it[ResourcePermissions.orgId] = grantOrgId
+                it[principalType] = "org_user"
+                it[principalId] = membershipId
+                it[resourceType] = "workspace"
+                it[resourceId] = GRANTED_RESOURCE_ID
+                it[permissions] = 2
+            }
+
+            // Two entries ABOUT the export user, written by somebody else — the
+            // shape the export used to miss, since the actor column names the
+            // inviter. They are found the two ways the subject is resolvable:
+            inviterUserId = createUser("export-inviter@tracedown.dev", "Inviter12345!")
+            // (a) the entity IS the account, so entity_id identifies them.
+            OrgAuditLog.insert {
+                it[id] = UUID.randomUUID()
+                it[organizationId] = grantOrgId
+                it[OrgAuditLog.userId] = inviterUserId
+                it[action] = "invite.user"
+                it[entityType] = "user"
+                it[entityId] = subjectId.toString()
+                it[entityDisplayName] = EXPORT_USER_EMAIL
+                it[comment] = "Invited $EXPORT_USER_EMAIL"
+                it[createdAt] = Instant.now()
+            }
+            // (b) the entity is the INVITE, not the person — only the address
+            // in the payload ties this row to them.
+            OrgAuditLog.insert {
+                it[id] = UUID.randomUUID()
+                it[organizationId] = grantOrgId
+                it[OrgAuditLog.userId] = inviterUserId
+                it[action] = "revoke.invite"
+                it[entityType] = "invite"
+                it[entityId] = UUID.randomUUID().toString()
+                it[entityDisplayName] = EXPORT_USER_EMAIL
+                it[createdAt] = Instant.now()
+            }
         }
 
         private fun createTotpChangeUser() {
@@ -297,6 +358,31 @@ class MeRoutesTest {
         assertEquals(EXPORT_USER_EMAIL, profile["email"]!!.jsonPrimitive.content)
         assertFalse(profile.containsKey("passwordHash"), "profile must not carry the password hash")
         assertFalse(profile.containsKey("totpSecretEncrypted"), "profile must not carry the TOTP secret")
+
+        // A section that can never return a row is indistinguishable from
+        // "you hold none of these" — assert the contents, not the key.
+        val grants = body["resourceGrants"]!!.jsonArray
+        assertEquals(1, grants.size, "the user's direct resource grant must be disclosed")
+        assertEquals(
+            GRANTED_RESOURCE_ID.toString(),
+            grants.single().jsonObject["resourceId"]!!.jsonPrimitive.content,
+        )
+
+        // Entries about the caller count, not only the ones they caused: the
+        // actor column names the inviter, so filtering on it hid the entry that
+        // holds the caller's own address.
+        val audit = body["auditLog"]!!.jsonArray
+        val subjectSide = audit
+            .filter { it.jsonObject["role"]!!.jsonPrimitive.content == "subject" }
+            .map { it.jsonObject["action"]!!.jsonPrimitive.content }
+        assertTrue(
+            subjectSide.contains("invite.user"),
+            "the entry whose ENTITY is the caller must be disclosed: $subjectSide",
+        )
+        assertTrue(
+            subjectSide.contains("revoke.invite"),
+            "the entry that names the caller only by address must be disclosed too: $subjectSide",
+        )
 
         val apiKeys = body["apiKeys"]!!.jsonArray
         assertEquals("export-test-key", apiKeys.single().jsonObject["name"]!!.jsonPrimitive.content)

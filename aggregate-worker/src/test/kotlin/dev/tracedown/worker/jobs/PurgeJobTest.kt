@@ -13,6 +13,7 @@ import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.PasswordResetTokens
+import dev.tracedown.common.models.PendingBodyDeletions
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.models.Projects
@@ -28,6 +29,10 @@ import dev.tracedown.common.storage.BodyStorageClient
 import dev.tracedown.common.util.VariableCrypto
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.sql.Database
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
@@ -320,13 +325,32 @@ class PurgeJobTest {
             return id
         }
 
-        private fun insertAudit(orgId: UUID, userId: UUID?, createdAt: Instant = NOW): UUID {
+        private fun insertAudit(
+            orgId: UUID,
+            userId: UUID?,
+            createdAt: Instant = NOW,
+            entityType: String? = null,
+            entityId: String? = null,
+            entityDisplayName: String? = null,
+            comment: String? = null,
+            diff: JsonObject? = null,
+        ): UUID {
             val id = UUID.randomUUID()
+            val type = entityType
+            val entity = entityId
+            val display = entityDisplayName
+            val note = comment
+            val diffJson = diff
             OrgAuditLog.insert {
                 it[OrgAuditLog.id] = id
                 it[organizationId] = orgId
                 it[OrgAuditLog.userId] = userId
                 it[action] = "test.action"
+                it[OrgAuditLog.entityType] = type
+                it[OrgAuditLog.entityId] = entity
+                it[OrgAuditLog.entityDisplayName] = display
+                it[OrgAuditLog.comment] = note
+                it[OrgAuditLog.diff] = diffJson
                 it[OrgAuditLog.createdAt] = createdAt
             }
             return id
@@ -402,20 +426,25 @@ class PurgeJobTest {
             serviceId: UUID? = null,
             resultId: UUID? = null,
             createdAt: Instant = NOW,
+            recipient: String = "r@t.dev",
         ): UUID {
             val id = UUID.randomUUID()
+            val to = recipient
             NotificationLog.insert {
                 it[NotificationLog.id] = id
                 it[organizationId] = orgId
                 it[NotificationLog.serviceId] = serviceId
                 it[probeResultId] = resultId
                 it[channel] = "email"
-                it[recipient] = "r@t.dev"
+                it[NotificationLog.recipient] = to
                 it[status] = "sent"
                 it[NotificationLog.createdAt] = createdAt
             }
             return id
         }
+
+        private fun emailOf(userId: UUID): String =
+            Users.selectAll().where { Users.id eq userId }.single()[Users.email]
 
         private fun count(table: Table, where: org.jetbrains.exposed.sql.Op<Boolean>): Long =
             table.selectAll().where { where }.count()
@@ -569,6 +598,129 @@ class PurgeJobTest {
             assertEquals(0, count(Users, Users.id eq stubUid), "stub account (and its email) purged")
             assertEquals(0, count(OrgUsers, OrgUsers.id eq inviteMembership), "invite membership gone")
             assertEquals(1, count(Users, Users.id eq realUid), "real account survives")
+        }
+    }
+
+    @Test
+    fun `user purge strips the erased account's identifiers from audit entries about it`() {
+        lateinit var uid: UUID
+        lateinit var email: String
+        lateinit var inviteRow: UUID
+        lateinit var userEntityRow: UUID
+        lateinit var byActorOnly: UUID
+        lateinit var bystander: UUID
+        val inviteId = UUID.randomUUID().toString()
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            uid = insertUser(purge = true)
+            email = emailOf(uid)
+            insertMembership(org, uid)
+
+            // The shape nothing reached: the ACTOR is the inviter and the ENTITY
+            // is the invite, so neither link is the invitee's — but the address
+            // is right there in the display name, the comment and the diff.
+            inviteRow = insertAudit(
+                org, owner, entityType = "invite", entityId = inviteId,
+                entityDisplayName = email,
+                comment = "Invited $email",
+                diff = buildJsonObject {
+                    put("email", buildJsonObject { put("old", JsonPrimitive(email)); put("new", JsonPrimitive("x@t.dev")) })
+                    put("isActive", buildJsonObject { put("from", JsonPrimitive("false")); put("to", JsonPrimitive("true")) })
+                },
+            )
+            // Entity IS the account: entity_id alone identifies the subject, so
+            // this one is scrubbed even though it never spells out the address.
+            userEntityRow = insertAudit(
+                org, owner, entityType = "user", entityId = uid.toString(),
+                entityDisplayName = "Purged Person",
+            )
+            // Acted on something else — only the actor link is theirs to lose.
+            byActorOnly = insertAudit(org, uid, entityType = "workspace", entityDisplayName = "some workspace")
+            // Somebody else's entry entirely, and their address is not erasing.
+            bystander = insertAudit(
+                org, owner, entityType = "user", entityId = owner.toString(),
+                entityDisplayName = emailOf(owner),
+            )
+        }
+
+        runPurge()
+
+        transaction {
+            assertEquals(0, count(Users, Users.id eq uid), "purged account is gone")
+
+            val invite = OrgAuditLog.selectAll().where { OrgAuditLog.id eq inviteRow }.single()
+            assertNull(invite[OrgAuditLog.entityDisplayName], "the invitee's address is gone from the display name")
+            assertEquals("Invited", invite[OrgAuditLog.comment],
+                "the address is stripped out of the comment, the note itself survives")
+            // The audit trail proper survives: what happened, to what, and when.
+            assertEquals("test.action", invite[OrgAuditLog.action])
+            assertEquals("invite", invite[OrgAuditLog.entityType])
+            assertEquals(inviteId, invite[OrgAuditLog.entityId], "what was acted on is still recorded")
+            // The diff keeps its non-identity field and loses the address.
+            val diff = invite[OrgAuditLog.diff]!!.jsonObject
+            assertFalse(diff.containsKey("email"), "the email diff is gone")
+            assertTrue(diff.containsKey("isActive"), "a non-identity change is preserved")
+
+            val userEntity = OrgAuditLog.selectAll().where { OrgAuditLog.id eq userEntityRow }.single()
+            assertNull(userEntity[OrgAuditLog.entityDisplayName],
+                "an entry whose entity IS the account is found by entity_id, address or not")
+            assertEquals(uid.toString(), userEntity[OrgAuditLog.entityId], "the entity reference itself is kept")
+
+            val actorOnly = OrgAuditLog.selectAll().where { OrgAuditLog.id eq byActorOnly }.single()
+            assertNull(actorOnly[OrgAuditLog.userId], "actor anonymized as before")
+            assertEquals("some workspace", actorOnly[OrgAuditLog.entityDisplayName],
+                "an entry merely ACTED on by the account keeps its own entity name")
+
+            val other = OrgAuditLog.selectAll().where { OrgAuditLog.id eq bystander }.single()
+            assertEquals(emailOf(other[OrgAuditLog.userId]!!), other[OrgAuditLog.entityDisplayName],
+                "somebody else's entry is untouched")
+
+            // The clinching assertion: the address is nowhere in the audit log,
+            // in any of the three columns that ever carry one.
+            val leaks = OrgAuditLog.selectAll().count { row ->
+                listOf(
+                    row[OrgAuditLog.entityDisplayName],
+                    row[OrgAuditLog.comment],
+                    row[OrgAuditLog.diff]?.toString(),
+                ).any { it?.contains(email, ignoreCase = true) == true }
+            }
+            assertEquals(0, leaks, "no erased address may survive anywhere in the audit log")
+        }
+    }
+
+    @Test
+    fun `user purge deletes the delivery log addressed to the erased account`() {
+        lateinit var uid: UUID
+        lateinit var theirs: UUID
+        lateinit var theirsOtherOrg: UUID
+        lateinit var somebodyElses: UUID
+        transaction {
+            val owner = insertUser()
+            val orgA = insertOrg(owner)
+            val orgB = insertOrg(insertUser())
+            uid = insertUser(purge = true)
+            insertMembership(orgA, uid)
+            val email = emailOf(uid)
+
+            // notification_log has no user FK, so nothing linked these rows to
+            // the account; they were cleared only when the whole ORG purged.
+            theirs = insertNotificationLog(orgA, recipient = email)
+            // Case differs — the address is still theirs.
+            theirsOtherOrg = insertNotificationLog(orgB, recipient = email.uppercase())
+            somebodyElses = insertNotificationLog(orgA, recipient = emailOf(owner))
+        }
+
+        runPurge()
+
+        transaction {
+            assertEquals(0, count(Users, Users.id eq uid))
+            assertEquals(0, count(NotificationLog, NotificationLog.id eq theirs),
+                "delivery history carrying the erased address is deleted")
+            assertEquals(0, count(NotificationLog, NotificationLog.id eq theirsOtherOrg),
+                "in every org they were alerted in, whatever the case")
+            assertEquals(1, count(NotificationLog, NotificationLog.id eq somebodyElses),
+                "another recipient's history is untouched")
         }
     }
 
@@ -799,6 +951,84 @@ class PurgeJobTest {
         transaction {
             assertEquals(0, count(Services, Services.id eq svc), "rows purged despite storage failure")
             assertEquals(0, count(ProbeSteps, ProbeSteps.probeResultId eq result))
+
+            // The row naming the object is gone, so without this the URI — the
+            // only record that the object exists — would be gone with it, and
+            // nothing sweeps body storage. It has to survive the purge.
+            val pending = PendingBodyDeletions.selectAll()
+                .where { PendingBodyDeletions.storageUrl eq "s3://bodies/unreachable" }
+                .single()
+            assertEquals(1, pending[PendingBodyDeletions.attempts])
+            assertEquals("bucket down", pending[PendingBodyDeletions.lastError])
+        }
+    }
+
+    @Test
+    fun `the retry job finishes a deletion the purge could not, and keeps the ones it still cannot`() {
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            val svc = insertService(proj, purge = true)
+            val result = insertResult(svc, proj, ws, org)
+            insertStep(result, "s3://bodies/retry-me")
+        }
+
+        runPurge(FakeStorage(failWith = RuntimeException("bucket down")))
+        transaction {
+            assertEquals(1, count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq "s3://bodies/retry-me"))
+        }
+
+        // Still broken: the row stays, with the failure counted. Nothing is ever
+        // given up on — dropping the row recreates the orphan it exists to stop.
+        val brokenStorage = FakeStorage(failWith = RuntimeException("still down"))
+        runBlocking { BodyDeletionRetryJob(storageClient = brokenStorage).execute() }
+        transaction {
+            val row = PendingBodyDeletions.selectAll()
+                .where { PendingBodyDeletions.storageUrl eq "s3://bodies/retry-me" }
+                .single()
+            assertEquals(2, row[PendingBodyDeletions.attempts], "the failed attempt is counted")
+            assertEquals("still down", row[PendingBodyDeletions.lastError])
+        }
+
+        // Bucket back: the object is deleted and stops being pending.
+        val healthy = FakeStorage()
+        runBlocking { BodyDeletionRetryJob(storageClient = healthy).execute() }
+        assertTrue(healthy.deleted.contains("s3://bodies/retry-me"), "the orphaned object is finally deleted")
+        transaction {
+            assertEquals(0, count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq "s3://bodies/retry-me"))
+        }
+    }
+
+    @Test
+    fun `retention records a body it could not delete instead of losing the reference`() {
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            val svc = insertService(proj)
+            val result = insertResult(svc, proj, ws, org)
+            // Older than the retention window below.
+            ProbeResults.update({ ProbeResults.id eq result }) {
+                it[startedAt] = NOW.minus(40, ChronoUnit.DAYS)
+            }
+            insertStep(result, "s3://bodies/expired-unreachable")
+        }
+
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 30,
+                storageClient = FakeStorage(failWith = RuntimeException("bucket down")),
+            ).execute()
+        }
+
+        transaction {
+            val pending = PendingBodyDeletions.selectAll()
+                .where { PendingBodyDeletions.storageUrl eq "s3://bodies/expired-unreachable" }
+                .single()
+            assertEquals("bucket down", pending[PendingBodyDeletions.lastError])
         }
     }
 

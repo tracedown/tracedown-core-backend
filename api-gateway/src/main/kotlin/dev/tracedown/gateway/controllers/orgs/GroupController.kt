@@ -264,7 +264,10 @@ object GroupController {
             val groupName = OrgGroups.selectAll()
                 .where { OrgGroups.id eq groupId }
                 .firstOrNull()?.get(OrgGroups.name)
-            AuditService.log(orgId, requestingUserId, "add.member", "group", groupId.toString(), entityDisplayName = groupName, comment = "Added user $userId")
+            AuditService.log(
+                orgId, requestingUserId, "add.member", "group", groupId.toString(),
+                entityDisplayName = groupName, comment = "Added user $userId",
+            )
             OutboxEmit.emitResourceEvent(
                 "resource.group.updated", "group", groupId,
                 buildJsonObject { put("id", groupId.toString()); put("orgId", orgId.toString()) },
@@ -373,7 +376,10 @@ object GroupController {
             val groupName = OrgGroups.selectAll()
                 .where { OrgGroups.id eq groupId }
                 .firstOrNull()?.get(OrgGroups.name)
-            AuditService.log(orgId, requestingUserId, "remove.member", "group", groupId.toString(), entityDisplayName = groupName, comment = "Removed user $userId")
+            AuditService.log(
+                orgId, requestingUserId, "remove.member", "group", groupId.toString(),
+                entityDisplayName = groupName, comment = "Removed user $userId",
+            )
             OutboxEmit.emitResourceEvent(
                 "resource.group.updated", "group", groupId,
                 buildJsonObject { put("id", groupId.toString()); put("orgId", orgId.toString()) },

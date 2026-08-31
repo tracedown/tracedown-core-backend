@@ -4,6 +4,7 @@ import dev.tracedown.common.agents.AgentVisibility
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.gateway.routes.v1
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
+import dev.tracedown.gateway.util.requireCachedPermissions
 import io.ktor.resources.Resource
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -52,11 +53,24 @@ fun Route.agentRoutes() {
      * admin list requires: this response carries a slug and a liveness state,
      * nothing configurable and no addresses, and every member has a legitimate
      * interest in whether the machinery running their probes is up.
+     *
+     * "Membership" is re-resolved here, per request, rather than inferred from
+     * the session's org: the org id on a principal is what was true when the
+     * session was scoped, and a membership can end at any point after that. A
+     * handler that only reads the id keeps answering for the rest of the
+     * token's life. Without the check the failure would also be silent rather
+     * than clean — a stale org narrows to nothing through [AgentVisibility] and
+     * the caller gets an empty roster, which reads as "the fleet is empty", not
+     * as "you are not a member here".
      */
     get<Agents.Health> {
         val (principal, orgId) = requireAuthWithOrg(call)
 
         val statuses = transaction {
+            // 403 not_org_member if the membership is gone; a session carrying
+            // no org at all was already a 400 from requireAuthWithOrg above.
+            requireCachedPermissions(orgId, principal.userId)
+
             val rows = ProbeAgents.selectAll()
                 .where { (ProbeAgents.isActive eq true) and (ProbeAgents.deleted eq false) }
                 .toList()

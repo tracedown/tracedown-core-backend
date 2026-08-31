@@ -36,15 +36,21 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import org.jetbrains.exposed.sql.Column
+import org.jetbrains.exposed.sql.Expression
 import org.jetbrains.exposed.sql.JoinType
+import org.jetbrains.exposed.sql.Op
+import org.jetbrains.exposed.sql.QueryBuilder
 import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.neq
 import org.jetbrains.exposed.sql.Table
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.lowerCase
+import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.selectAll
+import org.jetbrains.exposed.sql.stringParam
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import java.time.Instant
@@ -82,7 +88,7 @@ object UserDataController {
             sessions = exportSessions(userId, currentSessionId),
             orgMemberships = exportMemberships(userId),
             resourceGrants = exportResourceGrants(userId),
-            auditLog = exportAuditLog(userId),
+            auditLog = exportAuditLog(userId, user[Users.email]),
             apiKeys = exportApiKeys(userId),
             notificationSilences = exportSilences(userId),
             variables = exportVariables(userId),
@@ -205,11 +211,30 @@ object UserDataController {
                 )
             }
 
-    private fun exportResourceGrants(userId: UUID): List<ExportResourceGrant> =
-        ResourcePermissions.selectAll()
+    /**
+     * Direct per-resource grants held by the subject.
+     *
+     * `resource_permissions` never keys on an account: the only person-shaped
+     * principal is `'org_user'` and `principal_id` holds the **membership** id
+     * (the column's CHECK constraint permits only `'org_user'` and
+     * `'org_group'`, so a `'user'` principal cannot exist — matching on one
+     * returned an empty section for every data subject, which read as "you hold
+     * no grants" rather than as the bug it was). So the subject's memberships
+     * are resolved first and the grants are looked up by those ids.
+     *
+     * Soft-deleted memberships are included deliberately: a grant that is still
+     * stored is still personal data, whatever the state of the row it hangs off.
+     */
+    private fun exportResourceGrants(userId: UUID): List<ExportResourceGrant> {
+        val membershipIds = OrgUsers.select(OrgUsers.id)
+            .where { OrgUsers.userId eq userId }
+            .map { it[OrgUsers.id] }
+        if (membershipIds.isEmpty()) return emptyList()
+
+        return ResourcePermissions.selectAll()
             .where {
-                (ResourcePermissions.principalType eq "user") and
-                (ResourcePermissions.principalId eq userId)
+                (ResourcePermissions.principalType eq "org_user") and
+                (ResourcePermissions.principalId inList membershipIds)
             }
             .map { row ->
                 ExportResourceGrant(
@@ -219,15 +244,40 @@ object UserDataController {
                     permissions = row[ResourcePermissions.permissions],
                 )
             }
+    }
 
-    private fun exportAuditLog(userId: UUID): List<ExportAuditEntry> =
+    /**
+     * Audit entries the caller appears in, on **either** side.
+     *
+     * `user_id` is the actor column. Filtering on it alone disclosed only what
+     * the caller did, never what was done to them — being invited, removed,
+     * enabled, added to a group all carry someone else's actor id, and those are
+     * exactly the entries most likely to hold the caller's own email in
+     * `entity_display_name` or the comment.
+     *
+     * The subject side is resolved from what the row already carries, with no
+     * second link column:
+     *
+     *  - `entity_type = 'user'` makes `entity_id` the subject's account id — an
+     *    exact match, covering every entry whose entity IS a person;
+     *  - anything else that names them does so by spelling out their **email
+     *    address**, so the address itself is the handle (invite rows name the
+     *    invite as the entity, group membership rows the group).
+     *
+     * This is the same pair of rules the purge job scrubs on, deliberately: the
+     * export must disclose exactly the set erasure would later reach. It shares
+     * the same blind spot — a row that names the caller by display name alone,
+     * without their address and without a user entity, is matched by neither.
+     */
+    private fun exportAuditLog(userId: UUID, email: String): List<ExportAuditEntry> =
         OrgAuditLog.selectAll()
-            .where { OrgAuditLog.userId eq userId }
+            .where { (OrgAuditLog.userId eq userId) or subjectPredicate(userId, email) }
             .orderBy(OrgAuditLog.createdAt, SortOrder.DESC)
             .map { row ->
                 ExportAuditEntry(
                     organizationId = row[OrgAuditLog.organizationId].toString(),
                     action = row[OrgAuditLog.action],
+                    role = auditRole(row[OrgAuditLog.userId] == userId, row.isAboutSubject(userId, email)),
                     entityType = row[OrgAuditLog.entityType],
                     entityId = row[OrgAuditLog.entityId],
                     entityDisplayName = row[OrgAuditLog.entityDisplayName],
@@ -236,6 +286,47 @@ object UserDataController {
                     createdAt = row[OrgAuditLog.createdAt].toString(),
                 )
             }
+
+    /** SQL half of the subject rules documented on [exportAuditLog]. */
+    private fun subjectPredicate(userId: UUID, email: String): Op<Boolean> =
+        ((OrgAuditLog.entityType eq "user") and (OrgAuditLog.entityId eq userId.toString())) or
+            containsIgnoreCase(OrgAuditLog.entityDisplayName, email) or
+            containsIgnoreCase(OrgAuditLog.comment, email) or
+            containsIgnoreCase(OrgAuditLog.diff, email)
+
+    /** In-Kotlin half of the same rules, for labelling the row's [ExportAuditEntry.role]. */
+    private fun ResultRow.isAboutSubject(userId: UUID, email: String): Boolean {
+        if (this[OrgAuditLog.entityType] == "user" && this[OrgAuditLog.entityId] == userId.toString()) return true
+        val haystacks = listOf(
+            this[OrgAuditLog.entityDisplayName],
+            this[OrgAuditLog.comment],
+            this[OrgAuditLog.diff]?.toString(),
+        )
+        return haystacks.any { it != null && it.contains(email, ignoreCase = true) }
+    }
+
+    /**
+     * `strpos(lower(col::text), lower(?)) > 0` — a case-insensitive substring
+     * test that reads varchar, text and jsonb alike. Deliberately not LIKE:
+     * `_` and `%` are legal in an email local part and would be wildcards.
+     */
+    private fun containsIgnoreCase(column: Expression<*>, needle: String): Op<Boolean> =
+        object : Op<Boolean>() {
+            override fun toQueryBuilder(queryBuilder: QueryBuilder) = queryBuilder {
+                +"strpos(lower(coalesce(cast("
+                +column
+                +" as text), '')), lower("
+                +stringParam(needle)
+                +")) > 0"
+            }
+        }
+
+    /** Which side of the entry the caller is on — see [ExportAuditEntry.role]. */
+    private fun auditRole(isActor: Boolean, isSubject: Boolean): String = when {
+        isActor && isSubject -> "both"
+        isActor -> "actor"
+        else -> "subject"
+    }
 
     private fun exportApiKeys(userId: UUID): List<ExportApiKey> =
         ApiKeys.selectAll()

@@ -7,6 +7,7 @@ import dev.tracedown.common.models.OrgUserGroups
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.ResourcePermissions
+import dev.tracedown.common.models.Sessions
 import dev.tracedown.common.models.Users
 import io.ktor.server.config.HoconApplicationConfig
 import io.ktor.server.engine.EmbeddedServer
@@ -31,6 +32,7 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
@@ -83,12 +85,18 @@ class PermissionEscalationTest {
         /** Removed for cause, then re-invited. */
         private const val EX_ADMIN_EMAIL = "ex-admin@tracedown.dev"
 
+        /** Belongs to a second org too, so removal from this one is not their last. */
+        private const val MULTI_ORG_EMAIL = "multi-org@tracedown.dev"
+        private const val MULTI_ORG_PASSWORD = "MultiOrg123!"
+
         private lateinit var orgId: UUID
         private lateinit var adminGroupId: UUID
         private lateinit var plainGroupId: UUID
         private lateinit var managerUserId: UUID
         private lateinit var plainUserId: UUID
         private lateinit var exAdminUserId: UUID
+        private lateinit var multiOrgUserId: UUID
+        private lateinit var secondOrgId: UUID
 
         @BeforeAll
         @JvmStatic
@@ -150,6 +158,29 @@ class PermissionEscalationTest {
                 managerUserId = createMember(MANAGER_EMAIL, MANAGER_PASSWORD, users = 2)
                 plainUserId = createMember(PLAIN_EMAIL, PLAIN_PASSWORD, users = 0)
                 exAdminUserId = createMember(EX_ADMIN_EMAIL, "NeverLogsIn123!", users = 2, admin = 2)
+
+                // A member of this org AND a second one. Losing this membership
+                // is not losing their last, so nothing else revokes their
+                // session on the way out.
+                multiOrgUserId = createMember(MULTI_ORG_EMAIL, MULTI_ORG_PASSWORD, users = 0)
+                secondOrgId = UUID.randomUUID()
+                Organizations.insert {
+                    it[id] = secondOrgId
+                    it[name] = "Second Org"
+                    it[ownerId] = multiOrgUserId
+                    it[deleted] = false
+                    it[createdAt] = Instant.now()
+                }
+                OrgUsers.insert {
+                    it[id] = UUID.randomUUID()
+                    it[organizationId] = secondOrgId
+                    it[OrgUsers.userId] = multiOrgUserId
+                    it[joinedAt] = Instant.now()
+                    it[status] = "active"
+                    it[isActive] = true
+                    it[deleted] = false
+                    it[inviteToken] = ""
+                }
 
                 // The ex-admin also carries a group and a direct resource grant,
                 // so the removal has all three kinds of access to strip.
@@ -427,5 +458,48 @@ class PermissionEscalationTest {
                 "resource grants must not survive a re-invite",
             )
         }
+    }
+
+    // ---- a removed membership takes its org-scoped session with it ----
+
+    @Test
+    fun `removing a member from one of several orgs unbinds the session from that org`() {
+        val memberToken = login(MULTI_ORG_EMAIL, MULTI_ORG_PASSWORD)
+
+        // The session signed in scoped to this org.
+        transaction {
+            val bound = Sessions.selectAll()
+                .where { (Sessions.userId eq multiOrgUserId) and (Sessions.organizationId eq orgId) }
+                .count()
+            assertTrue(bound > 0, "the session starts out scoped to the org")
+        }
+
+        val (removeStatus, removeBody) = send(
+            "DELETE", "/api/v1/users/$multiOrgUserId", null, login(OWNER_EMAIL, OWNER_PASSWORD),
+        )
+        assertEquals(200, removeStatus, removeBody)
+
+        transaction {
+            // Nothing still points a session at the org they were removed from.
+            // Before this fix the row kept its organization_id and every handler
+            // that reads the org straight off the principal — without asking a
+            // permission helper — kept answering for the rest of the token's life.
+            assertEquals(
+                0L,
+                Sessions.selectAll()
+                    .where { (Sessions.userId eq multiOrgUserId) and (Sessions.organizationId eq orgId) }
+                    .count(),
+                "no session may stay scoped to an org the member was removed from",
+            )
+            assertNull(
+                Users.selectAll().where { Users.id eq multiOrgUserId }.first()[Users.selectedOrgId],
+                "the persisted org selection goes with the membership",
+            )
+        }
+
+        // The account keeps its other org, so the token itself is still valid —
+        // this re-scopes the session, it does not sign the person out.
+        val (meStatus, meBody) = send("GET", "/api/v1/auth/me", null, memberToken)
+        assertEquals(200, meStatus, meBody)
     }
 }
