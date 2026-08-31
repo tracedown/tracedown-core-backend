@@ -31,16 +31,22 @@ fun main(args: Array<String>) = EngineMain.main(args)
 fun Application.module() {
     val config = DispatcherConfig.load(environment)
 
-    // Fail fast in production if the insecure all-zero platform key is still
-    // set. This service decrypts the org and webhook variables that carry
-    // webhook credentials, so a key that does not match the gateway's does not
-    // announce itself at startup — it silently leaves every $o./$h. reference
-    // unresolved and fails those deliveries at runtime, one alert at a time.
-    // No-op in dev (see SecretGuard).
+    // Fail fast in production if a published dev credential is still in place.
+    // This service decrypts the org and webhook variables that carry webhook
+    // credentials, so a key that does not match the gateway's does not announce
+    // itself at startup — it silently leaves every $o./$h. reference unresolved
+    // and fails those deliveries at runtime, one alert at a time. No-op in dev
+    // (see SecretGuard).
+    //
+    // The key goes in by value rather than as a comparison against one literal:
+    // the all-zero default is only one of the dev keys this repository ships,
+    // and it was never the one an operator copying from a tracked example file
+    // would end up with.
     dev.tracedown.common.config.SecretGuard.requireSecure(
         environment.config.propertyOrNull("deployment.environment")?.getString(),
         "notification-dispatcher",
-        mapOf("PLATFORM_AES_KEY (all-zero dev default)" to (config.aesKey == "0".repeat(64))),
+        checks = emptyMap(),
+        credentials = mapOf("PLATFORM_AES_KEY" to config.aesKey),
     )
 
     // Database

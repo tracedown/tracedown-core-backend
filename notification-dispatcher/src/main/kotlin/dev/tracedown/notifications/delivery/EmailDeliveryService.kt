@@ -17,6 +17,15 @@ import java.util.UUID
  * Renders the notification template into HTML (with variable highlighting),
  * publishes to the email queue for the email-service to pick up, and logs
  * each delivery to notification_log.
+ *
+ * **`notification_log.recipient` holds a real email address**, and the table has
+ * no foreign key to the account it belongs to — it is keyed on the organization.
+ * That means nothing about it is reached by erasing an account: the row is
+ * deleted by the purge job matching on the address itself, and aged out by
+ * `NotificationLogRetentionJob`. If a delivery ever starts recording a different
+ * kind of recipient identifier here, the erasure path (aggregate-worker's
+ * PurgeJob) has to learn about it in the same change — an address that survives
+ * erasure is the whole failure mode.
  */
 class EmailDeliveryService(private val emailPublisher: EmailPublisher) {
 

@@ -28,12 +28,30 @@ fun main(args: Array<String>) = EngineMain.main(args)
 fun Application.module() {
     val config = IngestorConfig.load(environment)
 
-    // This service has no insecure defaults of its own to guard, but it still
-    // reports which deployment environment it resolved — an unset or misspelt
+    // Fail fast in production if a published dev credential is still in place.
+    // No-op in dev (see SecretGuard). This service ships no credential default
+    // of its own, but it does hold one when body storage is pointed at an
+    // S3-compatible backend: the bucket credential it relocates every response
+    // body with. Its `.conf` default is the empty string, which is exactly the
+    // shape that boots and then fails one body at a time, so it is guarded by
+    // value like every other credential in the fleet.
+    //
+    // Only when S3 is actually configured — the endpoint is the on/off switch
+    // (see IngestorConfig), and an unset secret is not a misconfiguration on a
+    // filesystem deployment. The access key *id* is deliberately not guarded:
+    // it identifies rather than authenticates, and a legitimate one is often
+    // shorter than the minimum a generated secret must clear.
+    //
+    // With no S3 backend this degrades to SecretGuard.announce, which is what
+    // matters even for a service with nothing to guard: an unset or misspelt
     // DEPLOYMENT_ENV is a fleet-wide condition and every log should say so.
-    SecretGuard.announce(
+    SecretGuard.requireSecure(
         environment.config.propertyOrNull("deployment.environment")?.getString(),
         "result-ingestor",
+        checks = emptyMap(),
+        credentials = config.storage.s3
+            ?.let { mapOf("STORAGE_S3_SECRET_KEY" to it.secretKey) }
+            ?: emptyMap(),
     )
 
     // Database
