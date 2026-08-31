@@ -1,5 +1,15 @@
 -- Restore plain (NO ACTION) foreign keys and the NOT NULL constraints.
 --
+-- NOTE on the forward file's audit-log comment: it claims the action/entity/diff
+-- columns carry no account identity of their own. That is wrong — the writers
+-- put the subject's email in entity_display_name, comment and diff, and on an
+-- invite entry the actor is the inviter, so anonymizing the actor link is
+-- necessary but not sufficient. The correction lives with the code that acts on
+-- it (PurgeJob.SCRUB_AUDIT_SUBJECT in aggregate-worker); it cannot be added to
+-- the forward file because that file is applied and checksummed — editing it
+-- breaks Flyway validation on every existing database. Undo files are not
+-- scanned by Flyway, which is why this note can live here.
+--
 -- Rows whose creator was erased under the forward migration carry NULL in
 -- created_by; to restore NOT NULL on api_keys/org_rule_presets those rows are
 -- reassigned to the owning organization's owner (the closest thing to a
