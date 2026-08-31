@@ -8,8 +8,19 @@
 -- group assignments) are deliberately NOT handled here — the purge job deletes
 -- those explicitly, leaf-first, so their removal stays visible in one place.
 
--- Audit history is kept on user erasure; only the actor link is anonymized.
--- The action/entity/diff columns carry no account identity of their own.
+-- Audit history is kept on user erasure and the actor link is anonymized here.
+--
+-- CORRECTION: the rest of the row is NOT identity-free. The writers put the
+-- subject's email in entity_display_name and repeat it in the comment
+-- (InviteController), and the account email change records both addresses in
+-- diff. Worse, on an invite entry the actor is the INVITER, so clearing user_id
+-- clears nothing about the invitee. Anonymizing the actor is therefore
+-- necessary but not sufficient: erasure also has to reach the payload columns
+-- of the rows *about* the erased person. The purge job does that, resolving the
+-- subject from what the row already carries — entity_type/entity_id when the
+-- entity IS the user, and the erased address itself everywhere else (see
+-- PurgeJob.SCRUB_AUDIT_SUBJECT). Do not read the line below as "the rest of the
+-- row is safe".
 ALTER TABLE org_audit_log DROP CONSTRAINT org_audit_log_user_id_fkey;
 ALTER TABLE org_audit_log ADD CONSTRAINT org_audit_log_user_id_fkey
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL;

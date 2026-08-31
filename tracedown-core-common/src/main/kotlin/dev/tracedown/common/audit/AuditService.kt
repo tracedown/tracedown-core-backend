@@ -31,6 +31,13 @@ object AuditService {
      *                           system-wide actions that target no single named entity.
      * @param diff               JSON string describing what changed (old/new values).
      * @param comment            Optional human-readable note.
+     *
+     * The entry's *subject* — the person it is about, who on an invite is not
+     * the actor — is not a column of its own: when the entity IS a user,
+     * `entityType`/`entityId` already identify them, and that is what erasure
+     * and the personal-data export match on. Everything else is found by the
+     * address the row carries, so keep identifiers out of `comment` and `diff`
+     * unless the entry genuinely needs them.
      */
     fun log(
         orgId: UUID,

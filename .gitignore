@@ -25,3 +25,6 @@ docker/email-attachments/
 # Deploy stack: operator-created files
 docker/deploy/.env
 docker/deploy/frontend-dist/
+
+# Kotlin compiler build output
+.kotlin/

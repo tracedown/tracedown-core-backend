@@ -34,6 +34,13 @@ object ErrorCodes {
     const val UNVERIFIED_DOMAIN_INTERVAL = "unverified_domain_interval"
     const val UNVERIFIED_DOMAIN_INCLUDES = "unverified_domain_includes"
     const val INVALID_REQUEST_BODY = "invalid_request_body"
+    /** The request body exceeds the size the API accepts (413). */
+    const val REQUEST_BODY_TOO_LARGE = "request_body_too_large"
+    /**
+     * The script targets an address this installation does not permit a probe to
+     * reach (a private, loopback or internal-only address, or a non-HTTP scheme).
+     */
+    const val BLOCKED_PROBE_TARGET = "blocked_probe_target"
     const val INVALID_UUID = "invalid_uuid"
     // A PFS filter/sort referenced a table or column that endpoint does not
     // expose for filtering/sorting (per-table allowlist rejection).

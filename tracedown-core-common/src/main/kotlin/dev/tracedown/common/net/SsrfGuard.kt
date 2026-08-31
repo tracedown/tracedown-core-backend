@@ -89,7 +89,13 @@ object SsrfGuard {
         return addresses
     }
 
-    private fun isInternalHostname(host: String): Boolean {
+    /**
+     * True when [host] names infrastructure that only ever exists inside a
+     * private network (`localhost`, `*.internal`, `*.local`, …). Public because
+     * probe-target policy applies the same list — the two guards must agree on
+     * what "internal" means.
+     */
+    fun isInternalHostname(host: String): Boolean {
         val normalized = try {
             IDN.toASCII(host).trimEnd('.').lowercase()
         } catch (_: Exception) {
