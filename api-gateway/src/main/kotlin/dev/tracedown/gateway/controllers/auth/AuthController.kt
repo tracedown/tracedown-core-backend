@@ -1006,19 +1006,58 @@ object AuthController {
         return false
     }
 
+    /**
+     * A fixed, valid bcrypt hash (cost 12, matching [PasswordHasher]) that no
+     * password will ever match. An unknown account is verified against it so the
+     * password step costs the same whether or not the email exists — otherwise
+     * an unknown email returns before any bcrypt runs and the response time
+     * enumerates accounts. Computed once, lazily.
+     */
+    private val dummyHash: String by lazy {
+        BCrypt.withDefaults().hashToString(12, "timing-normalization-only".toCharArray())
+    }
+
+    /**
+     * Verifies a password without becoming a user-enumeration oracle.
+     *
+     * Two properties, both deliberate:
+     *  - **Constant work for unknown/credential-less accounts.** A missing email
+     *    (or an invited stub with no password yet) still spends one bcrypt
+     *    verification against [dummyHash] before failing, so timing does not
+     *    distinguish "no such account" from "wrong password".
+     *  - **Deactivation is disclosed only after the password is proven.** The
+     *    account-state check used to run first, so a stranger could tell an
+     *    existing-but-disabled account (`ACCOUNT_DEACTIVATED`) from a wrong
+     *    password (`INVALID_CREDENTIALS`) without knowing any password. It now
+     *    runs last — only a caller who already supplied the correct password
+     *    learns the account is deactivated.
+     *
+     * TODO: per-account login throttling/lockout (a bounded counter + time-boxed
+     * lock, as [TotpPolicy] does for the second factor) is a larger change and is
+     * not attempted here.
+     */
     private fun verifyCredentials(email: String, password: String): ResultRow {
         val user = Users.selectAll()
             .where { (Users.email eq email) and (Users.deleted eq false) }
             .firstOrNull()
-            ?: throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
+
+        if (user == null) {
+            BCrypt.verifyer().verify(password.toCharArray(), dummyHash)
+            throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
+        }
+
+        val storedHash = user[Users.passwordHash]
+        if (storedHash.isBlank()) {
+            // An invited stub has no password yet; treat it exactly like a wrong
+            // password (same work, same code) rather than revealing it exists.
+            BCrypt.verifyer().verify(password.toCharArray(), dummyHash)
+            throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
+        }
+
+        val hashResult = BCrypt.verifyer().verify(password.toCharArray(), storedHash)
+        if (!hashResult.verified) throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
 
         if (!user[Users.isActive]) throw UnauthorizedException(ErrorCodes.ACCOUNT_DEACTIVATED)
-
-        val hashResult = BCrypt.verifyer().verify(
-            password.toCharArray(),
-            user[Users.passwordHash],
-        )
-        if (!hashResult.verified) throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
 
         return user
     }
