@@ -1,4 +1,7 @@
-// API key CRUD lifecycle: create, list (redacted), revoke, delete
+// API keys are DEFERRED: no X-Api-Key verifier exists, so a minted key would
+// authenticate nothing. The create and list routes are disabled (501) so no one
+// is handed a dead credential. This vector pins that deferral — restore the full
+// CRUD lifecycle here once a verifier ships and the routes are re-enabled.
 
 // Login
 post("$baseUrl/api/v1/auth/login", {
@@ -7,36 +10,17 @@ post("$baseUrl/api/v1/auth/login", {
 .expect(status: 200)
 .store({ "$$token": this.body.token })
 
-// Create API key
+// Create is deferred — must report 501, not mint a key
 post("$baseUrl/api/v1/api-keys", {
   headers: { Authorization: "Bearer $$token" },
   body: json({ name: "Test Key" })
 })
-.expect(status: 201)
-.assert({
-  expect: [
-    this.body.name eq "Test Key",
-    this.body.key neq null
-  ]
-})
-.store({ "$$keyId": this.body.id, "$$keyValue": this.body.key })
+.expect(status: 501)
+.assert({ expect: [this.body.error eq "api_keys_deferred"] })
 
-// List API keys — key field must be null (redacted)
+// List is deferred — must report 501 too
 get("$baseUrl/api/v1/api-keys", {
   headers: { Authorization: "Bearer $$token" }
 })
-.expect(status: 200)
-
-// Revoke the key
-post("$baseUrl/api/v1/api-keys/$$keyId/revoke", {
-  headers: { Authorization: "Bearer $$token" }
-})
-.expect(status: 200)
-.assert({ expect: [this.body.ok eq true] })
-
-// Delete the key
-delete("$baseUrl/api/v1/api-keys/$$keyId", {
-  headers: { Authorization: "Bearer $$token" }
-})
-.expect(status: 200)
-.assert({ expect: [this.body.ok eq true] })
+.expect(status: 501)
+.assert({ expect: [this.body.error eq "api_keys_deferred"] })

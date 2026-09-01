@@ -345,11 +345,11 @@ class MeRoutesTest {
         assertEquals(200, status, "Export response: $raw")
 
         val body = json(raw)
-        assertEquals(1, body["exportVersion"]!!.jsonPrimitive.content.toInt())
+        assertEquals(2, body["exportVersion"]!!.jsonPrimitive.content.toInt())
         assertNotNull(body["generatedAt"])
         for (section in listOf(
             "profile", "sessions", "orgMemberships", "resourceGrants", "auditLog",
-            "apiKeys", "notificationSilences", "variables", "sentInvites",
+            "apiKeys", "notificationSilences", "variables", "sentInvites", "notificationLog",
         )) {
             assertNotNull(body[section], "missing export section: $section")
         }
