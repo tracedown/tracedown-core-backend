@@ -25,7 +25,11 @@ class SmtpTransport(
         )
         .withProperty("mail.smtp.connectiontimeout", config.connectionTimeoutMs.toString())
         .withProperty("mail.smtp.timeout", config.readTimeoutMs.toString())
-        .async()
+        // Synchronous on purpose: an async mailer returns a future that this
+        // transport discarded, so a failed SMTP send threw on a background
+        // thread and every job still logged "sent". Sending inline lets the
+        // failure propagate to EmailProcessor's try/catch, which records the
+        // real outcome and reports it back on the status queue.
         .buildMailer()
 
     override fun send(message: EmailMessage) {
@@ -35,7 +39,9 @@ class SmtpTransport(
     override fun sendBatch(messages: List<EmailMessage>) {
         log.info("Sending batch of {} emails via SMTP", messages.size)
         for (message in messages) {
-            mailer.sendMail(buildEmail(message), true)
+            // async = false: the send must throw here if it fails, not on a
+            // detached thread whose exception nobody sees.
+            mailer.sendMail(buildEmail(message), false)
         }
     }
 
