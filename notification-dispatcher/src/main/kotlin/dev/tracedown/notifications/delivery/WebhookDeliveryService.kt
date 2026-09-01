@@ -17,6 +17,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import okhttp3.Dns
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -31,6 +32,7 @@ import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransacti
 import org.jetbrains.exposed.sql.update
 import org.slf4j.LoggerFactory
 import java.io.IOException
+import java.net.InetAddress
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -331,6 +333,23 @@ class WebhookDeliveryService(
         }
     }
 
+    /**
+     * An OkHttp [Dns] that answers the one vetted host with the exact addresses
+     * [SsrfGuard.assertAllowed] resolved and approved, and defers everything else
+     * to the system resolver. Scoped to a single call so it pins that call's
+     * connection to a checked address without touching any other lookup.
+     */
+    private class PinnedDns(
+        host: String,
+        private val vetted: List<InetAddress>,
+    ) : Dns {
+        private val pinnedHost = host.lowercase()
+
+        override fun lookup(hostname: String): List<InetAddress> =
+            if (hostname.lowercase() == pinnedHost && vetted.isNotEmpty()) vetted
+            else Dns.SYSTEM.lookup(hostname)
+    }
+
     private data class DeliveryOutcome(
         val status: String,
         val error: String?,
@@ -370,7 +389,7 @@ class WebhookDeliveryService(
             // Authoritative SSRF gate on the fully-resolved URL: https only, and
             // no host that resolves to a private/loopback/internal address. A
             // block is a permanent misconfiguration — never retried.
-            try {
+            val vetted = try {
                 dev.tracedown.common.net.SsrfGuard.assertAllowed(request.url.toString())
             } catch (e: dev.tracedown.common.net.SsrfGuard.BlockedException) {
                 lastError = "blocked: ${e.reason}"
@@ -378,9 +397,20 @@ class WebhookDeliveryService(
                 return DeliveryOutcome("failed", lastError, attempt)
             }
 
+            // Pin the addresses the guard just vetted for this one call, so the
+            // connection goes to what was checked. Without it OkHttp re-resolves
+            // the host itself, and a name that answered with a public address for
+            // the guard's lookup can answer with 127.0.0.1 (or a metadata IP) for
+            // the connect a moment later — the classic DNS-rebind window. TLS
+            // still validates the certificate against the hostname, so pinning
+            // the address changes only which IP is dialled, not who is trusted.
+            val pinnedClient = httpClient.newBuilder()
+                .dns(PinnedDns(request.url.host, vetted))
+                .build()
+
             try {
                 val (successful, code) = withContext(Dispatchers.IO) {
-                    httpClient.newCall(request).execute().use { response ->
+                    pinnedClient.newCall(request).execute().use { response ->
                         // Response body is never read into logs — it can contain
                         // reflected secrets or PII.
                         response.isSuccessful to response.code
