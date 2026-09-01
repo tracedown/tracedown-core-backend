@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.util
 
+import dev.tracedown.common.net.PathCanonicalizer
 import io.lettuce.core.api.sync.RedisCommands
 import org.slf4j.LoggerFactory
 
@@ -129,7 +130,14 @@ class RateLimiter(
  * stranger, and on a deployment with no reverse proxy in front they are
  * published straight to the internet.
  */
-fun rateLimitTierFor(path: String): RateLimiter.Tier? = when {
+fun rateLimitTierFor(rawPath: String): RateLimiter.Tier? {
+    // Classify on the canonical path, so `//api/v1/auth/login` (which routes to
+    // the login handler all the same) is metered on the strict AUTH budget
+    // rather than the fail-open GENERAL one it lands on when the raw URI is read
+    // verbatim. A path that plays games with dot-segments cannot be canonicalized
+    // and is put on the strictest bucket rather than being handed the lenient one.
+    val path = PathCanonicalizer.canonicalize(rawPath) ?: return RateLimiter.Tier.AUTH
+    return when {
     path == "/ping" -> null
     path.startsWith("/internal/") -> RateLimiter.Tier.INTERNAL
     // The data export fans out over many per-user queries, so it shares the
@@ -137,7 +145,8 @@ fun rateLimitTierFor(path: String): RateLimiter.Tier? = when {
     path.startsWith("/api/v1/auth/login") ||
         path.startsWith("/api/v1/auth/password-reset") ||
         path.startsWith("/api/v1/me/export") -> RateLimiter.Tier.AUTH
-    else -> RateLimiter.Tier.GENERAL
+        else -> RateLimiter.Tier.GENERAL
+    }
 }
 
 data class TierConfig(
