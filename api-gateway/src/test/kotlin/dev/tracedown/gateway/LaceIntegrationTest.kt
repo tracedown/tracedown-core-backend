@@ -174,7 +174,7 @@ class LaceIntegrationTest {
 
             // Reinitialize DomainController with HTTP verifier pointing at the test server
             val aesKey = "0000000000000000000000000000000000000000000000000000000000000000"
-            DomainController.init(aesKey, HttpDnsDomainVerifier(httpScheme = "http", httpPort = verifyServerPort))
+            DomainController.init(aesKey, HttpDnsDomainVerifier(httpScheme = "http", httpPort = verifyServerPort, allowInternalTargets = true))
 
             transaction {
                 val org = Organizations.selectAll().first()

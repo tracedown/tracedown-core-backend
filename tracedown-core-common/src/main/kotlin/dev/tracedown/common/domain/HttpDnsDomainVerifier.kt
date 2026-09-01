@@ -1,10 +1,12 @@
 package dev.tracedown.common.domain
 
 import dev.tracedown.common.domain.dns.TxtLookup
+import dev.tracedown.common.net.SsrfGuard
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.slf4j.LoggerFactory
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 
 /**
@@ -49,6 +51,14 @@ class HttpDnsDomainVerifier(
         .build(),
     private val httpScheme: String = "https",
     private val httpPort: Int? = null,
+    /**
+     * Whether an http-01 target that resolves to an internal/private/loopback
+     * address is allowed. Off in production — the claimant chooses the host and
+     * the platform then connects to it, so a domain pointed at `127.0.0.1` or a
+     * metadata IP would be a request-forgery primitive. Only local integration
+     * tests, which necessarily verify against a loopback server, turn it on.
+     */
+    private val allowInternalTargets: Boolean = false,
 ) : DomainVerifier {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -56,6 +66,16 @@ class HttpDnsDomainVerifier(
     private companion object {
         /** The only port a "this site is HTTPS-only" redirect may name. */
         const val HTTPS_PORT = 443
+
+        /**
+         * The single failure message returned to the caller for every http-01
+         * failure. It deliberately says nothing about the URL, the HTTP status,
+         * or the connection error: the claimant supplies the host and the
+         * platform connects to it, so a specific message ("HTTP 500 from …",
+         * "connection refused") turns the verify endpoint into a probe oracle for
+         * internal services. The detail is logged, not returned.
+         */
+        const val GENERIC_HTTP_FAILURE = "verification_failed"
     }
 
     override fun verify(domain: String, challenge: String, verificationType: String): VerificationResult {
@@ -67,6 +87,13 @@ class HttpDnsDomainVerifier(
     }
 
     private fun verifyHttp(domain: String, challenge: String): VerificationResult {
+        // The claimant chose this host; refuse to connect to it if it names or
+        // resolves to internal/private space, before any packet leaves.
+        blockedTargetReason(domain)?.let { reason ->
+            log.debug("http-01 verification refused for {}: {}", domain, reason)
+            return VerificationResult(verified = false, error = GENERIC_HTTP_FAILURE)
+        }
+
         val host = if (httpPort != null) "$domain:$httpPort" else domain
         val url = "$httpScheme://$host${DomainChallenge.WELL_KNOWN_PATH}"
         return try {
@@ -74,28 +101,44 @@ class HttpDnsDomainVerifier(
                 is Attempt.Done -> first.result
                 is Attempt.Redirect -> {
                     val upgraded = sameHostUpgrade(url, first.location)
-                        ?: return VerificationResult(
-                            verified = false,
-                            error = "HTTP ${first.code} from $url — only a same-host HTTPS upgrade is followed",
-                        )
+                        ?: run {
+                            log.debug("http-01 for {}: HTTP {} redirect not a same-host upgrade", domain, first.code)
+                            return VerificationResult(verified = false, error = GENERIC_HTTP_FAILURE)
+                        }
                     when (val second = fetch(upgraded, challenge)) {
                         is Attempt.Done -> second.result
                         // One hop and no further: a redirect off the upgraded URL
                         // is no longer the "site forces HTTPS" case this allows.
-                        is Attempt.Redirect -> VerificationResult(
-                            verified = false,
-                            error = "HTTP ${second.code} from $upgraded — redirects are not followed",
-                        )
+                        is Attempt.Redirect -> {
+                            log.debug("http-01 for {}: HTTP {} second redirect not followed", domain, second.code)
+                            VerificationResult(verified = false, error = GENERIC_HTTP_FAILURE)
+                        }
                     }
                 }
             }
         } catch (e: Exception) {
             log.debug("HTTP verification failed for {}: {}", domain, e.message)
-            VerificationResult(
-                verified = false,
-                error = "Failed to reach $url: ${e.message}",
-            )
+            VerificationResult(verified = false, error = GENERIC_HTTP_FAILURE)
         }
+    }
+
+    /**
+     * Why [domain] must not be dialled, or null when it is a public target.
+     * Runs the same internal-name and private/loopback/CGNAT/link-local address
+     * checks the webhook SSRF guard uses, so the two agree on what "internal"
+     * means. Skipped entirely when [allowInternalTargets] is set (local tests).
+     */
+    private fun blockedTargetReason(domain: String): String? {
+        if (allowInternalTargets) return null
+        if (SsrfGuard.isInternalHostname(domain)) return "internal_host"
+        val addresses = try {
+            InetAddress.getAllByName(domain).toList()
+        } catch (e: Exception) {
+            return "dns_resolution_failed"
+        }
+        if (addresses.isEmpty()) return "dns_no_addresses"
+        if (addresses.any { SsrfGuard.isBlockedAddress(it) }) return "private_address"
+        return null
     }
 
     /** One well-known fetch: either a verdict, or a redirect the caller may judge. */
@@ -111,8 +154,9 @@ class HttpDnsDomainVerifier(
                 return Attempt.Redirect(it.code, it.header("Location"))
             }
             if (!it.isSuccessful) {
+                log.debug("http-01 fetch of {} returned HTTP {}", url, it.code)
                 return Attempt.Done(
-                    VerificationResult(verified = false, error = "HTTP ${it.code} from $url"),
+                    VerificationResult(verified = false, error = GENERIC_HTTP_FAILURE),
                 )
             }
 
@@ -121,7 +165,8 @@ class HttpDnsDomainVerifier(
                 if (body == challenge) {
                     VerificationResult(verified = true)
                 } else {
-                    VerificationResult(verified = false, error = "Challenge token mismatch at $url")
+                    log.debug("http-01 challenge mismatch at {}", url)
+                    VerificationResult(verified = false, error = GENERIC_HTTP_FAILURE)
                 },
             )
         }

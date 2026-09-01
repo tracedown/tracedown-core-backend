@@ -117,7 +117,7 @@ class DomainVerificationTest {
 
             // Reinitialize DomainController with HTTP verifier pointing at test server (http, not https)
             val aesKey = "0000000000000000000000000000000000000000000000000000000000000000"
-            DomainController.init(aesKey, HttpDnsDomainVerifier(httpScheme = "http", httpPort = verifyServerPort))
+            DomainController.init(aesKey, HttpDnsDomainVerifier(httpScheme = "http", httpPort = verifyServerPort, allowInternalTargets = true))
         }
 
         @AfterAll
