@@ -29,20 +29,29 @@ class ApiKeys {
 }
 
 fun Route.apiKeyRoutes() {
-    /** Creates a new API key. Returns the plaintext key only on creation. */
+    // DEFERRED (SEC-M2): API-key authentication is not implemented. Nothing in
+    // the gateway verifies an `X-Api-Key` header, so a key minted here would
+    // authenticate no request — a dead credential. Creation and listing are
+    // disabled (501) so no one is handed one, while revoke/delete stay live to
+    // clean up anything that already exists. To re-enable, restore the two
+    // handler bodies below (kept verbatim in comments) once a verifier ships.
+
+    /** Creates a new API key — DISABLED until an X-Api-Key verifier exists. */
     post<ApiKeys> {
-        val (principal, orgId) = requireAuthWithOrg(call)
-        val body = tryReceive<CreateApiKeyRequest>(call)
-        val result = ApiKeyController.create(orgId, body, principal.userId)
-        call.respond(HttpStatusCode.Created, result)
+        call.respond(HttpStatusCode.NotImplemented, mapOf("error" to "api_keys_deferred"))
+        // val (principal, orgId) = requireAuthWithOrg(call)
+        // val body = tryReceive<CreateApiKeyRequest>(call)
+        // val result = ApiKeyController.create(orgId, body, principal.userId)
+        // call.respond(HttpStatusCode.Created, result)
     }
 
-    /** Lists all API keys for the organization. */
+    /** Lists API keys — DISABLED until an X-Api-Key verifier exists. */
     get<ApiKeys> {
-        val (principal, orgId) = requireAuthWithOrg(call)
-        val pfs = parsePfsParams(call)
-        val result = ApiKeyController.list(orgId, principal.userId, pfs)
-        call.respond(result)
+        call.respond(HttpStatusCode.NotImplemented, mapOf("error" to "api_keys_deferred"))
+        // val (principal, orgId) = requireAuthWithOrg(call)
+        // val pfs = parsePfsParams(call)
+        // val result = ApiKeyController.list(orgId, principal.userId, pfs)
+        // call.respond(result)
     }
 
     /** Revokes an API key (cannot be undone). */
