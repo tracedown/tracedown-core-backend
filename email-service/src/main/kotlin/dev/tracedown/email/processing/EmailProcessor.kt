@@ -272,14 +272,35 @@ open class EmailProcessor(
         }
     }
 
+    /**
+     * Substitutes `{{key}}` placeholders with the job's variables.
+     *
+     * Values are HTML-escaped before substitution. The templates are HTML
+     * documents and several variables are user-controlled — an inviter's display
+     * name, an organization name, the reset recipient's name — reaching here
+     * straight from what a person typed. Substituting them raw let markup (a
+     * `<a>` phishing link, a `<style>` overlay) be injected into DKIM-signed mail
+     * the platform sends on the user's behalf. Escaping centrally, once, means
+     * every current and future template is safe by default and no publisher has
+     * to remember to escape at its call site. Escaping a URL variable
+     * (`inviteLink`, `resetLink`) only turns `&` into `&amp;`, which is the
+     * correct encoding inside an `href`, so links still work.
+     */
     private fun renderTemplate(template: String, vars: JsonObject): String {
         var result = template
         for ((key, value) in vars) {
-            val strValue = value.jsonPrimitive.content
+            val strValue = escapeHtml(value.jsonPrimitive.content)
             result = result.replace("{{$key}}", strValue)
         }
         return result
     }
+
+    private fun escapeHtml(text: String): String = text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&#39;")
 
     private companion object {
         /** The optional footer region of the layout, markers included. */
