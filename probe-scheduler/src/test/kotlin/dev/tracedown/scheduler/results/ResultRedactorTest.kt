@@ -60,6 +60,39 @@ class ResultRedactorTest {
     }
 
     @Test
+    fun `sensitive response headers are masked even without secrets`() {
+        val result = parse(
+            """
+            {
+              "calls": [{
+                "request": { "url": "https://api.example.com/", "headers": { "Authorization": "Bearer abc", "Accept": "text/html" } },
+                "response": { "status": 200, "headers": { "set-cookie": "session=deadbeef; HttpOnly", "content-type": "text/html" } }
+              }]
+            }
+            """.trimIndent(),
+        )
+
+        val out = ResultRedactor.redact(result, emptySet()).toString()
+
+        assertFalse(out.contains("Bearer abc"), "request Authorization must be masked")
+        assertFalse(out.contains("session=deadbeef"), "response Set-Cookie must be masked")
+        assertTrue(out.contains(mask))
+        assertTrue(out.contains("text/html"), "non-sensitive headers remain")
+        assertTrue(out.contains("content-type"), "non-sensitive header names remain")
+    }
+
+    @Test
+    fun `multi-valued set-cookie has every entry masked`() {
+        val result = parse(
+            """{ "calls": [{ "response": { "headers": { "set-cookie": ["a=1", "b=2"] } } }] }""",
+        )
+        val out = ResultRedactor.redact(result, emptySet()).toString()
+        assertFalse(out.contains("a=1"))
+        assertFalse(out.contains("b=2"))
+        assertTrue(out.contains(mask))
+    }
+
+    @Test
     fun `no secrets returns the same instance untouched`() {
         val result = parse("""{ "calls": [{ "request": { "url": "https://h/?x=1" } }] }""")
         assertSame(result, ResultRedactor.redact(result, emptySet()))
