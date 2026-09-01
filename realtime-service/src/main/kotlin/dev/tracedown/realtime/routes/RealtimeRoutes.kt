@@ -1,5 +1,6 @@
 package dev.tracedown.realtime.routes
 
+import dev.tracedown.common.realtime.ConnectionAuthorizer
 import dev.tracedown.realtime.auth.SessionValidator
 import dev.tracedown.realtime.ws.ClientSession
 import dev.tracedown.realtime.ws.ConnectionManager
@@ -62,6 +63,22 @@ fun Route.realtimeRoutes(connectionManager: ConnectionManager) {
         val auth = SessionValidator.validate(token)
         if (auth == null) {
             close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "invalid session"))
+            return@webSocket
+        }
+
+        // Open-time gate. Core registers no authorizer, so the default is allow
+        // and this is a no-op for standalone Core; a host can register one to add
+        // its own policy at socket-open without any of it living here.
+        val decision = ConnectionAuthorizer.authorize(
+            ConnectionAuthorizer.ConnectionContext(
+                userId = auth.userId,
+                sessionId = auth.sessionId,
+                orgId = auth.orgId,
+            ),
+        )
+        if (decision is ConnectionAuthorizer.Decision.Deny) {
+            log.debug("connection refused by authorizer for session={}: {}", auth.sessionId, decision.reason)
+            close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "not authorized"))
             return@webSocket
         }
 
