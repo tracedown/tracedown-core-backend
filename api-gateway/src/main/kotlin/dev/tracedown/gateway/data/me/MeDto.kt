@@ -130,12 +130,29 @@ data class ExportSentInvite(
 )
 
 /**
+ * One notification-delivery record addressed to the subject's email address.
+ *
+ * The purge erases these rows on erasure (matched by email), so Art. 15 access
+ * must disclose exactly what Art. 17 would later delete. Message bodies are not
+ * stored on the row, so there is none to include.
+ */
+@Serializable
+data class ExportNotificationLogEntry(
+    val organizationId: String,
+    val channel: String,
+    val recipient: String,
+    val status: String,
+    val error: String? = null,
+    val createdAt: String,
+)
+
+/**
  * Versioned envelope for the personal data export. Section names and shapes
  * are a stable contract — additions bump [exportVersion].
  */
 @Serializable
 data class UserDataExport(
-    val exportVersion: Int = 1,
+    val exportVersion: Int = 2,
     val generatedAt: String,
     val profile: ExportProfile,
     val sessions: List<ExportSession>,
@@ -146,4 +163,5 @@ data class UserDataExport(
     val notificationSilences: List<ExportNotificationSilence>,
     val variables: List<ExportVariable>,
     val sentInvites: List<ExportSentInvite>,
+    val notificationLog: List<ExportNotificationLogEntry>,
 )

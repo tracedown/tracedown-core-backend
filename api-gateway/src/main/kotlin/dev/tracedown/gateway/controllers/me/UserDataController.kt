@@ -3,6 +3,7 @@ package dev.tracedown.gateway.controllers.me
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ApiKeys
+import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgAuditLog
 import dev.tracedown.common.models.OrgGroups
@@ -22,6 +23,7 @@ import dev.tracedown.gateway.data.auth.UserSummary
 import dev.tracedown.gateway.data.me.ChangeEmailRequest
 import dev.tracedown.gateway.data.me.ExportApiKey
 import dev.tracedown.gateway.data.me.ExportAuditEntry
+import dev.tracedown.gateway.data.me.ExportNotificationLogEntry
 import dev.tracedown.gateway.data.me.ExportNotificationSilence
 import dev.tracedown.gateway.data.me.ExportOrgMembership
 import dev.tracedown.gateway.data.me.ExportProfile
@@ -93,6 +95,7 @@ object UserDataController {
             notificationSilences = exportSilences(userId),
             variables = exportVariables(userId),
             sentInvites = exportSentInvites(userId),
+            notificationLog = exportNotificationLog(user[Users.email]),
         )
     }
 
@@ -403,6 +406,30 @@ object UserDataController {
             ServiceVariables.createdAt, ServiceVariables.updatedAt,
         )
     }
+
+    /**
+     * Notification-delivery history addressed to the subject's email address.
+     *
+     * Matched the same way the purge reaches these rows — case-insensitively on
+     * `recipient` (the purge runs `DELETE FROM notification_log WHERE
+     * lower(recipient) IN (…emails…)`) — so what Art. 15 access discloses is
+     * exactly what Art. 17 erasure deletes. Webhook rows carry a URL in
+     * `recipient`, not an email, so they do not match.
+     */
+    private fun exportNotificationLog(email: String): List<ExportNotificationLogEntry> =
+        NotificationLog.selectAll()
+            .where { NotificationLog.recipient.lowerCase() eq email.lowercase() }
+            .orderBy(NotificationLog.createdAt, SortOrder.DESC)
+            .map { row ->
+                ExportNotificationLogEntry(
+                    organizationId = row[NotificationLog.organizationId].toString(),
+                    channel = row[NotificationLog.channel],
+                    recipient = row[NotificationLog.recipient],
+                    status = row[NotificationLog.status],
+                    error = row[NotificationLog.error],
+                    createdAt = row[NotificationLog.createdAt].toString(),
+                )
+            }
 
     /** Pending invites the user sent. The invite token itself is never exported. */
     private fun exportSentInvites(userId: UUID): List<ExportSentInvite> =
