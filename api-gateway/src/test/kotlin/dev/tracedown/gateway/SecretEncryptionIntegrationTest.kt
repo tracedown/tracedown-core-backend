@@ -45,7 +45,7 @@ class SecretEncryptionIntegrationTest {
     companion object {
         @Container
         @JvmStatic
-        val postgres = PostgreSQLContainer("postgres:16-alpine")
+        val postgres = PostgreSQLContainer("postgres:18-alpine")
             .withDatabaseName("tracedown_secret_enc_test")
             .withUsername("test")
             .withPassword("test")

@@ -53,7 +53,7 @@ class MeRoutesTest {
     companion object {
         @Container
         @JvmStatic
-        val postgres = PostgreSQLContainer("postgres:16-alpine")
+        val postgres = PostgreSQLContainer("postgres:18-alpine")
             .withDatabaseName("tracedown_me_test")
             .withUsername("test")
             .withPassword("test")

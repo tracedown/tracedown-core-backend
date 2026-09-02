@@ -51,7 +51,7 @@ class BodySaveDispatchTest {
 
         @Container
         @JvmStatic
-        val postgres = PostgreSQLContainer("postgres:16-alpine")
+        val postgres = PostgreSQLContainer("postgres:18-alpine")
             .withDatabaseName("tracedown_test")
             .withUsername("test")
             .withPassword("test")

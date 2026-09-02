@@ -28,7 +28,7 @@ services:
   tracedown-postgres:
     # The schema is plain PostgreSQL — no extensions, no hypertables. Matches
     # the deploy stack (docker/deploy/docker-compose.yml).
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: tracedown-postgres
     networks: [tracedown-net]
     # Above the image default of 100. HikariCP fills its pool eagerly, so a
@@ -43,7 +43,8 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
     volumes:
-      - tracedown-pgdata:/var/lib/postgresql/data
+      # PostgreSQL 18 images keep the cluster at /var/lib/postgresql/18/docker, so the volume mounts the parent — not the pre-18 /var/lib/postgresql/data.
+      - tracedown-pgdata:/var/lib/postgresql
     ports:
       - "5555:5432"
     healthcheck:

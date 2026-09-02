@@ -44,7 +44,7 @@ services:
 
   tracedown-postgres:
     # The schema is plain PostgreSQL — no extensions, no hypertables.
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     # Above the image default of 100. Eight JVM services hold pools eagerly, and
     # the scheduler's is derived from its dispatch concurrency because a worker
@@ -55,7 +55,8 @@ services:
       POSTGRES_USER: ${DB_USER:-tracedown}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
     volumes:
-      - tracedown-pgdata:/var/lib/postgresql/data
+      # PostgreSQL 18 images keep the cluster at /var/lib/postgresql/18/docker, so the volume mounts the parent — not the pre-18 /var/lib/postgresql/data.
+      - tracedown-pgdata:/var/lib/postgresql
     networks: [tracedown-net]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-tracedown} -d ${DB_NAME:-tracedown}"]
