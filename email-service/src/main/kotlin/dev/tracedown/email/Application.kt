@@ -61,7 +61,7 @@ fun Application.module() {
     val consumerConn = RedisFactory.createBlockingConnection(config.redisAUrl, config.popTimeoutSeconds)
 
     // Processor + Consumer
-    val processor = EmailProcessor(emailTransport, redis, config.templateDir)
+    val processor = EmailProcessor(emailTransport, redis, config.templateDir, config.branding)
     val consumer = EmailQueueConsumer(consumerConn.sync(), processor, config.popTimeoutSeconds)
     val consumerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     consumer.start(consumerScope)

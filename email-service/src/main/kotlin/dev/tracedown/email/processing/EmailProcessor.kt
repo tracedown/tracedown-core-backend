@@ -45,6 +45,8 @@ open class EmailProcessor(
     private val emailTransport: EmailTransport,
     private val redis: RedisCommands<String, String>?,
     templateDir: String? = null,
+    /** The header band and host small-print every mail carries; see [MailBranding]. */
+    private val branding: MailBranding = MailBranding(),
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -111,7 +113,10 @@ open class EmailProcessor(
                 return
             }
             val vars = envelope["vars"]?.jsonObject ?: JsonObject(emptyMap())
-            htmlBody = renderTemplate(templateHtml, vars)
+            // Branding first, then the sender's variables: the brand rows are our
+            // own markup, the variables are escaped text, and doing it in this
+            // order means a variable value can never be read as a brand key.
+            htmlBody = renderTemplate(applyBranding(templateHtml), vars)
         } else {
             // Body mode: wrap pre-baked content in layout
             val body = envelope["body"]?.jsonPrimitive?.content
@@ -145,6 +150,14 @@ open class EmailProcessor(
     }
 
     /**
+     * Substitutes the brand header and the host footer into a template or the
+     * layout. Both placeholders are always resolved — the footer to an empty
+     * string when there is no small print — so a rendered mail never shows one.
+     */
+    private fun applyBranding(html: String): String =
+        branding.placeholders().entries.fold(html) { acc, (key, value) -> acc.replace("{{$key}}", value) }
+
+    /**
      * Wraps a pre-baked body in the shared layout.
      *
      * The footer explaining *why* the message was received belongs only to mail
@@ -154,7 +167,7 @@ open class EmailProcessor(
      * an empty bordered strip.
      */
     private fun applyLayout(body: String, footer: String?): String {
-        val withContent = layoutHtml.replace("{{content}}", body)
+        val withContent = applyBranding(layoutHtml).replace("{{content}}", body)
         return if (footer.isNullOrBlank()) {
             withContent.replace(FOOTER_BLOCK, "")
         } else {

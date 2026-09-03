@@ -7,6 +7,7 @@ import dev.tracedown.common.email.MailgunConfig
 import dev.tracedown.common.email.ResendConfig
 import dev.tracedown.common.email.SmtpConfig
 import dev.tracedown.common.email.TlsMode
+import dev.tracedown.email.processing.MailBranding
 import io.ktor.server.application.ApplicationEnvironment
 
 /**
@@ -23,6 +24,8 @@ data class EmailServiceConfig(
      * means packaged templates only. See `EmailProcessor`.
      */
     val templateDir: String?,
+    /** The header band and host small-print every mail carries. */
+    val branding: MailBranding = MailBranding(),
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -35,6 +38,11 @@ data class EmailServiceConfig(
                     ?.getString()?.toLong() ?: 5L,
                 templateDir = config.propertyOrNull("emailService.templateDir")
                     ?.getString()?.takeIf { it.isNotBlank() },
+                branding = MailBranding(
+                    logoUrl = config.propertyOrNull("emailService.branding.logoUrl")?.getString()?.takeIf { it.isNotBlank() },
+                    productUrl = config.propertyOrNull("emailService.branding.productUrl")?.getString()?.takeIf { it.isNotBlank() },
+                    footerHtml = config.propertyOrNull("emailService.branding.footerHtml")?.getString()?.takeIf { it.isNotBlank() },
+                ),
             )
         }
 

@@ -190,7 +190,10 @@ class MailTemplateContractTest {
 
     /** The shipped template rendered by hand, independent of the processor. */
     private fun renderPackaged(type: String, vars: Map<String, String>): String =
-        vars.entries.fold(classpathSource(type)!!) { acc, (k, v) -> acc.replace("{{$k}}", v) }
+        // The processor's own order: brand rows first, then the sender's variables.
+        vars.entries.fold(
+            MailBranding().placeholders().entries.fold(classpathSource(type)!!) { acc, (k, v) -> acc.replace("{{$k}}", v) },
+        ) { acc, (k, v) -> acc.replace("{{$k}}", v) }
 
     @Test
     fun `a directory that does not exist falls back to the shipped templates`(@TempDir root: File) {
@@ -283,14 +286,18 @@ class MailTemplateContractTest {
     }
 
     /** Runs [envelopes] through one processor and returns everything it sent. */
-    private fun sendAll(envelopes: List<JsonObject>, templateDir: String?): List<EmailMessage> {
+    private fun sendAll(
+        envelopes: List<JsonObject>,
+        templateDir: String?,
+        branding: MailBranding = MailBranding(),
+    ): List<EmailMessage> {
         val sent = CopyOnWriteArrayList<EmailMessage>()
         val transport = object : EmailTransport {
             override fun send(message: EmailMessage) { sent.add(message) }
             override fun sendBatch(messages: List<EmailMessage>) { sent.addAll(messages) }
             override fun close() {}
         }
-        val processor = RecordingProcessor(transport, templateDir)
+        val processor = RecordingProcessor(transport, templateDir, branding)
         envelopes.forEach { processor.process(it) }
         return sent
     }
@@ -318,8 +325,55 @@ class MailTemplateContractTest {
         javaClass.getResourceAsStream("/email-templates/${type.replace('.', '/')}.html")
             ?.bufferedReader()?.readText()
 
+    /**
+     * The placeholders a *sender* must supply: every `{{key}}` in the template
+     * except the two brand rows, which the processor itself resolves from its
+     * branding configuration (see [MailBranding]).
+     */
     private fun placeholdersIn(html: String): Set<String> =
-        PLACEHOLDER.findAll(html).map { it.groupValues[1] }.toSet()
+        PLACEHOLDER.findAll(html).map { it.groupValues[1] }.toSet() - BRAND_KEYS
+
+    @Test
+    fun `every shipped template carries the brand header and footer rows`() {
+        // Named templates are whole documents, so the chrome cannot come from
+        // the layout — each template has to place the two rows itself, or its
+        // mail goes out unbranded and without the deployment's small print.
+        for (file in shippedTemplates()) {
+            if (file.name == "layout.html") continue
+            val html = file.readText()
+            for (key in BRAND_KEYS) {
+                assertTrue("{{$key}}" in html, "${file.name} does not place {{$key}}")
+            }
+        }
+    }
+
+    @Test
+    fun `the brand rows are resolved in templates and in the layout`() {
+        val branding = MailBranding(
+            logoUrl = "https://example.test/logo.png",
+            productUrl = "https://example.test",
+            footerHtml = "<a href=\"https://example.test/terms\">Terms</a>",
+        )
+        val sent = sendAll(
+            listOf(envelope("system.invite", contract.getValue("system.invite").associateWith { "x" }), bodyEnvelope("hello")),
+            templateDir = null,
+            branding = branding,
+        )
+        assertEquals(2, sent.size)
+        for (html in sent.map { it.htmlBody }) {
+            assertFalse("{{brandHeader}}" in html || "{{brandFooter}}" in html, "brand placeholder left behind")
+            assertTrue("https://example.test/logo.png" in html, "logo not rendered")
+            assertTrue("https://example.test/terms" in html, "host footer not rendered")
+        }
+    }
+
+    @Test
+    fun `no branding configured still resolves both rows`() {
+        val html = render("system.invite", contract.getValue("system.invite").associateWith { "x" })
+        assertFalse("{{brandHeader}}" in html)
+        assertFalse("{{brandFooter}}" in html)
+        assertTrue("Tracedown" in html, "the wordmark header is the default")
+    }
 
     /** Every template packaged in this module, so the purity sweep cannot miss one. */
     private fun shippedTemplates(): List<File> {
@@ -330,13 +384,16 @@ class MailTemplateContractTest {
 
     private companion object {
         val PLACEHOLDER = Regex("\\{\\{([A-Za-z0-9_]+)}}")
+        /** Resolved by the processor, not by any sender. */
+        val BRAND_KEYS = setOf(MailBranding.HEADER_KEY, MailBranding.FOOTER_KEY)
     }
 
     /** The processor with idempotency disabled — there is no Redis in a unit test. */
     private class RecordingProcessor(
         transport: EmailTransport,
         templateDir: String?,
-    ) : EmailProcessor(transport, null, templateDir) {
+        branding: MailBranding = MailBranding(),
+    ) : EmailProcessor(transport, null, templateDir, branding) {
         override fun checkIdempotency(id: String): Boolean = true
     }
 }
