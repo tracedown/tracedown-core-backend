@@ -93,4 +93,17 @@ class BodyStorageClientTest {
             client.delete("s3://someone-elses-bucket/key")
         }
     }
+
+    @Test
+    fun `s3 delete failure propagates instead of reporting not-found`() {
+        // Nothing listens on port 1: the delete fails at connect time. Retention
+        // and purge only catch exceptions before dropping the row that names the
+        // object, so a swallowed failure here orphaned the object in the bucket.
+        val client = BodyStorageClient(s3Config = S3Config("http://127.0.0.1:1", "k", "s"))
+        val e = assertThrows(StorageDeleteException::class.java) {
+            client.delete("s3://bodies/org/svc/res/call_0_response.json")
+        }
+        assertTrue(e.message!!.contains("s3://bodies/org/svc/res/call_0_response.json"))
+        assertTrue(e.cause != null, "the backend failure is kept as the cause")
+    }
 }

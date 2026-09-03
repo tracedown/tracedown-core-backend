@@ -6,12 +6,9 @@ import io.minio.GetPresignedObjectUrlArgs
 import io.minio.MinioClient
 import io.minio.RemoveObjectArgs
 import io.minio.http.Method
-import org.slf4j.LoggerFactory
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-
-private val log = LoggerFactory.getLogger("dev.tracedown.common.storage.BodyStorageClient")
 
 /**
  * Raised when a storage URI points outside the configured backend root/bucket —
@@ -22,6 +19,15 @@ private val log = LoggerFactory.getLogger("dev.tracedown.common.storage.BodyStor
  * [BodyConfinement] also refuses to dereference one.
  */
 class StorageConfinementException(message: String) : SecurityException(message)
+
+/**
+ * Raised when a body could not be removed from its backend. Callers that are
+ * about to drop the database row naming the object (retention, purge) treat
+ * this as "the object is still there" and hand the URI to the deletion retry
+ * table — a failure that is merely logged would leave the object in the bucket
+ * with nothing referencing it, outside both retention and erasure.
+ */
+class StorageDeleteException(message: String, cause: Throwable) : RuntimeException(message, cause)
 
 /**
  * Confines a [BodyStorageClient] to a single backend location. When set, every
@@ -72,7 +78,14 @@ open class BodyStorageClient(
         }
     }
 
-    /** Deletes the body at the given storage URI. Returns true if deleted, false if not found. */
+    /**
+     * Deletes the body at the given storage URI. Returns true if deleted, false
+     * if the object was already gone; a missing object is never an error.
+     *
+     * A delete that *fails* — unreachable store, rejected credentials — throws
+     * [StorageDeleteException] rather than returning false, so a caller cannot
+     * mistake "still in the bucket" for "was not there".
+     */
     open fun delete(uri: String): Boolean {
         return when (val parsed = StorageUri.parse(uri)) {
             is StorageUri.File -> deleteFile(confineFilePath(parsed.path).toString())
@@ -152,18 +165,22 @@ open class BodyStorageClient(
 
     private fun deleteS3(bucket: String, key: String): Boolean {
         val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
-        return try {
+        // S3 DELETE on a missing key succeeds, so the "already gone" case never
+        // reaches the catch. Anything that does is a real failure and must
+        // propagate: this used to log and return false, which the retention and
+        // purge jobs — they only catch exceptions — read as success and went on
+        // to delete the row holding the object's only reference.
+        try {
             client.removeObject(
                 RemoveObjectArgs.builder()
                     .bucket(bucket)
                     .`object`(key)
                     .build()
             )
-            true
         } catch (e: Exception) {
-            log.warn("Failed to delete s3://{}/{}: {}", bucket, key, e.message)
-            false
+            throw StorageDeleteException("failed to delete s3://$bucket/$key: ${e.message}", e)
         }
+        return true
     }
 
     private fun presignS3(bucket: String, key: String): String {
