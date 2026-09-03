@@ -271,11 +271,25 @@ object SecretGuard {
         val stillInsecure = if (insecure.isEmpty()) "" else " Dev defaults in place: ${insecure.joinToString(", ")}."
 
         if (env == PRODUCTION) {
-            // enforcing() already warned about the override; make the consequence explicit.
-            log.error(
-                "SECURITY: {} is running in production with the insecure-default guards DISABLED by {}.{}",
-                service, OVERRIDE_VAR, stillInsecure,
-            )
+            if (overrideSet()) {
+                // enforcing() already warned about the override; make the consequence explicit.
+                log.error(
+                    "SECURITY: {} is running in production with the insecure-default guards DISABLED by {}.{}",
+                    service, OVERRIDE_VAR, stillInsecure,
+                )
+            } else if (insecure.isNotEmpty()) {
+                // Production, guards armed, and yet a dev default is in place: the
+                // caller reported it here instead of through requireSecure, so say
+                // so at the level a violation deserves.
+                log.error("SECURITY: {} is running in production with dev defaults in place: {}.", service, insecure.joinToString(", "))
+            } else {
+                // The ordinary production boot. Services with no secrets of their
+                // own call this directly (metrics, realtime, aggregate-worker), and
+                // before this branch existed they logged the override ERROR above
+                // on every healthy production start — a false alarm in the one log
+                // line operators are told to grep for.
+                log.info("{} running in production — insecure-default startup guards armed.", service)
+            }
             return
         }
 

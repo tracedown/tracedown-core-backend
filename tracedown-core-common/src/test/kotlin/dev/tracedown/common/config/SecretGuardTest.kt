@@ -60,6 +60,29 @@ class SecretGuardTest {
     }
 
     @Test
+    fun `announcing a healthy production boot is not an error`() {
+        // Services with no secrets of their own (metrics, realtime, worker) call
+        // announce directly. In production without the override that is the
+        // ordinary boot and must not log the "guards DISABLED" ERROR — which it
+        // did, on every healthy start, until the override check was added.
+        val logger = org.slf4j.LoggerFactory.getLogger(SecretGuard::class.java) as ch.qos.logback.classic.Logger
+        val appender = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().apply { start() }
+        logger.addAppender(appender)
+        try {
+            SecretGuard.announce("production", "test-service")
+            val errors = appender.list.filter { it.level == ch.qos.logback.classic.Level.ERROR }
+            assertTrue(errors.isEmpty(), "unexpected ERROR: ${errors.map { it.formattedMessage }}")
+            assertTrue(appender.list.any { it.formattedMessage.contains("guards armed") })
+
+            appender.list.clear()
+            SecretGuard.announce("production", "test-service", mapOf("SECRET (default)" to true))
+            assertTrue(appender.list.any { it.level == ch.qos.logback.classic.Level.ERROR && it.formattedMessage.contains("dev defaults in place") })
+        } finally {
+            logger.detachAppender(appender)
+        }
+    }
+
+    @Test
     fun `near-misses for production are recognised as typos`() {
         // These are the values that leave a deployment unguarded while looking
         // to the operator like they armed it.
