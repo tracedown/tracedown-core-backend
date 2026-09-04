@@ -166,6 +166,9 @@ fun Application.module() {
     )
     AuthController.init(trustedDomainMode = appConfig.platform.trustedDomainMode)
     GrafanaIntegrationController.init(appConfig.platform.metricsPublicUrl)
+    dev.tracedown.common.agents.AgentEnrolmentAddress.install(
+        dev.tracedown.common.agents.AgentEnrolmentAddress.fixed(appConfig.platform.publicUrl),
+    )
 
     // Redis A (operational) — lazy init, only connects when first accessed
     val redisA by lazy {

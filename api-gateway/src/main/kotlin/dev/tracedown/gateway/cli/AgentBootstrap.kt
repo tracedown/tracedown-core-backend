@@ -97,6 +97,16 @@ object AgentBootstrap {
             println("  Token: $token")
             println()
             println("Set this as PROBE_AGENT_BOOTSTRAP_TOKEN on the agent.")
+            // The CLI runs before the application (and its seam) is wired, so it reads
+            // the same variable the gateway config does, straight from the environment.
+            val enrolAt = dev.tracedown.common.agents.AgentEnrolmentAddress
+                .fixed(System.getenv("GATEWAY_PUBLIC_URL")).resolve()
+            if (enrolAt != null) {
+                println("Set PROBE_AGENT_SCHEDULER_URL to $enrolAt (GATEWAY_PUBLIC_URL).")
+            } else {
+                println("Set PROBE_AGENT_SCHEDULER_URL to the address the agent reaches this gateway by.")
+                println("(Set GATEWAY_PUBLIC_URL on the gateway to have it printed here.)")
+            }
             println("This token is single-use and will not be shown again.")
         } finally {
             ds.close()

@@ -53,6 +53,8 @@ data class PlatformConfig(
     val allowProfileEdit: Boolean,
     val allowAccountClosure: Boolean,
     val metricsPublicUrl: String,
+    /** Public base URL agents enrol against (`GATEWAY_PUBLIC_URL`); blank when unset. */
+    val publicUrl: String,
     val seed: SeedConfig,
     /**
      * Which addresses a probe may target, as configured (`auto`,
@@ -163,6 +165,7 @@ data class AppConfig(
                     allowProfileEdit = config.property("platform.allowProfileEdit").getString().toBoolean(),
                     allowAccountClosure = config.property("platform.allowAccountClosure").getString().toBoolean(),
                     metricsPublicUrl = config.property("platform.metricsPublicUrl").getString(),
+                    publicUrl = config.property("platform.publicUrl").getString(),
                     seed = SeedConfig(
                         enabled = config.property("platform.seed.enabled").getString().toBoolean(),
                         projectName = config.property("platform.seed.projectName").getString(),

@@ -13,6 +13,7 @@ import dev.tracedown.common.models.AgentCertificates
 import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ProbeAgents
+import dev.tracedown.common.agents.AgentEnrolmentAddress
 import dev.tracedown.common.agents.FleetAudience
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
@@ -68,9 +69,21 @@ data class CreateBootstrapTokenRequest(val slug: String, val label: String? = nu
     }
 }
 
-/** The raw token is shown exactly once — only its hash is stored. */
+/**
+ * The raw token is shown exactly once — only its hash is stored.
+ *
+ * `schedulerUrl` is the base URL the agent must dial with it
+ * (`PROBE_AGENT_SCHEDULER_URL`), from [AgentEnrolmentAddress]; null when the
+ * deployment has not configured one, in which case the dashboard shows a
+ * placeholder rather than an address that is only right on one network.
+ */
 @Serializable
-data class BootstrapTokenResponse(val slug: String, val token: String, val expiresAt: String)
+data class BootstrapTokenResponse(
+    val slug: String,
+    val token: String,
+    val expiresAt: String,
+    val schedulerUrl: String? = null,
+)
 
 /**
  * Partial update — an absent field is left as it is.
@@ -208,7 +221,14 @@ fun Route.agentAdminRoutes() {
             AuditService.log(orgId, principal.userId, "create.agent_bootstrap_token", "agent", slug, entityDisplayName = slug)
         }
 
-        call.respond(BootstrapTokenResponse(slug = slug, token = token, expiresAt = expiresAt.toString()))
+        call.respond(
+            BootstrapTokenResponse(
+                slug = slug,
+                token = token,
+                expiresAt = expiresAt.toString(),
+                schedulerUrl = AgentEnrolmentAddress.resolve(),
+            ),
+        )
     }
 
     /**
