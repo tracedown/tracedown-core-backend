@@ -22,10 +22,9 @@ dependencies {
 
     implementation(libs.logback)
     // Shared logback-base.xml (this module's resources) uses the logstash JSON
-    // encoder and janino-backed <if> conditionals; both must be on every
-    // consuming service's runtime classpath, so they live here.
+    // encoder, which must be on every consuming service's runtime classpath,
+    // so it lives here.
     implementation(libs.logstash.logback.encoder)
-    implementation(libs.janino)
 
     implementation(libs.simple.java.mail)
     implementation(libs.simple.java.mail.batch)

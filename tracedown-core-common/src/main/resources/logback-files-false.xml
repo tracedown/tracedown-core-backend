@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Included by logback-base.xml when LOG_TO_FILE is unset or false: no file sinks. -->
+<included/>

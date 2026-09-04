@@ -6,12 +6,8 @@ flyway = "11.20.3"
 hikari = "6.2.1"
 postgresql = "42.7.13"
 lettuce = "6.5.3.RELEASE"
-# 1.5.37+ stops evaluating <if> in logback-base.xml (the Janino `condition`
-# attribute is deprecated for removal in January 2027); 1.5.36 carries every
-# published CVE fix. Migrate the conditional before moving past it.
-logback = "1.5.36"
+logback = "1.5.38"
 logstash-logback = "8.1"
-janino = "3.1.12"
 koin = "4.0.3"
 kotlinx-serialization = "1.8.0"
 kotlinx-coroutines = "1.10.1"
@@ -61,7 +57,6 @@ lettuce = { module = "io.lettuce:lettuce-core", version.ref = "lettuce" }
 
 logback = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
 logstash-logback-encoder = { module = "net.logstash.logback:logstash-logback-encoder", version.ref = "logstash-logback" }
-janino = { module = "org.codehaus.janino:janino", version.ref = "janino" }
 
 koin-core = { module = "io.insert-koin:koin-core", version.ref = "koin" }
 koin-ktor = { module = "io.insert-koin:koin-ktor", version.ref = "koin" }

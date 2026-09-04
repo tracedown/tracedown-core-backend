@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Included by logback-base.xml when LOG_TO_FILE=true: the rolling file sinks,
+  attached to the root logger the base file already configured. The default
+  deploy is stdout-only so Docker/Railway capture logs and the container stays
+  stateless. Retention/auto-cleanup: maxHistory prunes by age, totalSizeCap by
+  size, and cleanHistoryOnStart sweeps orphans left by a crash on the next boot.
+-->
+<included>
+    <!-- Combined per-service rolling file. -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/${SERVICE_NAME}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/${SERVICE_NAME}.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+            <maxHistory>${LOG_RETENTION_DAYS}</maxHistory>
+            <totalSizeCap>${LOG_MAX_SIZE_MB}MB</totalSizeCap>
+            <cleanHistoryOnStart>true</cleanHistoryOnStart>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service":"${SERVICE_NAME}"}</customFields>
+            <includeMdcKeyName>org</includeMdcKeyName>
+            <includeMdcKeyName>user</includeMdcKeyName>
+            <includeMdcKeyName>ws</includeMdcKeyName>
+            <includeMdcKeyName>proj</includeMdcKeyName>
+            <includeMdcKeyName>svc</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <!-- Per-org rolling files, keyed on the `org` MDC value. -->
+    <appender name="ORG_SIFT" class="ch.qos.logback.classic.sift.SiftingAppender">
+        <discriminator>
+            <key>org</key>
+            <defaultValue>system</defaultValue>
+        </discriminator>
+        <sift>
+            <appender name="ORG-${org}" class="ch.qos.logback.core.rolling.RollingFileAppender">
+                <file>${LOG_DIR}/org/${org}.log</file>
+                <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+                    <fileNamePattern>${LOG_DIR}/org/${org}.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+                    <maxHistory>${LOG_RETENTION_DAYS}</maxHistory>
+                    <totalSizeCap>${LOG_MAX_SIZE_MB}MB</totalSizeCap>
+                    <cleanHistoryOnStart>true</cleanHistoryOnStart>
+                </rollingPolicy>
+                <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                    <customFields>{"service":"${SERVICE_NAME}"}</customFields>
+                    <includeMdcKeyName>user</includeMdcKeyName>
+                    <includeMdcKeyName>ws</includeMdcKeyName>
+                    <includeMdcKeyName>proj</includeMdcKeyName>
+                    <includeMdcKeyName>svc</includeMdcKeyName>
+                </encoder>
+            </appender>
+        </sift>
+    </appender>
+
+    <root>
+    <appender-ref ref="FILE"/>
+    <appender-ref ref="ORG_SIFT"/>
+    </root>
+</included>

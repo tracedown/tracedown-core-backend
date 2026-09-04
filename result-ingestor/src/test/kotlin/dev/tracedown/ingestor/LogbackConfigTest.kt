@@ -22,8 +22,8 @@ import kotlin.test.assertTrue
  * Loads the real service logback.xml (which `<include>`s the shared
  * logback-base.xml from tracedown-core-common) on this module's classpath and
  * asserts it parses without error and honours the org MDC — this is what
- * guards the janino `<if>`, the per-org SiftingAppender, and the retention
- * config, none of which the Kotlin compiler can check.
+ * guards the LOG_TO_FILE-selected include, the per-org SiftingAppender, and
+ * the retention config, none of which the Kotlin compiler can check.
  */
 class LogbackConfigTest {
 
