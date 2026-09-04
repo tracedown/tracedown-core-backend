@@ -1,6 +1,6 @@
 # Build from tracedown/ root:
 #   docker build -f core/tracedown-core-backend/probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent .
-FROM python:3.12-slim
+FROM python:3.13-slim
 COPY core/tracedown-probe-agent /opt/agent
 COPY lace/lacelang-python-validator /opt/lace-validator
 COPY lace/lacelang-python-executor /opt/lace-executor
