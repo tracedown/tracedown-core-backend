@@ -169,6 +169,21 @@ class AgentRegistrationTest {
         assertTrue(json["certificatePem"]!!.jsonPrimitive.content.contains("BEGIN CERTIFICATE"))
         assertTrue(json["caRootPem"]!!.jsonPrimitive.content.contains("BEGIN CERTIFICATE"))
 
+        // RFC 5280 key identifiers and CA key usage: OpenSSL's X509_STRICT
+        // (Python 3.13's default) refuses the chain without them.
+        val leaf = parseCert(json["certificatePem"]!!.jsonPrimitive.content)
+        val root = parseCert(json["caRootPem"]!!.jsonPrimitive.content)
+        assertNotNull(leaf.getExtensionValue("2.5.29.14"), "leaf carries a Subject Key Identifier")
+        assertNotNull(leaf.getExtensionValue("2.5.29.35"), "leaf carries an Authority Key Identifier")
+        assertNotNull(root.getExtensionValue("2.5.29.14"), "root carries a Subject Key Identifier")
+        assertNotNull(root.getExtensionValue("2.5.29.35"), "root carries an Authority Key Identifier")
+        assertTrue(root.keyUsage[5], "root keyUsage has keyCertSign")
+        // The leaf's AKID names the root's SKID: that is what links the chain.
+        assertTrue(
+            leaf.getExtensionValue("2.5.29.35").toList().containsAll(root.getExtensionValue("2.5.29.14").drop(4).toList()),
+            "leaf AKID key id matches root SKID",
+        )
+
         // Verify DB state
         transaction {
             val agent = ProbeAgents.selectAll()
@@ -351,6 +366,9 @@ class AgentRegistrationTest {
     }
 
     // ── Helpers ──
+
+    private fun parseCert(pem: String): X509Certificate =
+        CertificateFactory.getInstance("X.509").generateCertificate(pem.byteInputStream()) as X509Certificate
 
     private fun post(path: String, body: String, bearer: String? = null): HttpResponse<String> {
         val request = HttpRequest.newBuilder()

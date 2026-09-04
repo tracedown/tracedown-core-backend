@@ -9,6 +9,7 @@ import org.bouncycastle.asn1.x509.GeneralNames
 import org.bouncycastle.asn1.x509.KeyPurposeId
 import org.bouncycastle.asn1.x509.KeyUsage
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
@@ -117,6 +118,12 @@ class SchedulerCertService(private val aesKeyHex: String) {
                 false,
                 GeneralNames(GeneralName(GeneralName.dNSName, SCHEDULER_IDENTITY)),
             )
+            // RFC 5280 key identifiers, as the gateway's CaService issues them:
+            // agents verify this certificate with OpenSSL, and Python 3.13's
+            // default context enforces the RFC (X509_STRICT).
+            val ext = JcaX509ExtensionUtils()
+            addExtension(Extension.subjectKeyIdentifier, false, ext.createSubjectKeyIdentifier(keyPair.public))
+            addExtension(Extension.authorityKeyIdentifier, false, ext.createAuthorityKeyIdentifier(caCert.publicKey))
         }.build(JcaContentSignerBuilder("SHA256withRSA").build(caPrivateKey))
 
         this.certificate = JcaX509CertificateConverter()

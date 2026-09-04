@@ -11,6 +11,7 @@ import org.bouncycastle.asn1.x509.KeyPurposeId
 import org.bouncycastle.asn1.x509.KeyUsage
 import org.bouncycastle.cert.X509v3CertificateBuilder
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.openssl.PEMParser
@@ -124,6 +125,19 @@ object CaService {
             keyPair.public,
         ).apply {
             addExtension(Extension.basicConstraints, true, BasicConstraints(true))
+            // RFC 5280: a CA certificate carries keyUsage (keyCertSign,
+            // §4.2.1.3) and a Subject Key Identifier (§4.2.1.2), and every
+            // certificate it issues names that identifier in its Authority Key
+            // Identifier. Verifiers that enforce the RFC — OpenSSL's
+            // X509_STRICT, on by default in Python 3.13's
+            // ssl.create_default_context() — refuse a chain missing any of
+            // the three. Roots minted before this lack keyUsage and SKID; the
+            // agent relaxes strict verification for its private CA, and
+            // rotateCa() mints a compliant root.
+            addExtension(Extension.keyUsage, true, KeyUsage(KeyUsage.keyCertSign or KeyUsage.cRLSign))
+            val ext = JcaX509ExtensionUtils()
+            addExtension(Extension.subjectKeyIdentifier, false, ext.createSubjectKeyIdentifier(keyPair.public))
+            addExtension(Extension.authorityKeyIdentifier, false, ext.createAuthorityKeyIdentifier(keyPair.public))
         }.build(JcaContentSignerBuilder("SHA256withRSA").build(keyPair.private))
 
         val certPem = holderToPem(certHolder)
@@ -245,6 +259,11 @@ object CaService {
                 ExtendedKeyUsage(KeyPurposeId.id_kp_serverAuth),
             )
             addExtension(Extension.subjectAlternativeName, false, sanDns)
+            // Key identifiers: see createCa(). The AKID is the CA's key id, so it
+            // links to the root whether or not that root was minted with a SKID.
+            val ext = JcaX509ExtensionUtils()
+            addExtension(Extension.subjectKeyIdentifier, false, ext.createSubjectKeyIdentifier(csrPublicKey))
+            addExtension(Extension.authorityKeyIdentifier, false, ext.createAuthorityKeyIdentifier(caCert.publicKey))
         }.build(JcaContentSignerBuilder("SHA256withRSA").build(caPrivateKey))
 
         val agentCertPem = holderToPem(certHolder)
