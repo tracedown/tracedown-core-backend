@@ -50,6 +50,8 @@ object ErrorCodes {
     const val NOT_FOUND = "not_found"
     const val ALREADY_EXISTS = "already_exists"
     const val VERSION_CONFLICT = "version_conflict"
+    /** A bootstrap token was requested for a slug an agent is already registered under. */
+    const val AGENT_SLUG_TAKEN = "agent_slug_taken"
 
     // ── Variables ──
     /** The resource already holds as many variables as the operator allows. */

@@ -6,7 +6,13 @@ import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.AgentBootstrapTokens
 import dev.tracedown.common.models.AgentCertificates
 import dev.tracedown.common.models.CaRoot
+import dev.tracedown.common.models.OrgUsers
+import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.ProbeAgents
+import dev.tracedown.common.models.SessionStatus
+import dev.tracedown.common.models.Sessions
+import dev.tracedown.common.models.Users
+import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.gateway.controllers.agents.CaService
 import io.ktor.server.config.HoconApplicationConfig
 import io.ktor.server.engine.embeddedServer
@@ -321,15 +327,85 @@ class AgentRegistrationTest {
         assertEquals(400, post("/internal/agents/register", loopBody).statusCode())
     }
 
+    /**
+     * The dashboard issued a token for a slug that was already an agent, and
+     * registration then refused it — a token that could never be redeemed. The
+     * refusal belongs where the name is chosen. `test-agent-1` is the agent
+     * registered in order 2.
+     */
+    @Test
+    @Order(9)
+    fun `a bootstrap token for a registered slug is refused, a fresh slug is issued one`() {
+        val session = newOwnerSession()
+
+        val taken = post("/api/v1/agents/bootstrap-token", """{"slug":"test-agent-1"}""", bearer = session)
+        assertEquals(409, taken.statusCode(), "A registered slug must be refused. Body: ${taken.body()}")
+        assertTrue(taken.body().contains("agent_slug_taken"), taken.body())
+
+        val fresh = post("/api/v1/agents/bootstrap-token", """{"slug":"brand-new-agent"}""", bearer = session)
+        assertEquals(200, fresh.statusCode(), "A new slug must be issued a token. Body: ${fresh.body()}")
+        val json = Json.parseToJsonElement(fresh.body()).jsonObject
+        assertEquals("brand-new-agent", json["slug"]!!.jsonPrimitive.content)
+        // Nothing configured in the test environment: an honest null, not a guess.
+        assertTrue(json["schedulerUrl"] == null || json["schedulerUrl"] is kotlinx.serialization.json.JsonNull, fresh.body())
+    }
+
     // ── Helpers ──
 
-    private fun post(path: String, body: String): HttpResponse<String> {
+    private fun post(path: String, body: String, bearer: String? = null): HttpResponse<String> {
         val request = HttpRequest.newBuilder()
             .uri(URI.create("http://localhost:$serverPort$path"))
             .header("Content-Type", "application/json")
+            .apply { if (bearer != null) header("Authorization", "Bearer $bearer") }
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .build()
         return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+    }
+
+    /** An org owner with an active session scoped to that org; returns the bearer token. */
+    private fun newOwnerSession(): String {
+        val userId = UUID.randomUUID()
+        val orgId = UUID.randomUUID()
+        val token = "tok-${UUID.randomUUID()}"
+        transaction {
+            Users.insert {
+                it[id] = userId
+                it[email] = "owner-$userId@t.dev"
+                it[passwordHash] = "x"
+                it[displayName] = "owner"
+                it[isActive] = true
+                it[deleted] = false
+                it[createdAt] = Instant.now()
+            }
+            Organizations.insert {
+                it[id] = orgId
+                it[name] = "Org ${orgId.toString().take(6)}"
+                it[ownerId] = userId
+                it[deleted] = false
+                it[createdAt] = Instant.now()
+            }
+            OrgUsers.insert {
+                it[id] = UUID.randomUUID()
+                it[organizationId] = orgId
+                it[OrgUsers.userId] = userId
+                it[status] = "active"
+                it[isActive] = true
+                it[deleted] = false
+                it[inviteToken] = ""
+            }
+            Sessions.insert {
+                it[id] = UUID.randomUUID()
+                it[Sessions.userId] = userId
+                it[organizationId] = orgId
+                it[sessionTokenHash] = TokenHasher.sha256Hex(token)
+                it[status] = SessionStatus.ACTIVE
+                it[expiresAt] = Instant.now().plusSeconds(3600)
+                it[lastActiveAt] = Instant.now()
+                it[revoked] = false
+                it[createdAt] = Instant.now()
+            }
+        }
+        return token
     }
 
     /** Inserts a fresh single-use bootstrap token for [slug] and returns the raw value. */

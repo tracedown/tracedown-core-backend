@@ -21,6 +21,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
 import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
@@ -197,6 +198,12 @@ fun Route.agentAdminRoutes() {
             ),
         ) {
             requireOrgWrite(orgId, principal.userId) { it.settings }
+            // Registration refuses a slug that is already an agent, so a token
+            // for one can never be redeemed — refuse it here, where the person
+            // asking can still pick another name. Deleted agents do not hold
+            // their slug (it is renamed to free it), so any row counts.
+            val taken = ProbeAgents.selectAll().where { ProbeAgents.slug eq slug }.empty().not()
+            if (taken) throw ConflictException(ErrorCodes.AGENT_SLUG_TAKEN)
             // The signing CA is created lazily on the very first bootstrap.
             CaService.ensureCaRoot()
             // A fresh token supersedes any outstanding one for the slug — the
