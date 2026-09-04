@@ -1,26 +1,28 @@
 [versions]
 kotlin = "2.3.0"
-ktor = "3.4.3"
+ktor = "3.5.2"
 exposed = "0.58.0"
 flyway = "11.20.3"
 hikari = "6.2.1"
 postgresql = "42.7.13"
 lettuce = "6.5.3.RELEASE"
-logback = "1.5.15"
-logstash-logback = "8.0"
+logback = "1.5.38"
+logstash-logback = "8.1"
 janino = "3.1.12"
 koin = "4.0.3"
 kotlinx-serialization = "1.8.0"
 kotlinx-coroutines = "1.10.1"
 quartz = "2.5.0"
-bouncycastle = "1.79"
+# bcprov ships point releases on its own; bcpkix stays on the base release it was built against.
+bouncycastle-prov = "1.85.2"
+bouncycastle-pkix = "1.85"
 lib-recur = "0.16.0"
 bcrypt = "0.10.2"
 java-jwt = "4.4.0"
 java-otp = "0.4.0"
 simple-java-mail = "8.12.5"
 okhttp = "4.12.0"
-minio = "8.5.17"
+minio = "8.6.0"
 
 [libraries]
 ktor-server-core = { module = "io.ktor:ktor-server-core", version.ref = "ktor" }
@@ -67,8 +69,8 @@ kotlinx-coroutines-reactive = { module = "org.jetbrains.kotlinx:kotlinx-coroutin
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
 
 quartz = { module = "org.quartz-scheduler:quartz", version.ref = "quartz" }
-bouncycastle-pkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "bouncycastle" }
-bouncycastle-prov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
+bouncycastle-pkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "bouncycastle-pkix" }
+bouncycastle-prov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle-prov" }
 lib-recur = { module = "org.dmfs:lib-recur", version.ref = "lib-recur" }
 bcrypt = { module = "at.favre.lib:bcrypt", version.ref = "bcrypt" }
 java-jwt = { module = "com.auth0:java-jwt", version.ref = "java-jwt" }

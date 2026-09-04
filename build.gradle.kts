@@ -6,7 +6,7 @@ plugins {
 allprojects {
     group = "dev.tracedown"
 
-    version = "0.4.4"
+    version = "0.4.5"
 
     repositories {
         mavenCentral()
@@ -19,7 +19,19 @@ allprojects {
     // fully cacheable.
     buildscript {
         configurations.all {
-            resolutionStrategy.force("org.apache.commons:commons-lang3:3.18.0")
+            resolutionStrategy.force("org.apache.commons:commons-lang3:3.20.0")
+        }
+    }
+
+    // Ktor 3.5.2 ships Netty 4.2.16, which still carries one advisory on
+    // netty-codec-http (CVE-2026-59903); 4.2.17 is clean on every module. The
+    // same 4.2 line, so it is a drop-in until Ktor moves past it — then delete.
+    configurations.all {
+        resolutionStrategy.eachDependency {
+            if (requested.group == "io.netty" && requested.name.startsWith("netty-")) {
+                useVersion("4.2.17.Final")
+                because("CVE-2026-50010 and siblings; Ktor 3.5.2 pins 4.2.16")
+            }
         }
     }
 }
