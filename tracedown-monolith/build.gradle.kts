@@ -1,3 +1,4 @@
+import org.gradle.kotlin.dsl.support.serviceOf
 import java.net.HttpURLConnection
 import java.net.URI
 
@@ -106,6 +107,11 @@ val writeFlywayManifest = tasks.register("writeFlywayManifest") {
 val fetchFrontend = tasks.register("fetchFrontend") {
     val requested = providers.gradleProperty("monolithFrontend")
     val outDir = generatedResources
+    // Captured at configuration time: Task.project (and therefore project.copy /
+    // project.tarTree / project.resources) is unavailable at execution time under
+    // the configuration cache, which Gradle 10 makes mandatory.
+    val fsOps = serviceOf<FileSystemOperations>()
+    val archiveOps = serviceOf<ArchiveOperations>()
     outputs.upToDateWhen { false }
     doLast {
         val value = requested.orNull ?: return@doLast
@@ -133,8 +139,8 @@ val fetchFrontend = tasks.register("fetchFrontend") {
         }
         val target = outDir.get().dir("frontend").asFile
         target.deleteRecursively()
-        copy {
-            from(tarTree(resources.gzip(archive)))
+        fsOps.copy {
+            from(archiveOps.tarTree(archiveOps.gzip(archive)))
             into(target)
         }
         logger.lifecycle("Frontend bundle unpacked into the monolith resources.")

@@ -55,9 +55,9 @@ dependencies {
     testImplementation(libs.flyway.core)
     testImplementation(libs.flyway.postgresql)
     testImplementation(libs.bcrypt)
-    testImplementation("org.testcontainers:testcontainers:1.20.4")
-    testImplementation("org.testcontainers:junit-jupiter:1.20.4")
-    testImplementation("org.testcontainers:postgresql:1.20.4")
+    testImplementation(libs.testcontainers)
+    testImplementation(libs.testcontainers.junit.jupiter)
+    testImplementation(libs.testcontainers.postgresql)
 }
 
 // Include all service module migrations for test DB setup

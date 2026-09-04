@@ -31,7 +31,7 @@ jobs:
       deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -72,24 +72,24 @@ jobs:
       # Gradle build itself needs none of this (Lace resolves from Maven
       # Central); it is purely the test container's build context.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: core/tracedown-core-backend
 
       - name: Checkout probe agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: tracedown/tracedown-probe-agent
           path: core/tracedown-probe-agent
 
       - name: Checkout Lace Python validator
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: tracedown/lacelang-python-validator
           path: lace/lacelang-python-validator
 
       - name: Checkout Lace Python executor
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: tracedown/lacelang-python-executor
           path: lace/lacelang-python-executor
@@ -98,13 +98,13 @@ jobs:
         run: docker build -f core/tracedown-core-backend/probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent .
 
       - name: Setup JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       # Compiles every module and runs unit + integration tests. The
       # Testcontainers-based tests use the runner's Docker daemon.
@@ -122,7 +122,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Dev stack
         run: |

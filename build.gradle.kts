@@ -6,7 +6,7 @@ plugins {
 allprojects {
     group = "dev.tracedown"
 
-    version = "0.4.5"
+    version = "0.4.6"
 
     repositories {
         mavenCentral()
@@ -68,11 +68,15 @@ subprojects {
             // way, and a dropped entry fails silently ("No migrations found").
             val mergeServiceFiles = tasks.register("mergeServiceFiles") {
                 val out = project.layout.buildDirectory.dir("merged-service-files")
-                inputs.files(project.configurations.getByName("runtimeClasspath"))
+                // Resolved lazily but referenced through a captured FileCollection:
+                // Task.project is unavailable at execution time under the
+                // configuration cache (Gradle 10 makes it an error).
+                val runtimeClasspath = project.configurations.getByName("runtimeClasspath")
+                inputs.files(runtimeClasspath)
                 outputs.dir(out)
                 doLast {
                     val merged = linkedMapOf<String, MutableList<String>>()
-                    project.configurations.getByName("runtimeClasspath").files
+                    runtimeClasspath.files
                         .filter { it.isFile && it.name.endsWith(".jar") }
                         .forEach { jar ->
                             java.util.zip.ZipFile(jar).use { zf ->

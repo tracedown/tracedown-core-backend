@@ -21,7 +21,7 @@ jobs:
       && !contains(github.event.pull_request.labels.*.name, 'no-release')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The base commit has to be readable to compare against.
           fetch-depth: 0

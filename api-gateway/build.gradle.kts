@@ -58,25 +58,16 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.ktor.server.test.host)
 
-    testImplementation("dev.lacelang:kotlin-lacetest:0.1.2")
-    // Pinned forward past what the harness asks for. kotlin-lacetest 0.1.2 —
-    // the latest published — still declares executor 0.1.3, which predates the
-    // spec's assert-only helpers `count(x)` and `includes(search, x)` (S8.1).
-    // The validator above is new enough to PARSE them, so without this pin a
-    // script using either one compiles, runs, and quietly evaluates the
-    // condition to null: a passing-looking assertion that tests nothing.
-    // Remove once a kotlin-lacetest release carries the bump (it is fixed in
-    // that repo's source, unpublished as of this pin).
-    testImplementation("dev.lacelang:lacelang-kotlin-executor:0.1.6")
+    testImplementation("dev.lacelang:kotlin-lacetest:0.1.3")
 
     testImplementation(libs.flyway.core)
     testImplementation(libs.flyway.postgresql)
 
-    testImplementation("org.testcontainers:testcontainers:1.20.4")
-    testImplementation("org.testcontainers:junit-jupiter:1.20.4")
-    testImplementation("org.testcontainers:postgresql:1.20.4")
+    testImplementation(libs.testcontainers)
+    testImplementation(libs.testcontainers.junit.jupiter)
+    testImplementation(libs.testcontainers.postgresql)
 
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation(libs.okhttp)
 }
 
 tasks.processTestResources {
