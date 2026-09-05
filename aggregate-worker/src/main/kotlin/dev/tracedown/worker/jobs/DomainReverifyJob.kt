@@ -1,12 +1,11 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.domain.DomainVerifier
 import dev.tracedown.common.models.OrgDomains
-import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import java.time.Instant
@@ -33,7 +32,7 @@ class DomainReverifyJob(
             return
         }
 
-        val domains = newSuspendedTransaction(Dispatchers.IO) {
+        val domains = ioTransaction {
             OrgDomains.selectAll()
                 .where { (OrgDomains.status eq "verified") and (OrgDomains.deleted eq false) }
                 .map { Triple(it[OrgDomains.id], it[OrgDomains.domain], it[OrgDomains.challenge] to it[OrgDomains.verificationType]) }
@@ -50,7 +49,7 @@ class DomainReverifyJob(
                 continue // transient errors must not lapse a domain
             }
 
-            newSuspendedTransaction(Dispatchers.IO) {
+            ioTransaction {
                 val wasLapsed = OrgDomains.selectAll()
                     .where { OrgDomains.id eq id }
                     .firstOrNull()?.get(OrgDomains.lapsed) ?: false

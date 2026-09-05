@@ -1,5 +1,6 @@
 package dev.tracedown.notifications.processing
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ProbeResults
@@ -11,13 +12,11 @@ import dev.tracedown.notifications.recipients.RecipientCooldown
 import dev.tracedown.notifications.recipients.RecipientResolver
 import dev.tracedown.notifications.templates.NotificationBuilder
 import dev.tracedown.notifications.templates.RenderedNotification
-import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.util.UUID
 
@@ -65,7 +64,7 @@ class NotificationProcessor(
         val orgId = UUID.fromString(payload["organizationId"]?.jsonPrimitive?.content ?: return)
 
         // Load raw result and context
-        val context = newSuspendedTransaction(Dispatchers.IO) {
+        val context = ioTransaction {
             loadContext(resultId, serviceId, projectId, workspaceId)
         } ?: run {
             log.warn("could not load context for result {}", resultId)
@@ -136,7 +135,7 @@ class NotificationProcessor(
         // Re-processing guard: anyone already logged for this probe result was
         // dispatched to on an earlier pass that failed on the other channel.
         // They are not mailed twice.
-        val alreadyEmailed = newSuspendedTransaction(Dispatchers.IO) {
+        val alreadyEmailed = ioTransaction {
             loggedRecipients(resultId, EMAIL_CHANNEL)
         }
         val toEmail = eligible.filterNot { it.email in alreadyEmailed }

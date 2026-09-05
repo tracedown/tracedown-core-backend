@@ -1,5 +1,6 @@
 package dev.tracedown.notifications.delivery
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.ResourceWebhookAccess
@@ -31,7 +32,6 @@ import org.jetbrains.exposed.v1.core.or
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import java.io.IOException
@@ -184,7 +184,7 @@ class WebhookDeliveryService(
         probeResultId: UUID,
         vars: Map<String, String>,
     ) {
-        val (webhooks, alreadyLogged) = newSuspendedTransaction(Dispatchers.IO) {
+        val (webhooks, alreadyLogged) = ioTransaction {
             findBoundWebhooks(orgId, workspaceId, projectId, serviceId) to
                 loggedRecipients(probeResultId, CHANNEL)
         }
@@ -218,7 +218,7 @@ class WebhookDeliveryService(
             .flatMap { webhook -> webhook.referencedKeys(ORG_VAR_RE) }
             .toSet()
         val orgVars = if (referencedKeys.isNotEmpty()) {
-            newSuspendedTransaction(Dispatchers.IO) { loadOrgVars(orgId, referencedKeys) }
+            ioTransaction { loadOrgVars(orgId, referencedKeys) }
         } else {
             emptyMap()
         }
@@ -229,7 +229,7 @@ class WebhookDeliveryService(
             // copied to another webhook's row will not decrypt).
             val hookKeys = webhook.referencedKeys(WEBHOOK_VAR_RE)
             val hookVars = if (hookKeys.isNotEmpty()) {
-                newSuspendedTransaction(Dispatchers.IO) { loadWebhookVars(orgId, webhook.webhookId, hookKeys) }
+                ioTransaction { loadWebhookVars(orgId, webhook.webhookId, hookKeys) }
             } else {
                 emptyMap()
             }
@@ -244,7 +244,7 @@ class WebhookDeliveryService(
             // picked up (and before this method can be re-entered for the same
             // probe result).
             val logId = UUID.randomUUID()
-            newSuspendedTransaction(Dispatchers.IO) {
+            ioTransaction {
                 NotificationLog.insert {
                     it[id] = logId
                     it[NotificationLog.organizationId] = orgId
@@ -323,7 +323,7 @@ class WebhookDeliveryService(
 
     /** Transitions the `queued` log row to its final state. */
     private suspend fun recordOutcome(logId: UUID, outcome: DeliveryOutcome) {
-        newSuspendedTransaction(Dispatchers.IO) {
+        ioTransaction {
             NotificationLog.update({ NotificationLog.id eq logId }) {
                 it[NotificationLog.status] = outcome.status
                 it[NotificationLog.error] = outcome.error

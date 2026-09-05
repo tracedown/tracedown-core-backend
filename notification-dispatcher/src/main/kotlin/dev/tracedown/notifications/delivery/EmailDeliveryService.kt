@@ -1,12 +1,11 @@
 package dev.tracedown.notifications.delivery
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.notifications.recipients.Recipient
 import dev.tracedown.notifications.templates.TemplateRenderer
-import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.jdbc.insert
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.UUID
@@ -57,7 +56,7 @@ class EmailDeliveryService(private val emailPublisher: EmailPublisher) {
             // Log before publishing so the email-service's status event
             // (consumed by EmailStatusConsumer) can never race the insert.
             val logId = UUID.randomUUID()
-            newSuspendedTransaction(Dispatchers.IO) {
+            ioTransaction {
                 NotificationLog.insert {
                     it[id] = logId
                     it[NotificationLog.organizationId] = orgId

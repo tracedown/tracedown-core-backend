@@ -1,9 +1,9 @@
 package dev.tracedown.metrics.scrape
 
+import dev.tracedown.common.config.ioTransaction
 import io.lettuce.core.api.sync.RedisCommands
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import java.util.UUID
 
 /**
@@ -69,7 +69,7 @@ class MetricsReader(
      */
     suspend fun readAggregates(serviceIds: List<UUID>): Map<UUID, ServiceAggregate> {
         if (serviceIds.isEmpty()) return emptyMap()
-        return newSuspendedTransaction(Dispatchers.IO) {
+        return ioTransaction {
             val conn = this.connection.connection as java.sql.Connection
             val idArray = conn.createArrayOf("uuid", serviceIds.map { it.toString() }.toTypedArray())
             val out = HashMap<UUID, ServiceAggregate>()

@@ -1,8 +1,7 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.onboarding.AccountLifecycle
-import kotlinx.coroutines.Dispatchers
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.ExpiredInviteSweepJob")
@@ -26,7 +25,7 @@ class ExpiredInviteSweepJob(
     override val name = "ExpiredInviteSweepJob"
 
     override suspend fun execute() {
-        val swept = newSuspendedTransaction(Dispatchers.IO) {
+        val swept = ioTransaction {
             AccountLifecycle.sweepExpiredInvites()
         }
         if (swept > 0) {

@@ -1,6 +1,7 @@
 package dev.tracedown.worker.jobs
 
 import dev.tracedown.common.config.PlatformDefaults
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.storage.BodyStorageClient
@@ -8,10 +9,8 @@ import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.core.less
-import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.select
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
@@ -58,7 +57,7 @@ class RetentionJob(
         // used to select every column of every expired row, raw payloads
         // included, and deduplicate them in the JVM.
         val cutoffScan = tickStart.minus(1, ChronoUnit.DAYS)
-        val orgIds = newSuspendedTransaction(Dispatchers.IO) {
+        val orgIds = ioTransaction {
             ProbeResults.select(ProbeResults.organizationId)
                 .where { ProbeResults.startedAt less cutoffScan }
                 .withDistinct()
@@ -118,7 +117,7 @@ class RetentionJob(
             // One bounded page of ids. `LIMIT` is what keeps this off the heap:
             // the page is the same size whether the org has a thousand expired
             // results or ten million.
-            val resultIds = newSuspendedTransaction(Dispatchers.IO) {
+            val resultIds = ioTransaction {
                 ProbeResults.select(ProbeResults.id)
                     .where { (ProbeResults.organizationId eq orgId) and (ProbeResults.startedAt less cutoff) }
                     .limit(batchSize)
@@ -129,7 +128,7 @@ class RetentionJob(
 
             // Body URIs for exactly this page, projected on their own — the old
             // query read whole step rows to reach one nullable column.
-            val bodyUris = newSuspendedTransaction(Dispatchers.IO) {
+            val bodyUris = ioTransaction {
                 ProbeSteps.select(ProbeSteps.responseBodyStorageUrl)
                     .where { ProbeSteps.probeResultId inList resultIds }
                     .mapNotNull { it[ProbeSteps.responseBodyStorageUrl] }
@@ -154,13 +153,13 @@ class RetentionJob(
             // so an unreferenced one is outside retention and erasure for good.
             // Record the URI instead; BodyDeletionRetryJob finishes the job.
             if (failed.isNotEmpty()) {
-                newSuspendedTransaction(Dispatchers.IO) {
+                ioTransaction {
                     failed.forEach { (uri, error) -> PendingBodyDeletion.record(listOf(uri), error) }
                 }
             }
 
             // Leaf-first: steps, then results.
-            val removed = newSuspendedTransaction(Dispatchers.IO) {
+            val removed = ioTransaction {
                 ProbeSteps.deleteWhere { probeResultId inList resultIds }
                 ProbeResults.deleteWhere { id inList resultIds }
             }

@@ -1,12 +1,11 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.PendingBodyDeletions
 import dev.tracedown.common.storage.BodyStorageClient
-import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.BodyDeletionRetryJob")
@@ -43,7 +42,7 @@ class BodyDeletionRetryJob(
     override val name = "BodyDeletionRetryJob"
 
     override suspend fun execute() {
-        val pending = newSuspendedTransaction(Dispatchers.IO) {
+        val pending = ioTransaction {
             PendingBodyDeletions
                 .select(PendingBodyDeletions.storageUrl, PendingBodyDeletions.attempts)
                 .orderBy(PendingBodyDeletions.lastAttemptAt, SortOrder.ASC)
@@ -73,7 +72,7 @@ class BodyDeletionRetryJob(
             }
         }
 
-        newSuspendedTransaction(Dispatchers.IO) {
+        ioTransaction {
             PendingBodyDeletion.clear(settled)
             stillFailing.forEach { (uri, error) -> PendingBodyDeletion.record(listOf(uri), error) }
         }
