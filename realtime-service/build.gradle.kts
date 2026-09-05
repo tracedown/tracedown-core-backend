@@ -38,6 +38,15 @@ dependencies {
     implementation(libs.logstash.logback.encoder)
 
     // Test
+    // JUnit Platform 6. The BOM is what actually moves the engine: both
+    // kotlin-test-junit5 and testcontainers-junit-jupiter still ask for
+    // Jupiter 5.x transitively, and the BOM lifts every junit artifact onto
+    // one version. Gradle no longer injects the platform launcher into the
+    // test runtime, so it is declared here rather than inherited.
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
 }
