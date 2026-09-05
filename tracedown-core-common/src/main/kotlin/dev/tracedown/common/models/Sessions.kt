@@ -1,7 +1,8 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 /** Session lifecycle values for [Sessions.status]. */
 object SessionStatus {
@@ -12,9 +13,9 @@ object SessionStatus {
 }
 
 object Sessions : Table("sessions") {
-    val id = uuid("id")
-    val userId = uuid("user_id").references(Users.id)
-    val organizationId = uuid("organization_id").references(Organizations.id).nullable()
+    val id = javaUUID("id")
+    val userId = javaUUID("user_id").references(Users.id)
+    val organizationId = javaUUID("organization_id").references(Organizations.id).nullable()
     // SHA-256 digest of the bearer token — never the raw token (see TokenHasher).
     // Tokenless until 'active' — see SessionStatus and the migration comment.
     val sessionTokenHash = varchar("session_token_hash", 255).nullable()

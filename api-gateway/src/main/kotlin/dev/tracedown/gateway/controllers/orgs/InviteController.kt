@@ -40,13 +40,13 @@ import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.TooManyRequestsException
 import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.validatePassword
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import java.security.SecureRandom
 import java.time.Instant
@@ -511,7 +511,7 @@ object InviteController {
         }
     }
 
-    private fun findValidInvite(token: String): org.jetbrains.exposed.sql.ResultRow {
+    private fun findValidInvite(token: String): org.jetbrains.exposed.v1.core.ResultRow {
         if (token.isBlank()) throw UnauthorizedException(ErrorCodes.INVALID_INVITE_TOKEN)
 
         val invite = OrgUsers.selectAll()

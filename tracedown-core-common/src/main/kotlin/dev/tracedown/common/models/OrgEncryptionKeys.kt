@@ -1,7 +1,8 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 /**
  * Per-organization data-encryption keys (DEKs) for envelope encryption of
@@ -13,7 +14,7 @@ import org.jetbrains.exposed.sql.javatime.timestamp
  * organization becomes permanently undecryptable.
  */
 object OrgEncryptionKeys : Table("org_encryption_keys") {
-    val orgId = uuid("org_id").references(Organizations.id)
+    val orgId = javaUUID("org_id").references(Organizations.id)
     val wrappedDek = text("wrapped_dek")
     val keyVersion = integer("key_version").default(1)
     val createdAt = timestamp("created_at")

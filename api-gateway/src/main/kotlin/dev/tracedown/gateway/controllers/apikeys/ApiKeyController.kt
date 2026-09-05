@@ -13,11 +13,12 @@ import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.requireOrgWrite
 import dev.tracedown.gateway.util.requireOrgRead
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import java.security.SecureRandom
 import java.time.Instant
 import java.util.Base64
@@ -166,7 +167,7 @@ object ApiKeyController {
         )
     }
 
-    private fun summaryFromRow(row: org.jetbrains.exposed.sql.ResultRow) = ApiKeySummary(
+    private fun summaryFromRow(row: org.jetbrains.exposed.v1.core.ResultRow) = ApiKeySummary(
         id = row[ApiKeys.id].toString(),
         name = row[ApiKeys.name],
         key = null,

@@ -5,7 +5,7 @@ import dev.tracedown.common.models.ProjectVariables
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.WorkspaceVariables
 import dev.tracedown.common.variables.SystemVariables
-import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.v1.jdbc.insert
 import java.time.Instant
 import java.util.UUID
 

@@ -1,11 +1,12 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object PasswordResetTokens : Table("password_reset_tokens") {
-    val id = uuid("id")
-    val userId = uuid("user_id").references(Users.id)
+    val id = javaUUID("id")
+    val userId = javaUUID("user_id").references(Users.id)
     val tokenHash = varchar("token_hash", 255)
 
     /**

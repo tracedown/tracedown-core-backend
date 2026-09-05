@@ -32,15 +32,16 @@ import dev.tracedown.gateway.util.orgUserSections
 import dev.tracedown.gateway.util.requireGrantable
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
-import org.jetbrains.exposed.sql.JoinType
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.deleteWhere
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.neq
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import java.time.Instant
 import java.util.UUID
 
@@ -378,7 +379,7 @@ object PermissionController {
      * pre-configured like group memberships; everything gates on active
      * status until acceptance.
      */
-    private fun findOrgUser(orgId: UUID, userId: UUID): org.jetbrains.exposed.sql.ResultRow {
+    private fun findOrgUser(orgId: UUID, userId: UUID): org.jetbrains.exposed.v1.core.ResultRow {
         return OrgUsers.selectAll()
             .where {
                 (OrgUsers.organizationId eq orgId) and
@@ -488,7 +489,7 @@ object PermissionController {
         }
     }
 
-    private fun resourceGrantFromRow(row: org.jetbrains.exposed.sql.ResultRow) = ResourceGrant(
+    private fun resourceGrantFromRow(row: org.jetbrains.exposed.v1.core.ResultRow) = ResourceGrant(
         resourceType = row[ResourcePermissions.resourceType],
         resourceId = row[ResourcePermissions.resourceId].toString(),
         permissions = row[ResourcePermissions.permissions],

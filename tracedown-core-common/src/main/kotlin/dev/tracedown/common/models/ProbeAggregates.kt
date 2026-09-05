@@ -1,11 +1,12 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object ProbeAggregates : Table("probe_aggregates") {
-    val id = uuid("id")
-    val serviceId = uuid("service_id").references(Services.id)
+    val id = javaUUID("id")
+    val serviceId = javaUUID("service_id").references(Services.id)
     val probeAgentId = long("probe_agent_id").references(ProbeAgents.id).nullable()
     val bucketStart = timestamp("bucket_start")
     val bucketType = varchar("bucket_type", 8)

@@ -20,14 +20,15 @@ import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
 import dev.tracedown.gateway.util.requireCachedPermissions
 import org.dmfs.rfc5545.recur.RecurrenceRule
-import org.jetbrains.exposed.sql.JoinType
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.deleteWhere
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import java.util.UUID
 
 object SilenceController {
@@ -242,7 +243,7 @@ object SilenceController {
         return silenceSummaryFromRow(orgId, row)
     }
 
-    private fun silenceSummaryFromRow(orgId: UUID, row: org.jetbrains.exposed.sql.ResultRow) = SilenceSummary(
+    private fun silenceSummaryFromRow(orgId: UUID, row: org.jetbrains.exposed.v1.core.ResultRow) = SilenceSummary(
         id = row[NotificationSilences.id].toString(),
         orgUserId = row[NotificationSilences.orgUserId].toString(),
         workspaceId = row[NotificationSilences.workspaceId]?.toString(),
@@ -263,7 +264,7 @@ object SilenceController {
      * [requireVisibleTarget] existed may still point outside the org — those
      * resolve to no name rather than echoing a foreign one.
      */
-    private fun resolveResourceName(orgId: UUID, row: org.jetbrains.exposed.sql.ResultRow): String? {
+    private fun resolveResourceName(orgId: UUID, row: org.jetbrains.exposed.v1.core.ResultRow): String? {
         row[NotificationSilences.serviceId]?.let { id ->
             return Services
                 .join(Projects, JoinType.INNER, Services.projectId, Projects.id)

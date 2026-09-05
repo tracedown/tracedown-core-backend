@@ -1,7 +1,8 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 /**
  * Per-webhook variables (`$h.<key>`), resolved only at webhook delivery —
@@ -9,10 +10,10 @@ import org.jetbrains.exposed.sql.javatime.timestamp
  * AAD scope `webhook:<webhookId>`, binding the ciphertext to its webhook.
  */
 object WebhookVariables : Table("webhook_variables") {
-    val id = uuid("id")
-    val organizationId = uuid("organization_id").references(Organizations.id)
-    val webhookId = uuid("webhook_id").references(WebhookDeliveries.id)
-    val createdBy = uuid("created_by").references(Users.id).nullable()
+    val id = javaUUID("id")
+    val organizationId = javaUUID("organization_id").references(Organizations.id)
+    val webhookId = javaUUID("webhook_id").references(WebhookDeliveries.id)
+    val createdBy = javaUUID("created_by").references(Users.id).nullable()
     val key = varchar("key", 64)
     val value = text("value")
     val secret = bool("secret")

@@ -1,13 +1,14 @@
 package dev.tracedown.common.models
 
 import kotlinx.serialization.json.Json
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
-import org.jetbrains.exposed.sql.json.jsonb
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
+import org.jetbrains.exposed.v1.json.jsonb
 
 object OrgDomains : Table("org_domains") {
-    val id = uuid("id")
-    val organizationId = uuid("organization_id").references(Organizations.id)
+    val id = javaUUID("id")
+    val organizationId = javaUUID("organization_id").references(Organizations.id)
     val domain = varchar("domain", 256)
     val challenge = text("challenge")
     val verificationType = varchar("verification_type", 16)

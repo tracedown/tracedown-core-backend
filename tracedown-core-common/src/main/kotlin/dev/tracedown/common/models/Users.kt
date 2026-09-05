@@ -1,10 +1,11 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object Users : Table("users") {
-    val id = uuid("id")
+    val id = javaUUID("id")
     val email = varchar("email", 256)
     val passwordHash = varchar("password_hash", 256)
     val displayName = varchar("display_name", 128)
@@ -30,7 +31,7 @@ object Users : Table("users") {
     /** Set when the account trips the attempt limit; second factors are refused until it passes. */
     val totpLockedUntil = timestamp("totp_locked_until").nullable()
     val totpEnabled = bool("totp_enabled").default(false)
-    val selectedOrgId = uuid("selected_org_id").references(Organizations.id).nullable()
+    val selectedOrgId = javaUUID("selected_org_id").references(Organizations.id).nullable()
     val isActive = bool("is_active").default(true)
     val deleted = bool("deleted").default(false)
     val deletedAt = timestamp("deleted_at").nullable()

@@ -19,13 +19,15 @@ import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.deleteWhere
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.neq
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import java.time.Instant
 import java.util.UUID
 
@@ -96,7 +98,7 @@ object NotificationTemplateController {
             val source = if (filtersBindings) {
                 NotificationTemplates.join(
                     ProjectNotificationTemplates,
-                    org.jetbrains.exposed.sql.JoinType.LEFT,
+                    org.jetbrains.exposed.v1.core.JoinType.LEFT,
                     onColumn = NotificationTemplates.id,
                     otherColumn = ProjectNotificationTemplates.notificationTemplateId,
                 ).select(NotificationTemplates.columns)
@@ -306,7 +308,7 @@ object NotificationTemplateController {
         return summaryFromRow(row, projectIds)
     }
 
-    private fun summaryFromRow(row: org.jetbrains.exposed.sql.ResultRow, projectIds: List<String>) = NotificationTemplateSummary(
+    private fun summaryFromRow(row: org.jetbrains.exposed.v1.core.ResultRow, projectIds: List<String>) = NotificationTemplateSummary(
         id = row[NotificationTemplates.id].toString(),
         name = row[NotificationTemplates.name],
         text = row[NotificationTemplates.text],

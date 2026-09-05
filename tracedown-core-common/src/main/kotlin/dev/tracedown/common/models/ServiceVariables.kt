@@ -1,12 +1,13 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object ServiceVariables : Table("service_variables") {
-    val id = uuid("id")
-    val serviceId = uuid("service_id").references(Services.id)
-    val createdBy = uuid("created_by").references(Users.id).nullable()
+    val id = javaUUID("id")
+    val serviceId = javaUUID("service_id").references(Services.id)
+    val createdBy = javaUUID("created_by").references(Users.id).nullable()
     val key = varchar("key", 193)
     val value = text("value")
     val secret = bool("secret")

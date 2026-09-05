@@ -33,14 +33,15 @@ import dev.tracedown.gateway.util.requireGroupGrantable
 import dev.tracedown.gateway.util.requireOrgPolicyWrite
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.deleteWhere
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.neq
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import java.util.UUID
 
 object GroupController {
@@ -404,7 +405,7 @@ object GroupController {
         return groupSummaryFromRow(row)
     }
 
-    private fun groupSummaryFromRow(row: org.jetbrains.exposed.sql.ResultRow): GroupSummary {
+    private fun groupSummaryFromRow(row: org.jetbrains.exposed.v1.core.ResultRow): GroupSummary {
         val groupId = row[OrgGroups.id]
         val memberCount = OrgUserGroups.selectAll()
             .where { OrgUserGroups.orgGroupId eq groupId }

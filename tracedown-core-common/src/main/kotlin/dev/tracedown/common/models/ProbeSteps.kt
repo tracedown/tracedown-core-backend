@@ -1,14 +1,15 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
-import org.jetbrains.exposed.sql.json.jsonb
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
+import org.jetbrains.exposed.v1.json.jsonb
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 
 object ProbeSteps : Table("probe_steps") {
-    val id = uuid("id")
-    val probeResultId = uuid("probe_result_id").references(ProbeResults.id)
+    val id = javaUUID("id")
+    val probeResultId = javaUUID("probe_result_id").references(ProbeResults.id)
     val stepNum = short("step_num")
     val requestUrl = varchar("request_url", 256)
     val statusCode = short("status_code").nullable()

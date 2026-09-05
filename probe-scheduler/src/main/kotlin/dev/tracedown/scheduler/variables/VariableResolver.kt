@@ -6,9 +6,10 @@ import dev.tracedown.common.variables.SystemVariables
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.util.UUID
 
 /**
@@ -128,25 +129,25 @@ object VariableResolver {
      * the platform key — [VariableCrypto.decrypt] dispatches on the stored format.
      */
     private fun loadScope(
-        scopeColumn: org.jetbrains.exposed.sql.Column<UUID>,
+        scopeColumn: org.jetbrains.exposed.v1.core.Column<UUID>,
         scopeId: UUID,
-        table: org.jetbrains.exposed.sql.Table,
+        table: org.jetbrains.exposed.v1.core.Table,
         orgId: UUID,
         scope: String,
     ): Map<String, VarEntry> {
         val result = mutableMapOf<String, VarEntry>()
         @Suppress("UNCHECKED_CAST")
-        val keyCol = table.columns.first { it.name == "key" } as org.jetbrains.exposed.sql.Column<String>
+        val keyCol = table.columns.first { it.name == "key" } as org.jetbrains.exposed.v1.core.Column<String>
         @Suppress("UNCHECKED_CAST")
-        val valueCol = table.columns.first { it.name == "value" } as org.jetbrains.exposed.sql.Column<String>
+        val valueCol = table.columns.first { it.name == "value" } as org.jetbrains.exposed.v1.core.Column<String>
         @Suppress("UNCHECKED_CAST")
-        val ivCol = table.columns.first { it.name == "value_iv" } as org.jetbrains.exposed.sql.Column<String?>
+        val ivCol = table.columns.first { it.name == "value_iv" } as org.jetbrains.exposed.v1.core.Column<String?>
         @Suppress("UNCHECKED_CAST")
-        val encCol = table.columns.first { it.name == "encrypted" } as org.jetbrains.exposed.sql.Column<Boolean>
+        val encCol = table.columns.first { it.name == "encrypted" } as org.jetbrains.exposed.v1.core.Column<Boolean>
         @Suppress("UNCHECKED_CAST")
-        val secretCol = table.columns.first { it.name == "secret" } as org.jetbrains.exposed.sql.Column<Boolean>
+        val secretCol = table.columns.first { it.name == "secret" } as org.jetbrains.exposed.v1.core.Column<Boolean>
         @Suppress("UNCHECKED_CAST")
-        val deletedCol = table.columns.first { it.name == "deleted" } as org.jetbrains.exposed.sql.Column<Boolean>
+        val deletedCol = table.columns.first { it.name == "deleted" } as org.jetbrains.exposed.v1.core.Column<Boolean>
 
         table.selectAll()
             .where { (scopeColumn eq scopeId) and (deletedCol eq false) }
