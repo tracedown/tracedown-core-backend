@@ -1,9 +1,11 @@
 package dev.tracedown.common.email
 
+import jakarta.mail.Message
 import org.simplejavamail.api.mailer.Mailer
 import org.simplejavamail.api.mailer.config.TransportStrategy
 import org.simplejavamail.email.EmailBuilder
 import org.simplejavamail.mailer.MailerBuilder
+import org.simplejavamail.recipient.RecipientsBuilder
 import org.slf4j.LoggerFactory
 
 class SmtpTransport(
@@ -52,7 +54,15 @@ class SmtpTransport(
     private fun buildEmail(message: EmailMessage): org.simplejavamail.api.email.Email {
         return EmailBuilder.startingBlank()
             .from(fromName, fromAddress)
-            .to(message.to)
+            // Simple Java Mail 9 dropped the ~100 to()/cc()/bcc() overloads;
+            // recipients are now assembled through a RecipientsBuilder. This
+            // call is the exact delegate the old to(String) used, so a
+            // comma/semicolon-delimited address list still expands the same way.
+            .withRecipients(
+                RecipientsBuilder()
+                    .withRecipientsWithDefaultName(null, Message.RecipientType.TO, message.to)
+                    .buildRecipients()
+            )
             .withSubject(message.subject)
             .withHTMLText(message.htmlBody)
             .apply {
