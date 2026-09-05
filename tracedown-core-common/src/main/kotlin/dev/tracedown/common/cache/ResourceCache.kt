@@ -1,5 +1,6 @@
 package dev.tracedown.common.cache
 
+import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -87,7 +88,7 @@ class ResourceCache(
         val redis = conn() ?: return
         try {
             val key = "res:svc:${ctx.serviceId}"
-            redis.setex(key, ttlSeconds, Json.encodeToString(CachedServiceContext.serializer(), ctx))
+            redis.set(key, Json.encodeToString(CachedServiceContext.serializer(), ctx), SetArgs.Builder.ex(ttlSeconds))
         } catch (e: Exception) {
             log.debug("cache write failed for service {}: {}", ctx.serviceId, e.message)
         }
@@ -124,7 +125,7 @@ class ResourceCache(
         val redis = conn() ?: return
         try {
             val key = "res:proj:${ctx.projectId}"
-            redis.setex(key, ttlSeconds, Json.encodeToString(CachedProjectContext.serializer(), ctx))
+            redis.set(key, Json.encodeToString(CachedProjectContext.serializer(), ctx), SetArgs.Builder.ex(ttlSeconds))
         } catch (e: Exception) {
             log.debug("cache write failed for project {}: {}", ctx.projectId, e.message)
         }

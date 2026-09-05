@@ -1,6 +1,9 @@
 package dev.tracedown.common.cache
 
+import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
+import io.lettuce.core.codec.StringCodec
+import io.lettuce.core.protocol.CommandArgs
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
@@ -180,7 +183,7 @@ class ResourceCacheTest {
         }
 
         @Test
-        fun `putService sets TTL via setex`() {
+        fun `putService sets TTL via SET EX`() {
             val serviceId = UUID.randomUUID()
             val ctx = CachedServiceContext(
                 serviceId = serviceId.toString(),
@@ -279,6 +282,10 @@ class ResourceCacheTest {
         val store: MutableMap<String, String> = mutableMapOf()
         val ttls: MutableMap<String, Long> = mutableMapOf()
 
+        private companion object {
+            val EX_SECONDS = Regex("\\bEX (\\d+)\\b")
+        }
+
         @Suppress("UNCHECKED_CAST")
         fun commands(): RedisCommands<String, String> {
             return Proxy.newProxyInstance(
@@ -290,12 +297,17 @@ class ResourceCacheTest {
                         val key = args!![0] as String
                         store[key]
                     }
-                    "setex" -> {
+                    "set" -> {
                         val key = args!![0] as String
-                        val seconds = args[1] as Long
-                        val value = args[2] as String
+                        val value = args[1] as String
                         store[key] = value
-                        ttls[key] = seconds
+                        // SET key value EX <ttl>. SetArgs exposes no getter, so
+                        // the expiry is read back off the rendered command
+                        // ("EX 3600") rather than by assuming a layout.
+                        val rendered = CommandArgs(StringCodec.UTF8)
+                        (args[2] as SetArgs).build(rendered)
+                        EX_SECONDS.find(rendered.toCommandString())
+                            ?.let { ttls[key] = it.groupValues[1].toLong() }
                         "OK"
                     }
                     "del" -> {

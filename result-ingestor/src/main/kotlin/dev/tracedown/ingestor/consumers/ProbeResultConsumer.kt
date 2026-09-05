@@ -8,6 +8,7 @@ import io.lettuce.core.KeyScanCursor
 import io.lettuce.core.LMoveArgs
 import io.lettuce.core.ScanArgs
 import io.lettuce.core.ScanCursor
+import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
@@ -345,7 +346,7 @@ class ProbeResultConsumer(
     /** Refreshes this consumer's presence key. Its absence is what declares death. */
     private fun beat() {
         try {
-            redis.setex(heartbeatKey, ProcessingListReclaim.HEARTBEAT_TTL_SECONDS, Instant.now().toString())
+            redis.set(heartbeatKey, Instant.now().toString(), SetArgs.Builder.ex(ProcessingListReclaim.HEARTBEAT_TTL_SECONDS))
         } catch (e: Exception) {
             // A missed beat is survivable — the TTL allows several. What it must
             // not do is take the consumer down.

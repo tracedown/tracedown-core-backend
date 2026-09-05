@@ -1,7 +1,9 @@
 package dev.tracedown.common.redis
 
 import io.lettuce.core.ClientOptions
+import io.lettuce.core.MaintNotificationsConfig
 import io.lettuce.core.RedisClient
+import io.lettuce.core.RedisURI
 import io.lettuce.core.api.StatefulRedisConnection
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection
 import org.slf4j.LoggerFactory
@@ -86,15 +88,29 @@ object RedisFactory {
         redisUrl: String,
         connect: (RedisClient) -> T,
     ): T {
-        val client = RedisClient.create(redisUrl)
+        // Lettuce 7 dropped AbstractRedisClient.setDefaultTimeout; the client's
+        // default now comes off the RedisURI, with the same meaning — it seeds
+        // each new connection's timeout, which [createBlockingConnection] then
+        // raises on its own connection. (ClientOptions.timeoutOptions with a
+        // fixedTimeout is *not* the equivalent: a fixed timeout overrides the
+        // connection's own and would cut the blocking reads short.)
+        val redisUri = RedisURI.create(redisUrl)
+        redisUri.timeout = COMMAND_TIMEOUT
+        val client = RedisClient.create(redisUri)
         // Auto-reconnect with commands accepted while the link is down: a
         // sub-second reconnect stays invisible. COMMAND_TIMEOUT is what stops
         // that from becoming an unbounded wait.
         client.options = ClientOptions.builder()
             .autoReconnect(true)
             .disconnectedBehavior(ClientOptions.DisconnectedBehavior.ACCEPT_COMMANDS)
+            // Lettuce 7 handshakes `CLIENT MAINT_NOTIFICATIONS` by default —
+            // a hosted-Redis maintenance feature no open-source server has.
+            // Against the redis:7 this platform ships, every connect answers
+            // "ERR unknown subcommand" and logs the failure with a stack trace.
+            // Harmless (the connection is usable either way) but alarming in
+            // the logs, so don't ask for it.
+            .maintNotificationsConfig(MaintNotificationsConfig.disabled())
             .build()
-        client.setDefaultTimeout(COMMAND_TIMEOUT)
 
         var lastError: Exception? = null
         for (attempt in 1..CONNECT_ATTEMPTS) {

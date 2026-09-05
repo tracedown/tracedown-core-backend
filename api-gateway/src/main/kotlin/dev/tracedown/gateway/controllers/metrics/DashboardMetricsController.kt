@@ -19,6 +19,7 @@ import dev.tracedown.gateway.data.metrics.MetricsState
 import dev.tracedown.gateway.data.metrics.ResponsePercentiles
 import dev.tracedown.gateway.data.metrics.ServiceMetricsDto
 import io.lettuce.core.LettuceFutures
+import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
 import java.util.concurrent.TimeUnit
 import kotlinx.serialization.encodeToString
@@ -381,7 +382,7 @@ object DashboardMetricsController {
         } ?: run {
             val computed = closedKeys.map { readHourBucket(serviceIds, it) }.toMutableList()
             fillEmptiesFromDb(serviceIds, computed)
-            redis.setex(closedCacheKey, CLOSED_CACHE_SECONDS, Json.encodeToString<List<HourlyBucket>>(computed))
+            redis.set(closedCacheKey, Json.encodeToString<List<HourlyBucket>>(computed), SetArgs.Builder.ex(CLOSED_CACHE_SECONDS))
             computed
         }
 
