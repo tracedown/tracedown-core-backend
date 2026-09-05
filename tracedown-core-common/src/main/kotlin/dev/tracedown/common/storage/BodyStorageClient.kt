@@ -1,11 +1,11 @@
 package dev.tracedown.common.storage
 
 import io.minio.CopyObjectArgs
-import io.minio.CopySource
 import io.minio.GetPresignedObjectUrlArgs
+import io.minio.Http
 import io.minio.MinioClient
 import io.minio.RemoveObjectArgs
-import io.minio.http.Method
+import io.minio.SourceObject
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -187,7 +187,7 @@ open class BodyStorageClient(
         val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
         return client.getPresignedObjectUrl(
             GetPresignedObjectUrlArgs.builder()
-                .method(Method.GET)
+                .method(Http.Method.GET)
                 .bucket(bucket)
                 .`object`(key)
                 .expiry(3600)
@@ -261,7 +261,7 @@ open class BodyStorageClient(
             CopyObjectArgs.builder()
                 .bucket(allowedBucket)
                 .`object`(destFullKey)
-                .source(CopySource.builder().bucket(bucket).`object`(key).build())
+                .source(SourceObject.builder().bucket(bucket).`object`(key).build())
                 .build()
         )
         deleteS3(bucket, key)
