@@ -53,12 +53,12 @@ dependencies {
     implementation(libs.bouncycastle.pkix)
     implementation(libs.bouncycastle.prov)
 
-    implementation("dev.lacelang:kotlin-validator:0.1.5")
+    implementation("dev.lacelang:kotlin-validator:0.1.6")
 
     testImplementation(libs.kotlin.test)
     testImplementation(libs.ktor.server.test.host)
 
-    testImplementation("dev.lacelang:kotlin-lacetest:0.1.3")
+    testImplementation("dev.lacelang:kotlin-lacetest:0.1.4")
 
     testImplementation(libs.flyway.core)
     testImplementation(libs.flyway.postgresql)

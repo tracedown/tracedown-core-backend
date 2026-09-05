@@ -31,8 +31,8 @@ dependencies {
 
     // Embedded probe execution — the canonical Kotlin Lace implementations.
     // (The two repos publish under different artifact-id conventions.)
-    implementation("dev.lacelang:kotlin-validator:0.1.5")
-    implementation("dev.lacelang:lacelang-kotlin-executor:0.1.6")
+    implementation("dev.lacelang:kotlin-validator:0.1.6")
+    implementation("dev.lacelang:lacelang-kotlin-executor:0.1.7")
 
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.netty)
