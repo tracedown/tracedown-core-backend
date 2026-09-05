@@ -1,5 +1,6 @@
 package dev.tracedown.notifications.consumers
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.Outbox
 import dev.tracedown.notifications.processing.NotificationProcessor
 import io.lettuce.core.pubsub.RedisPubSubAdapter
@@ -10,7 +11,6 @@ import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import java.util.UUID
@@ -134,7 +134,7 @@ class OutboxConsumer(
      * the single-instance note on the class before adding a replica.
      */
     private suspend fun poll(): List<Pair<UUID, JsonObject>> {
-        return newSuspendedTransaction(Dispatchers.IO) {
+        return ioTransaction {
             Outbox.selectAll()
                 .where {
                     (Outbox.published eq false) and
@@ -149,7 +149,7 @@ class OutboxConsumer(
     }
 
     private suspend fun markPublished(ids: List<UUID>) {
-        newSuspendedTransaction(Dispatchers.IO) {
+        ioTransaction {
             Outbox.update({ Outbox.id inList ids }) {
                 it[published] = true
             }

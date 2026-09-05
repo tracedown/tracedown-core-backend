@@ -1,13 +1,12 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.AgentBootstrapTokens
 import dev.tracedown.common.models.PasswordResetTokens
-import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.less
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.time.Instant
 
@@ -39,7 +38,7 @@ class ExpiredTokenCleanupJob(
 
     override suspend fun execute() {
         val now = Instant.now()
-        val (resets, bootstraps) = newSuspendedTransaction(Dispatchers.IO) {
+        val (resets, bootstraps) = ioTransaction {
             val resets = PasswordResetTokens.deleteWhere { expiresAt less now }
             val bootstraps = AgentBootstrapTokens.deleteWhere {
                 (expiresAt less now) and (used eq false)

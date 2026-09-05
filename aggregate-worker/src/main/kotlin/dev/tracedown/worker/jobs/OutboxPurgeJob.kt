@@ -3,11 +3,10 @@ package dev.tracedown.worker.jobs
 import dev.tracedown.common.alerts.AlertContext
 import dev.tracedown.common.alerts.SystemAlertRouting
 import dev.tracedown.common.alerts.SystemAlertService
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.OutboxStream
-import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
@@ -65,7 +64,7 @@ class OutboxPurgeJob(
 
         val floor = decision.floor
 
-        val deleted = newSuspendedTransaction(Dispatchers.IO) {
+        val deleted = ioTransaction {
             // Never delete above the slowest honoured cursor; when none exists
             // the floor is absent and this clause is dropped entirely.
             // retentionDays and floor are numeric values under our control —

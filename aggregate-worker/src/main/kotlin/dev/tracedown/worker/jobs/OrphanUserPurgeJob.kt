@@ -1,8 +1,7 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.onboarding.AccountLifecycle
-import kotlinx.coroutines.Dispatchers
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.OrphanUserPurgeJob")
@@ -27,7 +26,7 @@ class OrphanUserPurgeJob(
     override val name = "OrphanUserPurgeJob"
 
     override suspend fun execute() {
-        val marked = newSuspendedTransaction(Dispatchers.IO) {
+        val marked = ioTransaction {
             AccountLifecycle.markAbandonedOrphans()
         }
 

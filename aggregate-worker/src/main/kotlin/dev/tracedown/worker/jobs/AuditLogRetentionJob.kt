@@ -1,10 +1,9 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.OrgAuditLog
-import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.core.less
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -32,7 +31,7 @@ class AuditLogRetentionJob(
             return
         }
         val cutoff = Instant.now().minus(retentionDays.toLong(), ChronoUnit.DAYS)
-        val deleted = newSuspendedTransaction(Dispatchers.IO) {
+        val deleted = ioTransaction {
             OrgAuditLog.deleteWhere { createdAt less cutoff }
         }
         if (deleted > 0) {

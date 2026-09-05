@@ -1,9 +1,8 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.storage.BodyStorageClient
-import kotlinx.coroutines.Dispatchers
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.PurgeJob")
@@ -53,7 +52,7 @@ class PurgeJob(
 
         for (unit in purgeUnits) {
             try {
-                totalDeleted += newSuspendedTransaction(Dispatchers.IO) { unit.purge(this) }
+                totalDeleted += ioTransaction { unit.purge(this) }
             } catch (e: Exception) {
                 failedGroups++
                 log.error(

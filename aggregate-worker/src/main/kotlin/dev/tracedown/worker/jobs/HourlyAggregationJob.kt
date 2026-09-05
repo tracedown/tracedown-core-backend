@@ -1,9 +1,8 @@
 package dev.tracedown.worker.jobs
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.worker.data.JobWatermarks
 import io.lettuce.core.api.sync.RedisCommands
-import kotlinx.coroutines.Dispatchers
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -38,7 +37,7 @@ class HourlyAggregationJob(
     override val name = "HourlyAggregationJob"
 
     override suspend fun execute() {
-        val watermark = newSuspendedTransaction(Dispatchers.IO) { JobWatermarks.read(name) }
+        val watermark = ioTransaction { JobWatermarks.read(name) }
 
         val window = AggregationWindow.nextWindow(
             now = clock(),
@@ -56,7 +55,7 @@ class HourlyAggregationJob(
         val tsStart = java.sql.Timestamp.from(window.start)
         val tsEnd = java.sql.Timestamp.from(window.end)
 
-        newSuspendedTransaction(Dispatchers.IO) {
+        ioTransaction {
             val conn = this.connection.connection as java.sql.Connection
 
             // Per-agent aggregation — ON CONFLICT works because probe_agent_id is NOT NULL

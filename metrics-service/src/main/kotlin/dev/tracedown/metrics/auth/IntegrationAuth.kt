@@ -1,14 +1,13 @@
 package dev.tracedown.metrics.auth
 
 import dev.tracedown.common.auth.TokenHasher
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.GrafanaIntegrations
-import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.security.MessageDigest
 import java.util.UUID
@@ -44,7 +43,7 @@ object IntegrationAuth {
      * @return the resolved integration, or null if auth fails
      */
     suspend fun authenticate(integrationId: UUID, bearerToken: String): ResolvedIntegration? {
-        val row = newSuspendedTransaction(Dispatchers.IO) {
+        val row = ioTransaction {
             GrafanaIntegrations.selectAll()
                 .where {
                     (GrafanaIntegrations.id eq integrationId) and

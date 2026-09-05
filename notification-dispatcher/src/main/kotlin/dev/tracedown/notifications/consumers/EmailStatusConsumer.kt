@@ -1,5 +1,6 @@
 package dev.tracedown.notifications.consumers
 
+import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.email.EmailStatusEvent
 import dev.tracedown.common.models.NotificationLog
 import io.lettuce.core.api.sync.RedisCommands
@@ -7,7 +8,6 @@ import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 
@@ -65,7 +65,7 @@ class EmailStatusConsumer(
             return
         }
 
-        val updated = newSuspendedTransaction(Dispatchers.IO) {
+        val updated = ioTransaction {
             NotificationLog.update({ NotificationLog.id eq event.notificationLogId }) {
                 it[status] = event.status
                 it[error] = event.error
