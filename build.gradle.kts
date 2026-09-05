@@ -6,7 +6,7 @@ plugins {
 allprojects {
     group = "dev.tracedown"
 
-    version = "0.4.7"
+    version = "0.4.8"
 
     repositories {
         mavenCentral()
@@ -57,7 +57,7 @@ subprojects {
     }
 
     // Every runnable service ships as a single self-contained jar (GitHub
-    // release artifacts). schema-migrator is deliberately excluded: Flyway 11's
+    // release artifacts). schema-migrator is deliberately excluded: Flyway's
     // classpath scanning cannot find migration resources inside a merged jar —
     // it would connect, apply nothing, and report success — so the migrator
     // ships as its installDist-based distZip instead.

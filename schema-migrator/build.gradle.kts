@@ -34,7 +34,7 @@ dependencies {
     implementation(libs.logback)
 }
 
-// No fat JAR for the migrator: Flyway 11's classpath scanning does not find
+// No fat JAR for the migrator: Flyway's classpath scanning does not find
 // migrations inside a merged JAR (it would run and silently apply zero
 // migrations). The migrator ships via installDist / the `migrator` target in
 // docker/Dockerfile, which keeps the classpath as discrete entries.

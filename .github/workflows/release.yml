@@ -8,7 +8,7 @@ name: Release
 #
 # Artifacts: every runnable service as a self-contained jar, the monolith
 # (whole platform in one jar, latest frontend release baked in, embedded Lace
-# executor), plus the schema-migrator as a distZip (Flyway 11 cannot scan
+# executor), plus the schema-migrator as a distZip (Flyway cannot scan
 # migrations inside a merged jar, so the migrator ships as a distribution and
 # runs from its bin/ launcher).
 

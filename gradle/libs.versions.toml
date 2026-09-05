@@ -2,7 +2,7 @@
 kotlin = "2.4.10"
 ktor = "3.5.2"
 exposed = "0.58.0"
-flyway = "11.20.3"
+flyway = "13.5.0"
 hikari = "6.2.1"
 postgresql = "42.7.13"
 lettuce = "6.5.3.RELEASE"
