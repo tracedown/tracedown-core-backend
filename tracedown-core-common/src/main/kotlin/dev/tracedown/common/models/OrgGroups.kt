@@ -2,12 +2,13 @@ package dev.tracedown.common.models
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.json.jsonb
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.json.jsonb
 
 object OrgGroups : Table("org_groups") {
-    val id = uuid("id")
-    val organizationId = uuid("organization_id").references(Organizations.id)
+    val id = javaUUID("id")
+    val organizationId = javaUUID("organization_id").references(Organizations.id)
     val name = varchar("name", 64)
     val totpRequired = bool("totp_required").default(false)
     val orgUserList = short("org_user_list").default(0)

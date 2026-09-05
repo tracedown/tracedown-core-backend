@@ -12,7 +12,7 @@ import io.ktor.resources.Resource
 import io.ktor.server.resources.get
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
-import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 
 /**
  * @OpenAPITag Usage

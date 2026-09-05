@@ -2,14 +2,14 @@ package dev.tracedown.worker.jobs
 
 import dev.tracedown.common.storage.BodyStorageClient
 import kotlinx.coroutines.Dispatchers
-import org.jetbrains.exposed.sql.Transaction
-import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
+import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.PurgeJob")
 
 /** Executes raw SQL and returns the update count. */
-private fun Transaction.execCount(sql: String): Long =
+private fun JdbcTransaction.execCount(sql: String): Long =
     connection.prepareStatement(sql, false).executeUpdate().toLong()
 
 /**
@@ -69,7 +69,7 @@ class PurgeJob(
     }
 
     /** One independently-purged entity group. Runs inside its own transaction. */
-    private class PurgeUnit(val entity: String, val purge: Transaction.() -> Long)
+    private class PurgeUnit(val entity: String, val purge: JdbcTransaction.() -> Long)
 
     private val purgeUnits: List<PurgeUnit> = buildList {
         // ── Crypto-shredding: purging orgs lose their data-encryption key FIRST ──
@@ -138,7 +138,7 @@ class PurgeJob(
      * rows pointing at them. Storage failures are logged and tolerated — a
      * broken bucket must not stop the database purge.
      */
-    private fun Transaction.deleteStoredBodies(purgingResults: String) {
+    private fun JdbcTransaction.deleteStoredBodies(purgingResults: String) {
         val uris = mutableListOf<String>()
         exec(
             "SELECT response_body_storage_url FROM probe_steps " +
@@ -177,7 +177,7 @@ class PurgeJob(
      * orphan the organization. Ownership must be transferred or the
      * organization deleted first; the account stays until then.
      */
-    private fun Transaction.purgeUsers(): Long {
+    private fun JdbcTransaction.purgeUsers(): Long {
         val blockedOwners = mutableListOf<String>()
         exec("SELECT id FROM users WHERE $PURGE_DUE AND id IN (SELECT owner_id FROM organizations)") { rs ->
             while (rs.next()) blockedOwners.add(rs.getString(1))

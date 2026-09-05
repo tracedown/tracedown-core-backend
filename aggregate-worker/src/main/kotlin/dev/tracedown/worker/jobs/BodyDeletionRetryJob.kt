@@ -3,9 +3,10 @@ package dev.tracedown.worker.jobs
 import dev.tracedown.common.models.PendingBodyDeletions
 import dev.tracedown.common.storage.BodyStorageClient
 import kotlinx.coroutines.Dispatchers
-import org.jetbrains.exposed.sql.SortOrder
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import org.jetbrains.exposed.v1.core.SortOrder
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.BodyDeletionRetryJob")

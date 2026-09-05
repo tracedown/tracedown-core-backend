@@ -13,9 +13,11 @@ import dev.tracedown.notifications.templates.NotificationBuilder
 import dev.tracedown.notifications.templates.RenderedNotification
 import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.*
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.experimental.newSuspendedTransaction
 import org.slf4j.LoggerFactory
 import java.util.UUID
 

@@ -7,8 +7,9 @@ import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.gateway.data.audit.AuditLogEntry
 import dev.tracedown.gateway.util.requireOrgRead
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.util.UUID
 
 object AuditController {
@@ -28,7 +29,7 @@ object AuditController {
 
             val query = OrgAuditLog.join(
                 Users,
-                org.jetbrains.exposed.sql.JoinType.LEFT,
+                org.jetbrains.exposed.v1.core.JoinType.LEFT,
                 onColumn = OrgAuditLog.userId,
                 otherColumn = Users.id,
             ).selectAll()

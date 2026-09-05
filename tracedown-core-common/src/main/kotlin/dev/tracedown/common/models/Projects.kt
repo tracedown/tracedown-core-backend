@@ -1,11 +1,12 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object Projects : Table("projects") {
-    val id = uuid("id")
-    val workspaceId = uuid("workspace_id").references(Workspaces.id)
+    val id = javaUUID("id")
+    val workspaceId = javaUUID("workspace_id").references(Workspaces.id)
     val name = varchar("name", 128)
     val coverImageUrl = varchar("cover_image_url", 128).nullable()
     val deleted = bool("deleted").default(false)

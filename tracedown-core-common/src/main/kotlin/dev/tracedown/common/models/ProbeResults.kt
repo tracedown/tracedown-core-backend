@@ -1,14 +1,15 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
-import org.jetbrains.exposed.sql.json.jsonb
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
+import org.jetbrains.exposed.v1.json.jsonb
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 
 object ProbeResults : Table("probe_results") {
-    val id = uuid("id")
-    val serviceId = uuid("service_id").references(Services.id)
+    val id = javaUUID("id")
+    val serviceId = javaUUID("service_id").references(Services.id)
     // Nullable: skipped probes (dispatch queue full) never reached an agent.
     val probeAgentId = long("probe_agent_id").references(ProbeAgents.id).nullable()
     val startedAt = timestamp("started_at")
@@ -24,9 +25,9 @@ object ProbeResults : Table("probe_results") {
     // Number of HTTP calls this run made (chain length). Neutral per-run metric.
     val requestCount = integer("request_count").default(0)
     val rawResult = jsonb<JsonObject>("raw_result", Json.Default)
-    val projectId = uuid("project_id").references(Projects.id)
-    val workspaceId = uuid("workspace_id").references(Workspaces.id)
-    val organizationId = uuid("organization_id").references(Organizations.id)
+    val projectId = javaUUID("project_id").references(Projects.id)
+    val workspaceId = javaUUID("workspace_id").references(Workspaces.id)
+    val organizationId = javaUUID("organization_id").references(Organizations.id)
 
     override val primaryKey = PrimaryKey(id)
 }

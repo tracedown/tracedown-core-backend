@@ -2,7 +2,7 @@ package dev.tracedown.common.onboarding
 
 import dev.tracedown.common.models.NotificationTemplates
 import dev.tracedown.common.models.OrgRulePresets
-import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.v1.jdbc.insert
 import java.time.Instant
 import java.util.UUID
 

@@ -1,7 +1,8 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 /**
  * Stored response bodies whose object-storage delete failed, kept so the delete
@@ -19,7 +20,7 @@ import org.jetbrains.exposed.sql.javatime.timestamp
  * failure rather than wasted bytes.
  */
 object PendingBodyDeletions : Table("pending_body_deletions") {
-    val id = uuid("id")
+    val id = javaUUID("id")
 
     /** The `file://` or `s3://` URI still to be deleted. Unique. */
     val storageUrl = text("storage_url")

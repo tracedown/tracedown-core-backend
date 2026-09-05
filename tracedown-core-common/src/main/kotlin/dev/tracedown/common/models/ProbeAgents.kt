@@ -1,7 +1,7 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object ProbeAgents : Table("probe_agents") {
     val id = long("id").autoIncrement()

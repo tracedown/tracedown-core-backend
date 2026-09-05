@@ -2,14 +2,15 @@ package dev.tracedown.common.models
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
-import org.jetbrains.exposed.sql.json.jsonb
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
+import org.jetbrains.exposed.v1.json.jsonb
 
 object OrgUsers : Table("org_users") {
-    val id = uuid("id")
-    val organizationId = uuid("organization_id").references(Organizations.id)
-    val userId = uuid("user_id").references(Users.id)
+    val id = javaUUID("id")
+    val organizationId = javaUUID("organization_id").references(Organizations.id)
+    val userId = javaUUID("user_id").references(Users.id)
     val joinedAt = timestamp("joined_at").nullable()
     val status = varchar("status", 16).default("invited")
     val isActive = bool("is_active").default(true)
@@ -25,7 +26,7 @@ object OrgUsers : Table("org_users") {
     val orgWorkspaces = short("org_workspaces").default(0)
     val inviteToken = varchar("invite_token", 128)
     val invitedAt = timestamp("invited_at").nullable()
-    val invitedBy = uuid("invited_by").references(Users.id).nullable()
+    val invitedBy = javaUUID("invited_by").references(Users.id).nullable()
     val inviteExpiresAt = timestamp("invite_expires_at").nullable()
     val lastInviteSentAt = timestamp("last_invite_sent_at").nullable()
     val permissionCache = jsonb<JsonObject>(

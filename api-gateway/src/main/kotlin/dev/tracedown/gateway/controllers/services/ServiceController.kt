@@ -21,7 +21,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ServiceAllowedAgents
-import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.v1.core.JoinType
 import dev.tracedown.common.domain.DomainPolicy
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.OutboxEmit
@@ -66,13 +66,15 @@ import dev.tracedown.gateway.util.ServiceContext
 import dev.tracedown.gateway.util.VariableCrypto
 import dev.tracedown.gateway.util.requireCachedPermissions
 import org.dmfs.rfc5545.recur.RecurrenceRule
-import org.jetbrains.exposed.sql.JoinType
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.jdbc.update
 import java.time.Instant
 import java.util.UUID
 
@@ -1242,7 +1244,7 @@ object ServiceController {
         return serviceSummaryFromRow(row)
     }
 
-    private fun serviceSummaryFromRow(row: org.jetbrains.exposed.sql.ResultRow) = ServiceSummary(
+    private fun serviceSummaryFromRow(row: org.jetbrains.exposed.v1.core.ResultRow) = ServiceSummary(
         id = row[Services.id].toString(),
         projectId = row[Services.projectId].toString(),
         name = row[Services.name],
@@ -1267,7 +1269,7 @@ object ServiceController {
         return variableSummaryFromRow(row)
     }
 
-    private fun variableSummaryFromRow(row: org.jetbrains.exposed.sql.ResultRow, reveal: Boolean = false) = VariableSummary(
+    private fun variableSummaryFromRow(row: org.jetbrains.exposed.v1.core.ResultRow, reveal: Boolean = false) = VariableSummary(
         id = row[ServiceVariables.id].toString(),
         key = row[ServiceVariables.key],
         value = VariableCrypto.displayValue(

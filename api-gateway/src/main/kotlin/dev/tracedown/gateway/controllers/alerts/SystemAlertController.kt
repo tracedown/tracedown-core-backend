@@ -7,11 +7,12 @@ import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.requireOrgWrite
-import org.jetbrains.exposed.sql.SortOrder
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.insert
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.v1.core.SortOrder
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.time.Instant
 import java.util.UUID
 
@@ -66,7 +67,7 @@ object SystemAlertController {
         }
     }
 
-    private fun summaryFromRow(row: org.jetbrains.exposed.sql.ResultRow) = SystemAlertSummary(
+    private fun summaryFromRow(row: org.jetbrains.exposed.v1.core.ResultRow) = SystemAlertSummary(
         id = row[SystemAlerts.id].toString(),
         alertType = row[SystemAlerts.alertType],
         subject = row[SystemAlerts.subject],

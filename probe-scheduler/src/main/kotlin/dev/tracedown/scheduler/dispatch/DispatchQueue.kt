@@ -23,8 +23,10 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import org.jetbrains.exposed.sql.selectAll
-import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.UUID
@@ -479,12 +481,12 @@ class DispatchQueue(
         if (lastRunId == null) return null
         return try {
             transaction {
-                val conn = org.jetbrains.exposed.sql.transactions.TransactionManager.current().connection
+                val conn = org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager.current().connection
                 val stmt = conn.prepareStatement(
                     "SELECT raw_result FROM probe_results WHERE id = ?::uuid",
                     false
                 )
-                stmt.fillParameters(listOf(Pair(org.jetbrains.exposed.sql.VarCharColumnType(), lastRunId.toString())))
+                stmt.fillParameters(listOf(Pair(org.jetbrains.exposed.v1.core.VarCharColumnType(), lastRunId.toString())))
                 val rs = stmt.executeQuery()
                 if (rs.next()) {
                     val raw = rs.getString(1)

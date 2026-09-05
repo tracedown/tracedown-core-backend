@@ -1,12 +1,13 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object OrgVariables : Table("org_variables") {
-    val id = uuid("id")
-    val organizationId = uuid("organization_id").references(Organizations.id)
-    val createdBy = uuid("created_by").references(Users.id).nullable()
+    val id = javaUUID("id")
+    val organizationId = javaUUID("organization_id").references(Organizations.id)
+    val createdBy = javaUUID("created_by").references(Users.id).nullable()
     val key = varchar("key", 64)
     val value = text("value")
     val secret = bool("secret")

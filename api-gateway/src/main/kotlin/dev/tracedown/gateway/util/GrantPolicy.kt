@@ -6,7 +6,7 @@ import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.OrgGroups
 import dev.tracedown.common.models.OrgUsers
-import org.jetbrains.exposed.sql.ResultRow
+import org.jetbrains.exposed.v1.core.ResultRow
 
 /**
  * Who may hand out which level of access.

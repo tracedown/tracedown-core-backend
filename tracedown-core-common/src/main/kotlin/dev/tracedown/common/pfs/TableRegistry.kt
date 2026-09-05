@@ -2,8 +2,8 @@ package dev.tracedown.common.pfs
 
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.*
-import org.jetbrains.exposed.sql.Column
-import org.jetbrains.exposed.sql.Table
+import org.jetbrains.exposed.v1.core.Column
+import org.jetbrains.exposed.v1.core.Table
 
 /** Raised when a PFS filter/sort names a table or column not on the allowlist. */
 class PfsValidationException(val code: String = ErrorCodes.UNKNOWN_COLUMN) : RuntimeException(code)

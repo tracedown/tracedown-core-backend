@@ -1,11 +1,12 @@
 package dev.tracedown.common.models
 
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
 
 object Services : Table("services") {
-    val id = uuid("id")
-    val projectId = uuid("project_id").references(Projects.id)
+    val id = javaUUID("id")
+    val projectId = javaUUID("project_id").references(Projects.id)
     val name = varchar("name", 128)
     val label = varchar("label", 32).nullable()
     val script = text("script").default("")
@@ -19,7 +20,7 @@ object Services : Table("services") {
     val lastStatus = varchar("last_status", 8).nullable()
     val lastStatusSince = timestamp("last_status_since").nullable()
     val lastStatusConsecutive = integer("last_status_consecutive").default(0)
-    val lastRunId = uuid("last_run_id").references(ProbeResults.id).nullable()
+    val lastRunId = javaUUID("last_run_id").references(ProbeResults.id).nullable()
     val version = integer("version").default(1)
     val deleted = bool("deleted").default(false)
     val deletedAt = timestamp("deleted_at").nullable()

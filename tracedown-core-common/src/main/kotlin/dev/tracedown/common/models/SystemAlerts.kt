@@ -2,13 +2,14 @@ package dev.tracedown.common.models
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import org.jetbrains.exposed.sql.Table
-import org.jetbrains.exposed.sql.javatime.timestamp
-import org.jetbrains.exposed.sql.json.jsonb
+import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
+import org.jetbrains.exposed.v1.javatime.timestamp
+import org.jetbrains.exposed.v1.json.jsonb
 
 object SystemAlerts : Table("system_alerts") {
-    val id = uuid("id")
-    val organizationId = uuid("organization_id").references(Organizations.id)
+    val id = javaUUID("id")
+    val organizationId = javaUUID("organization_id").references(Organizations.id)
     val alertType = varchar("alert_type", 64)
     val subject = varchar("subject", 128).default("")
     val severity = varchar("severity", 16).default("warning")
@@ -20,9 +21,9 @@ object SystemAlerts : Table("system_alerts") {
 }
 
 object SystemAlertDismissals : Table("system_alert_dismissals") {
-    val id = uuid("id")
-    val alertId = uuid("alert_id").references(SystemAlerts.id)
-    val userId = uuid("user_id").references(Users.id)
+    val id = javaUUID("id")
+    val alertId = javaUUID("alert_id").references(SystemAlerts.id)
+    val userId = javaUUID("user_id").references(Users.id)
     val dismissedAt = timestamp("dismissed_at")
 
     override val primaryKey = PrimaryKey(id)
