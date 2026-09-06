@@ -52,6 +52,8 @@ class MailTemplateContractTest {
         "system.invite" to setOf("inviterName", "orgName", "inviteLink"),
         // api-gateway → AuthController password reset
         "system.password-reset" to setOf("userName", "expiryMinutes", "resetLink"),
+        // api-gateway → OrgSettingsRoutes, after the owner deletes the org
+        "system.org-deleted" to setOf("userName", "orgName", "deletedDate", "purgeDate"),
     )
 
     // ── the shipped templates ────────────────────────────────────────────────

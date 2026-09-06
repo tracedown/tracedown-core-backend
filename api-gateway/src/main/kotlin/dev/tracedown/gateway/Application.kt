@@ -487,7 +487,7 @@ fun Application.module() {
         meRoutes()
         inviteRoutes(appConfig, emailPublisher)
         groupRoutes()
-        orgSettingsRoutes(appConfig)
+        orgSettingsRoutes(appConfig, emailPublisher)
         permissionRoutes()
         resourceAccessRoutes()
         rulePresetRoutes()

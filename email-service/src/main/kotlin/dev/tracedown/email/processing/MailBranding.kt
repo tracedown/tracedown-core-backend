@@ -30,18 +30,18 @@ data class MailBranding(
         val logo = logoUrl?.takeIf { it.isNotBlank() }?.let {
             """<img src="${attr(it)}" width="28" height="28" alt="" style="width:28px;height:28px;vertical-align:middle;border:0;margin-right:10px;">"""
         } ?: ""
-        val wordmark = """<span style="font-size:17px;font-weight:700;letter-spacing:-0.01em;color:$TEXT_ON_DARK;vertical-align:middle;">${escape(productName)}</span>"""
+        val wordmark = """<span style="font-size:17px;font-weight:700;letter-spacing:-0.01em;color:$TEXT;vertical-align:middle;">${escape(productName)}</span>"""
         val inner = productUrl?.takeIf { it.isNotBlank() }?.let {
-            """<a href="${attr(it)}" style="text-decoration:none;color:$TEXT_ON_DARK;">$logo$wordmark</a>"""
+            """<a href="${attr(it)}" style="text-decoration:none;color:$TEXT;">$logo$wordmark</a>"""
         } ?: "$logo$wordmark"
-        return """<tr><td style="padding:18px 40px;background-color:$DARK;border-top:4px solid $ACCENT;">$inner</td></tr>"""
+        return """<tr><td style="padding:18px 40px;background-color:$HEADER;border-top:4px solid $ACCENT;border-bottom:1px solid $RULE;">$inner</td></tr>"""
     }
 
     /** A full `<tr>` for the bottom of the mail card, or empty when there is no small print. */
     fun footerRow(): String {
         val html = footerHtml?.trim().orEmpty()
         if (html.isEmpty()) return ""
-        return """<tr><td style="padding:20px 40px 28px;border-top:1px solid $RULE;"><p style="margin:0;font-size:12px;line-height:1.7;color:$MUTED;">$html</p></td></tr>"""
+        return """<tr><td style="padding:20px 40px 28px;border-top:1px solid $RULE;"><p style="margin:0;font-size:12px;line-height:1.7;color:$TEXT_DIM;">$html</p></td></tr>"""
     }
 
     /** The two placeholders, as the processor substitutes them. */
@@ -54,12 +54,27 @@ data class MailBranding(
         const val HEADER_KEY = "brandHeader"
         const val FOOTER_KEY = "brandFooter"
 
-        /** The dashboard's palette, so mail reads as the same product. */
-        const val DARK = "#222729"
+        /**
+         * The dashboard's palette, so mail reads as the same product: the whole
+         * card is dark, not just the header band. Templates on the classpath
+         * carry the same values inline (mail clients drop `<style>`), so a
+         * change here is a change there too.
+         */
+        /** Page background behind the card (`--color-background-secondary`). */
+        const val PAGE = "#0e1719"
+        /** The card itself (`--color-background-primary`). */
+        const val CARD = "#222729"
+        /** The header band, one step raised above the card. */
+        const val HEADER = "#2a3032"
         const val ACCENT = "#ff5e5b"
-        const val TEXT_ON_DARK = "#f2f5f4"
-        const val RULE = "#e4e4e7"
-        const val MUTED = "#71717a"
+        /** Headings and primary copy. */
+        const val TEXT = "#f2f5f4"
+        /** Secondary copy and small print (`--color-text-secondary`). */
+        const val TEXT_DIM = "#9eaeac"
+        /** Links (`--color-text-primary`). */
+        const val LINK = "#66a8e6"
+        /** Rules and the card border. */
+        const val RULE = "#3a4143"
 
         private fun escape(s: String) = s
             .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

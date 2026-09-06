@@ -1,5 +1,8 @@
 package dev.tracedown.gateway.routes.v1.orgs
 
+import dev.tracedown.common.email.EmailPublisher
+import dev.tracedown.common.models.Organizations
+import dev.tracedown.common.models.Users
 import dev.tracedown.gateway.controllers.orgs.OrgSettingsController
 import dev.tracedown.gateway.controllers.orgs.OrgVariableController
 import dev.tracedown.gateway.data.CreateVariableRequest
@@ -21,6 +24,14 @@ import io.ktor.server.resources.delete
 import io.ktor.server.resources.get
 import io.ktor.server.resources.patch
 import io.ktor.server.resources.post
+import org.jetbrains.exposed.v1.core.ResultRow
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 
 /**
  * @OpenAPITag Organization Settings
@@ -41,7 +52,7 @@ class Org {
     }
 }
 
-fun Route.orgSettingsRoutes(appConfig: AppConfig) {
+fun Route.orgSettingsRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
     /** Returns the organization's settings. */
     get<Org.Settings> {
         val (principal, orgId) = requireAuthWithOrg(call)
@@ -111,7 +122,46 @@ fun Route.orgSettingsRoutes(appConfig: AppConfig) {
         val (principal, orgId) = requireAuthWithOrg(call)
         val body = tryReceive<DeleteOrgRequest>(call)
         AuthController.verifyIdentity(principal.userId, body.password, body.code)
+        // Read before the delete: afterwards the org row is gone from the
+        // non-deleted view and the owner's membership with it.
+        val (orgName, owner) = transaction {
+            val orgName = Organizations.selectAll()
+                .where { (Organizations.id eq orgId) and (Organizations.deleted eq false) }
+                .firstOrNull()?.get(Organizations.name)
+            val owner = Users.selectAll().where { Users.id eq principal.userId }.firstOrNull()
+            orgName to owner
+        }
         OrgSettingsController.deleteOrg(orgId, principal.userId, appConfig.systemLimits.purgeRetentionDays)
+        if (orgName != null && owner != null) {
+            sendOrgDeletedEmail(emailPublisher, owner, orgName, appConfig.systemLimits.purgeRetentionDays)
+        }
         call.respond(mapOf("ok" to true))
     }
+}
+
+/**
+ * The one mail an org deletion sends: to the owner who did it, confirming what
+ * went and when its data is purged. The account-deletion cascade does not come
+ * through here — its own notice covers the orgs it takes with it.
+ */
+private fun sendOrgDeletedEmail(
+    emailPublisher: EmailPublisher,
+    owner: ResultRow,
+    orgName: String,
+    purgeRetentionDays: Int,
+) {
+    val now = Instant.now()
+    val date = DateTimeFormatter.ISO_LOCAL_DATE.withZone(ZoneOffset.UTC)
+    emailPublisher.publish(
+        to = owner[Users.email],
+        subject = "$orgName has been deleted",
+        type = "system.org-deleted",
+        vars = mapOf(
+            "userName" to owner[Users.displayName],
+            "orgName" to orgName,
+            "deletedDate" to date.format(now),
+            "purgeDate" to date.format(now.plusSeconds(purgeRetentionDays * 86400L)),
+        ),
+        source = "api-gateway",
+    )
 }
