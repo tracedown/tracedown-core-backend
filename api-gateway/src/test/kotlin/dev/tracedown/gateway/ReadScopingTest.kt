@@ -312,6 +312,46 @@ class ReadScopingTest {
     // ── Silence targets ──
 
     @Test
+    fun `the page holding a moment is counted from the newest result down`() {
+        val org = transaction { seedOrg("pageat") }
+        // Three results, one hour apart; seedOrg's own is the newest (NOW).
+        transaction {
+            for (hoursAgo in listOf(1L, 2L)) {
+                ProbeResults.insert {
+                    it[id] = UUID.randomUUID()
+                    it[serviceId] = org.serviceId
+                    it[projectId] = org.projectId
+                    it[workspaceId] = org.workspaceId
+                    it[organizationId] = org.id
+                    it[startedAt] = NOW.minusSeconds(hoursAgo * 3600)
+                    it[status] = "success"
+                    it[runDurationMs] = 12
+                    it[rawResult] = JsonObject(emptyMap())
+                }
+            }
+        }
+        // Page size 1: the newest is page 1, the one from an hour ago page 2, the oldest page 3.
+        assertEquals(1, ProbeResultController.pageAt(org.id, org.serviceId, org.ownerId, NOW, 1).page)
+        assertEquals(2, ProbeResultController.pageAt(org.id, org.serviceId, org.ownerId, NOW.minusSeconds(3600), 1).page)
+        assertEquals(3, ProbeResultController.pageAt(org.id, org.serviceId, org.ownerId, NOW.minusSeconds(7200), 1).page)
+        // A moment between two results lands on the page of the next-older one.
+        assertEquals(2, ProbeResultController.pageAt(org.id, org.serviceId, org.ownerId, NOW.minusSeconds(1800), 1).page)
+        // Before everything: clamped to the last page, never past it.
+        assertEquals(3, ProbeResultController.pageAt(org.id, org.serviceId, org.ownerId, NOW.minusSeconds(86400), 1).page)
+        // With the whole history on one page, every moment is page 1.
+        assertEquals(1, ProbeResultController.pageAt(org.id, org.serviceId, org.ownerId, NOW.minusSeconds(7200), 50).page)
+        assertEquals(3L, ProbeResultController.pageAt(org.id, org.serviceId, org.ownerId, NOW, 50).total)
+    }
+
+    @Test
+    fun `the page of a service in another org is not readable`() {
+        val (a, b) = transaction { seedOrg("pageat-a") to seedOrg("pageat-b") }
+        assertThrows(NotFoundException::class.java) {
+            ProbeResultController.pageAt(a.id, b.serviceId, a.ownerId, NOW, 50)
+        }
+    }
+
+    @Test
     fun `a service in another org cannot be silenced`() {
         assertThrows(NotFoundException::class.java) {
             SilenceController.create(

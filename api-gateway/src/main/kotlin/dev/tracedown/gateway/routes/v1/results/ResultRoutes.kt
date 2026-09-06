@@ -4,6 +4,8 @@ import dev.tracedown.common.storage.BodyStorageClient
 import dev.tracedown.gateway.controllers.results.ProbeResultController
 import dev.tracedown.gateway.routes.v1
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
+import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.parsePfsParams
 import dev.tracedown.gateway.util.parseUuid
 import io.ktor.http.HttpStatusCode
@@ -19,6 +21,10 @@ import kotlinx.serialization.Serializable
  */
 @Resource("/api/v1/services/{serviceId}/results")
 class Results(val serviceId: String) {
+    /** `at` is an ISO-8601 instant; `pageSize` must match the list's, or the page number means nothing. */
+    @Resource("page-at")
+    class PageAt(val parent: Results, val at: String, val pageSize: Int = 50)
+
     @Resource("{resultId}")
     class ById(val parent: Results, val resultId: String) {
         @Resource("steps/{stepId}/body")
@@ -46,6 +52,19 @@ fun Route.resultRoutes() {
         val pfs = parsePfsParams(call)
         val result = ProbeResultController.list(orgId, svcId, principal.userId, pfs)
         call.respond(result)
+    }
+
+    /** Returns the page on which results at or before `at` begin (see [ProbeResultController.pageAt]). */
+    get<Results.PageAt> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val svcId = parseUuid(resource.parent.serviceId, "service ID")
+        val at = try {
+            java.time.Instant.parse(resource.at)
+        } catch (e: java.time.format.DateTimeParseException) {
+            throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        }
+        if (resource.pageSize < 1 || resource.pageSize > 1000) throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        call.respond(ProbeResultController.pageAt(orgId, svcId, principal.userId, at, resource.pageSize))
     }
 
     /** Returns a single probe result with all steps. */

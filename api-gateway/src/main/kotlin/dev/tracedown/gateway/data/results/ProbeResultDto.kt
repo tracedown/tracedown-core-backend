@@ -44,3 +44,7 @@ data class ProbeStepSummary(
     val hasBody: Boolean,
     val bodyNotStoredReason: String?,
 )
+
+/** Where a moment sits in the history: the page holding results at or before `at`, and the total count. */
+@Serializable
+data class ResultPageAt(val page: Int, val total: Long)

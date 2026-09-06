@@ -21,6 +21,9 @@ import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import java.time.Instant
+import org.jetbrains.exposed.v1.core.greater
+import dev.tracedown.gateway.data.results.ResultPageAt
 import java.util.UUID
 
 /**
@@ -67,6 +70,31 @@ object ProbeResultController {
                 )
             }
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /**
+     * The page of the (most-recent-first) history on which results started at
+     * or before [at] begin: the count of newer results divided by the page
+     * size, plus one, clamped to the last page. The dashboard uses it to jump
+     * the pager to a date without turning the list into a filter, so the
+     * neighbours of that moment stay one click away.
+     */
+    fun pageAt(orgId: UUID, serviceId: UUID, userId: UUID, at: Instant, pageSize: Int): ResultPageAt {
+        return transaction {
+            val ctx = ResourceResolver.resolveService(serviceId, orgId)
+            val cached = requireCachedPermissions(orgId, userId)
+            val parentChain = listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
+            if (!canAccessResource(cached, "service", ctx.serviceId, parentChain)) {
+                throw NotFoundException()
+            }
+            val scope = (ProbeResults.serviceId eq serviceId) and (ProbeResults.organizationId eq orgId)
+            val total = ProbeResults.selectAll().where { scope }.count()
+            val newer = ProbeResults.selectAll().where { scope and (ProbeResults.startedAt greater at) }.count()
+            val limit = PfsParams(pageSize = pageSize).limit
+            val lastPage = ((total + limit - 1) / limit).toInt().coerceAtLeast(1)
+            val page = (newer / limit).toInt() + 1
+            ResultPageAt(page = page.coerceAtMost(lastPage), total = total)
         }
     }
 
