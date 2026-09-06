@@ -98,11 +98,13 @@ object SystemAlertService {
     const val HEALTH_TOKEN_UNAVAILABLE = "health_token_unavailable"
 
     /**
-     * Agent challenge round-trips above this raise [AGENT_DEGRADED]. The
-     * challenge is a cold mTLS handshake plus the agent's callback to the
-     * gateway (~5 round trips), so a healthy agent on another continent
-     * legitimately takes ~1–1.2 s — the boundary sits at the top of that,
-     * flagging only what geography can't explain.
+     * The floor of the round trip above which a passing agent challenge counts
+     * as degraded. The challenge is a cold mTLS handshake plus the agent's
+     * callback to the gateway (~5 round trips), so a healthy agent on another
+     * continent legitimately takes ~1 s; the scheduler's `DegradationRule`
+     * raises the ceiling to twice the agent's own recent median where that is
+     * higher, and needs two consecutive slow rounds, so the floor only ever
+     * decides for an agent with no history or a fast one.
      */
     const val DEGRADED_RTT_MS = 1200
 

@@ -32,8 +32,10 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.isNotNull
 import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
@@ -340,6 +342,7 @@ class HealthChallengeJob : Job {
         // or, while hysteresis is holding, whatever was there already.
         var status = "success"
         var convicted = false
+        var degraded = false
 
         transaction {
             // The previous round that observed anything, read in the same
@@ -355,6 +358,25 @@ class HealthChallengeJob : Job {
                 .limit(1)
                 .firstOrNull()
                 ?.get(AgentHealthChecks.result)
+
+            // Slowness is judged against this agent's own recent rounds, read
+            // before this one is written so the sample never includes itself.
+            if (result == RESULT_PASS) {
+                val recentPassMs = AgentHealthChecks.select(AgentHealthChecks.roundTripMs)
+                    .where {
+                        (AgentHealthChecks.probeAgentId eq agentId) and
+                            (AgentHealthChecks.result eq RESULT_PASS) and
+                            (AgentHealthChecks.roundTripMs.isNotNull())
+                    }
+                    .orderBy(AgentHealthChecks.createdAt to SortOrder.DESC)
+                    .limit(DegradationRule.BASELINE_ROUNDS)
+                    .mapNotNull { it[AgentHealthChecks.roundTripMs] }
+                degraded = DegradationRule.isDegraded(
+                    roundTripMs = roundTripMs,
+                    priorRoundTripMs = recentPassMs.firstOrNull(),
+                    baselineMs = DegradationRule.baseline(recentPassMs),
+                )
+            }
 
             AgentHealthChecks.insert {
                 it[id] = UUID.randomUUID()
@@ -419,7 +441,7 @@ class HealthChallengeJob : Job {
                 put("at", challengedAt.toString())
                 put("result", result)
             })
-        } else if (result == RESULT_PASS && roundTripMs > SystemAlertService.DEGRADED_RTT_MS) {
+        } else if (degraded) {
             raisePlatformAgentAlert(SystemAlertService.AGENT_DEGRADED, agentSlug, "warning", buildJsonObject {
                 put("agentSlug", agentSlug)
                 put("at", challengedAt.toString())
