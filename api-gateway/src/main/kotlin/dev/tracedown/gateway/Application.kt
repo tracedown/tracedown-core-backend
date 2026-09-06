@@ -235,6 +235,8 @@ fun Application.module() {
                 endpoint = endpoint,
                 accessKey = storageConf.property("storage.s3.accessKey").getString(),
                 secretKey = storageConf.property("storage.s3.secretKey").getString(),
+                region = storageConf.propertyOrNull("storage.s3.region")?.getString()?.takeIf { it.isNotBlank() } ?: "auto",
+                timeoutSeconds = storageConf.propertyOrNull("storage.s3.timeoutSeconds")?.getString()?.toLongOrNull() ?: 30L,
             )
         }
     dev.tracedown.gateway.controllers.results.ProbeResultController.init(

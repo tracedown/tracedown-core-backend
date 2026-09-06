@@ -52,6 +52,8 @@ data class IngestorConfig(
                                 endpoint = endpoint,
                                 accessKey = config.property("storage.s3.accessKey").getString(),
                                 secretKey = config.property("storage.s3.secretKey").getString(),
+                                region = config.propertyOrNull("storage.s3.region")?.getString()?.takeIf { it.isNotBlank() } ?: "auto",
+                                timeoutSeconds = config.propertyOrNull("storage.s3.timeoutSeconds")?.getString()?.toLongOrNull() ?: 30L,
                             )
                         },
                     s3Bucket = config.propertyOrNull("storage.s3.bucket")?.getString()

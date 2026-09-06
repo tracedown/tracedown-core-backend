@@ -112,6 +112,7 @@ class RetentionJob(
      */
     private suspend fun purgeOrg(orgId: UUID, cutoff: Instant, tickStart: Instant): Pair<Long, Boolean> {
         var deleted = 0L
+        var batches = 0
 
         while (true) {
             // One bounded page of ids. `LIMIT` is what keeps this off the heap:
@@ -138,14 +139,27 @@ class RetentionJob(
             // one: a slow or unreachable store must not hold a pooled
             // connection open for the length of the page.
             val failed = mutableListOf<Pair<String, String?>>()
-            for (uri in bodyUris) {
+            val bodiesStart = clock()
+            for ((index, uri) in bodyUris.withIndex()) {
+                val started = clock()
                 try {
                     storageClient.delete(uri)
                 } catch (e: Exception) {
                     failed.add(uri to e.message)
                     log.warn("Failed to delete body at {}: {}", uri, e.message)
                 }
+                // The first delete of a tick says what the store is doing: a
+                // healthy one answers in tens of milliseconds, and a hung one
+                // used to stall retention with nothing in the log at all.
+                if (index == 0 && batches == 0) {
+                    log.info(
+                        "Retention: first body delete for org {} took {} ms ({})",
+                        orgId, Duration.between(started, clock()).toMillis(),
+                        if (failed.isEmpty()) "ok" else "failed",
+                    )
+                }
             }
+            val bodiesMs = Duration.between(bodiesStart, clock()).toMillis()
 
             // The rows below are deleted whether or not the objects went, which
             // used to lose the only reference to a body still sitting in the
@@ -164,6 +178,11 @@ class RetentionJob(
                 ProbeResults.deleteWhere { id inList resultIds }
             }
             deleted += removed.toLong()
+            batches++
+            log.info(
+                "Retention: org {} batch {} — {} results, {} bodies ({} failed) in {} ms",
+                orgId, batches, resultIds.size, bodyUris.size, failed.size, bodiesMs,
+            )
 
             when (RetentionBatching.verdict(
                 rowsInRound = resultIds.size,

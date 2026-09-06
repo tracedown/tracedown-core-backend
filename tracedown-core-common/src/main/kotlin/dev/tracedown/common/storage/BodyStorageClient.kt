@@ -71,9 +71,20 @@ open class BodyStorageClient(
 
     private val s3Client: MinioClient? by lazy {
         s3Config?.let { cfg ->
+            val timeout = java.time.Duration.ofSeconds(cfg.timeoutSeconds.coerceAtLeast(1))
             MinioClient.builder()
                 .endpoint(cfg.endpoint)
                 .credentials(cfg.accessKey, cfg.secretKey)
+                .region(cfg.region)
+                // MinIO's own default client waits five minutes per phase.
+                .httpClient(
+                    okhttp3.OkHttpClient.Builder()
+                        .connectTimeout(timeout)
+                        .readTimeout(timeout)
+                        .writeTimeout(timeout)
+                        .callTimeout(timeout.multipliedBy(2))
+                        .build(),
+                )
                 .build()
         }
     }

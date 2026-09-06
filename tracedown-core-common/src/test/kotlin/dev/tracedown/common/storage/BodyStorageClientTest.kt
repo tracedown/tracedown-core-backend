@@ -106,4 +106,36 @@ class BodyStorageClientTest {
         assertTrue(e.message!!.contains("s3://bodies/org/svc/res/call_0_response.json"))
         assertTrue(e.cause != null, "the backend failure is kept as the cause")
     }
+
+    @Test
+    fun `s3 delete gives up on a store that accepts and never answers`() {
+        // A socket that completes the TCP handshake and then says nothing is
+        // what a stalled store looks like. MinIO's default client waits five
+        // minutes per phase for it; the configured timeout has to win instead,
+        // because retention deletes bodies one after another and a single hung
+        // call parked the whole job with nothing in the log.
+        val server = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
+        val accepted = mutableListOf<java.net.Socket>()
+        val acceptor = Thread {
+            try {
+                while (true) accepted.add(server.accept())
+            } catch (_: Exception) {
+            }
+        }.apply { isDaemon = true; start() }
+        try {
+            val client = BodyStorageClient(
+                s3Config = S3Config("http://127.0.0.1:${server.localPort}", "k", "s", timeoutSeconds = 1),
+            )
+            val started = System.nanoTime()
+            assertThrows(StorageDeleteException::class.java) {
+                client.delete("s3://bodies/org/svc/res/call_0_response.json")
+            }
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            assertTrue(elapsedMs < 15_000, "gave up after $elapsedMs ms, expected the 1s timeout to apply")
+        } finally {
+            accepted.forEach { runCatching { it.close() } }
+            server.close()
+            acceptor.interrupt()
+        }
+    }
 }
