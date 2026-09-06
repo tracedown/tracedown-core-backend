@@ -73,7 +73,10 @@ class ReadScopingTest {
             .withUsername("test")
             .withPassword("test")
 
-        private val NOW: Instant = Instant.now()
+        // Truncated to what the columns hold: probe_results.started_at is TIMESTAMP(0), and
+        // Postgres rounds to the nearest second, so a clock with 500 ms or more stored and read
+        // back comes out one second newer than itself.
+        private val NOW: Instant = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
 
         /** The caller's own org, owned by [ownerA]. */
         private lateinit var orgA: Org
