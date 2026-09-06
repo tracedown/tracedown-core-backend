@@ -13,6 +13,7 @@ get("$baseUrl/api/v1/org/settings", {
 .assert({
   expect: [
     this.body.id eq "$orgId",
-    this.body.name eq "Default"
+    this.body.name eq "Default",
+    this.body.dateFormat eq "eu"
   ]
 })

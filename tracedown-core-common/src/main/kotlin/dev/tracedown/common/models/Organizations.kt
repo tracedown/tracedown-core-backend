@@ -13,6 +13,8 @@ object Organizations : Table("organizations") {
     val deletedAt = timestamp("deleted_at").nullable()
     val purgeAfter = timestamp("purge_after").nullable()
     val defaultTimezone = varchar("default_timezone", 64).default("UTC")
+    /** `eu` (dd.mm.yyyy) or `us` (mm/dd/yyyy); how every member sees dates. */
+    val dateFormat = varchar("date_format", 8).default("eu")
     val createdAt = timestamp("created_at")
 
     override val primaryKey = PrimaryKey(id)

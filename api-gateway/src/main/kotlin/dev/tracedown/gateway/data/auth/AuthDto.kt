@@ -172,6 +172,8 @@ data class MeResponse(
     val resources: Map<String, Short> = emptyMap(),
     /** The selected org's default IANA timezone (null without org context). */
     val orgDefaultTimezone: String? = null,
+    /** The selected org's date format (`eu` / `us`; null without org context). */
+    val orgDateFormat: String? = null,
     /** Platform flag: when true, domain verification is a no-op (no Domains UI). */
     val trustedDomainMode: Boolean = true,
 )

@@ -75,6 +75,7 @@ object OrgSettingsController {
                 request.name?.let { v -> it[name] = v }
                 request.totpRequired?.let { v -> it[Organizations.totpRequired] = v }
                 request.defaultTimezone?.let { v -> it[Organizations.defaultTimezone] = v }
+                request.dateFormat?.let { v -> it[Organizations.dateFormat] = v }
             }
 
             if (totpChanged) {
@@ -88,6 +89,7 @@ object OrgSettingsController {
                     Triple("name", org[Organizations.name], request.name ?: org[Organizations.name]),
                     Triple("totpRequired", org[Organizations.totpRequired], request.totpRequired ?: org[Organizations.totpRequired]),
                     Triple("defaultTimezone", org[Organizations.defaultTimezone], request.defaultTimezone ?: org[Organizations.defaultTimezone]),
+                    Triple("dateFormat", org[Organizations.dateFormat], request.dateFormat ?: org[Organizations.dateFormat]),
                 ),
             )
             RealtimePublisher.publish("org:$orgId", orgId, "settings.updated")
@@ -228,6 +230,7 @@ object OrgSettingsController {
             ownerId = org[Organizations.ownerId].toString(),
             totpRequired = org[Organizations.totpRequired],
             defaultTimezone = org[Organizations.defaultTimezone],
+            dateFormat = org[Organizations.dateFormat],
         )
     }
 }

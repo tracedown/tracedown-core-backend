@@ -12,17 +12,29 @@ data class OrgSettings(
     val totpRequired: Boolean,
     /** Org-wide default IANA timezone (maintenance windows etc.). */
     val defaultTimezone: String,
+    /** Org-wide date format, one of [DateFormats.ALL]; applies to every member. */
+    val dateFormat: String,
 )
+
+object DateFormats {
+    /** dd.mm.yyyy */
+    const val EU = "eu"
+    /** mm/dd/yyyy */
+    const val US = "us"
+    val ALL: Set<String> = setOf(EU, US)
+}
 
 @Serializable
 data class UpdateOrgSettingsRequest(
     val name: String? = null,
     val totpRequired: Boolean? = null,
     val defaultTimezone: String? = null,
+    val dateFormat: String? = null,
 ) : Validatable {
     override fun validate() = buildList {
         Validators.maxLen("name", name, 128)?.let(::add)
         Validators.maxLen("defaultTimezone", defaultTimezone, 64)?.let(::add)
+        Validators.oneOf("dateFormat", dateFormat, DateFormats.ALL)?.let(::add)
     }
 }
 

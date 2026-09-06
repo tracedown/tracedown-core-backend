@@ -469,11 +469,10 @@ object AuthController {
                 )
             }
 
-            val orgDefaultTimezone = principal.organizationId?.let { orgId ->
+            val orgRow = principal.organizationId?.let { orgId ->
                 Organizations.selectAll()
                     .where { Organizations.id eq orgId }
                     .firstOrNull()
-                    ?.get(Organizations.defaultTimezone)
             }
 
             MeResponse(
@@ -483,7 +482,10 @@ object AuthController {
                 resources = cached?.resources ?: emptyMap(),
                 // Needed by anyone editing scripts (window editor prefill) —
                 // not sensitive, always included.
-                orgDefaultTimezone = orgDefaultTimezone,
+                orgDefaultTimezone = orgRow?.get(Organizations.defaultTimezone),
+                // Every member renders dates the org's way, so it rides the
+                // session like the timezone does.
+                orgDateFormat = orgRow?.get(Organizations.dateFormat),
                 // Platform-config disclosure — settings readers only; others
                 // get the safe default (domains UI hidden either way).
                 trustedDomainMode = if (cached?.org?.settings?.canRead() == true) {

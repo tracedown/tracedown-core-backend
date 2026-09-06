@@ -1,0 +1,36 @@
+// Login as admin
+post("$baseUrl/api/v1/auth/login", {
+  body: json({ email: "$adminEmail", password: "$adminPassword" })
+})
+.expect(status: 200)
+.store({ "$$token": this.body.token })
+
+// Switch the org to US dates
+patch("$baseUrl/api/v1/org/settings", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ dateFormat: "us" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.dateFormat eq "us"] })
+
+// The session carries it for every member
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.orgDateFormat eq "us"] })
+
+// Only the known formats are accepted
+patch("$baseUrl/api/v1/org/settings", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ dateFormat: "iso" })
+})
+.expect(status: 400)
+
+// Back to the default
+patch("$baseUrl/api/v1/org/settings", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ dateFormat: "eu" })
+})
+.expect(status: 200)
+.assert({ expect: [this.body.dateFormat eq "eu"] })
