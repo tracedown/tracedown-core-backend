@@ -67,7 +67,7 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.ktor.server.test.host)
 
-    testImplementation("dev.lacelang:kotlin-lacetest:0.1.6")
+    testImplementation("dev.lacelang:kotlin-lacetest:0.2.0")
 
     testImplementation(libs.flyway.core)
     testImplementation(libs.flyway.postgresql)
