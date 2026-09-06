@@ -27,6 +27,12 @@ object DatabaseFactory {
 
         Database.connect(dataSource)
 
+        // Initialise every table object here, on this one thread, before the
+        // caller launches jobs or serves requests: touched concurrently for
+        // the first time, the tables' mutual references deadlock the JVM's
+        // class initialisation with no error and no log. See [Tables].
+        dev.tracedown.common.models.Tables.preload()
+
         return dataSource
     }
 }
