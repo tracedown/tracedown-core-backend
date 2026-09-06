@@ -71,6 +71,8 @@ class PurgeJobTest {
             deleted.add(uri)
             return true
         }
+        override fun deleteAll(uris: Collection<String>): Map<String, String?> =
+            uris.mapNotNull { uri -> runCatching { delete(uri) }.exceptionOrNull()?.let { uri to it.message } }.toMap()
     }
 
     companion object {

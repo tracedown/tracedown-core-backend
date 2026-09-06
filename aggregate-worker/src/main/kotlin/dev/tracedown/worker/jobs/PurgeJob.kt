@@ -146,15 +146,8 @@ class PurgeJob(
             while (rs.next()) uris.add(rs.getString(1))
         }
 
-        val failed = mutableListOf<Pair<String, String?>>()
-        for (uri in uris) {
-            try {
-                storageClient.delete(uri)
-            } catch (e: Exception) {
-                failed.add(uri to e.message)
-                log.error("Failed to delete stored response body {}: {}", uri, e.message)
-            }
-        }
+        val failed = storageClient.deleteAll(uris).toList()
+        failed.forEach { (uri, error) -> log.error("Failed to delete stored response body {}: {}", uri, error) }
 
         // The rows naming these objects are about to go, so a failure here used
         // to destroy the only reference to a live object — permanently, since

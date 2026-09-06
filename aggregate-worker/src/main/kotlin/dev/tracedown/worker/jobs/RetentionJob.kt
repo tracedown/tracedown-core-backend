@@ -138,28 +138,22 @@ class RetentionJob(
             // Object-store round trips happen between transactions, not inside
             // one: a slow or unreachable store must not hold a pooled
             // connection open for the length of the page.
-            val failed = mutableListOf<Pair<String, String?>>()
+            // One bulk request per page rather than a round trip per body: at
+            // ~100 ms an object, a page of 600 bodies used to cost a minute and
+            // a whole tick budget drained nine pages.
             val bodiesStart = clock()
-            for ((index, uri) in bodyUris.withIndex()) {
-                val started = clock()
-                try {
-                    storageClient.delete(uri)
-                } catch (e: Exception) {
-                    failed.add(uri to e.message)
-                    log.warn("Failed to delete body at {}: {}", uri, e.message)
-                }
-                // The first delete of a tick says what the store is doing: a
-                // healthy one answers in tens of milliseconds, and a hung one
-                // used to stall retention with nothing in the log at all.
-                if (index == 0 && batches == 0) {
-                    log.info(
-                        "Retention: first body delete for org {} took {} ms ({})",
-                        orgId, Duration.between(started, clock()).toMillis(),
-                        if (failed.isEmpty()) "ok" else "failed",
-                    )
-                }
-            }
+            val failed = storageClient.deleteAll(bodyUris).toList()
+            failed.forEach { (uri, error) -> log.warn("Failed to delete body at {}: {}", uri, error) }
             val bodiesMs = Duration.between(bodiesStart, clock()).toMillis()
+            // The first page of a tick says what the store is doing: a healthy
+            // one answers in well under a second, and a hung one used to stall
+            // retention with nothing in the log at all.
+            if (batches == 0 && bodyUris.isNotEmpty()) {
+                log.info(
+                    "Retention: first body page for org {} — {} bodies in {} ms ({})",
+                    orgId, bodyUris.size, bodiesMs, if (failed.isEmpty()) "ok" else "${failed.size} failed",
+                )
+            }
 
             // The rows below are deleted whether or not the objects went, which
             // used to lose the only reference to a body still sitting in the

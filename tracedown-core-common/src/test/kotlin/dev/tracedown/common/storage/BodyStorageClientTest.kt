@@ -138,4 +138,65 @@ class BodyStorageClientTest {
             acceptor.interrupt()
         }
     }
+
+    @Test
+    fun `s3 bulk delete sends a page of keys as one request and reports nothing on success`() {
+        // Retention hands a whole page of bodies over at once; at one round
+        // trip per object a page cost a minute of wall clock, so the page must
+        // travel as a single DeleteObjects request.
+        val requests = java.util.concurrent.atomic.AtomicInteger()
+        val keysSeen = java.util.concurrent.atomic.AtomicInteger()
+        fakeS3(status = 200) { body ->
+            requests.incrementAndGet()
+            keysSeen.addAndGet(Regex("<Key>").findAll(body).count())
+        }.use { server ->
+            val client = BodyStorageClient(s3Config = S3Config("http://127.0.0.1:${server.port}", "k", "s"))
+            val uris = (1..600).map { "s3://bodies/org/svc/res-$it/call_0_response.json" }
+            assertEquals(emptyMap<String, String?>(), client.deleteAll(uris))
+            assertEquals(1, requests.get(), "a page of 600 keys is one request")
+            assertEquals(600, keysSeen.get())
+        }
+    }
+
+    @Test
+    fun `s3 bulk delete marks every key of a rejected request as failed`() {
+        // The rows naming these objects are dropped afterwards, so a request the
+        // store refused must surface each key: the caller queues them for the
+        // retry job exactly as it would a single failed delete.
+        fakeS3(status = 500) {}.use { server ->
+            val client = BodyStorageClient(s3Config = S3Config("http://127.0.0.1:${server.port}", "k", "s", timeoutSeconds = 5))
+            val uris = listOf("s3://bodies/a/1.json", "s3://bodies/a/2.json")
+            val failed = client.deleteAll(uris)
+            assertEquals(uris.toSet(), failed.keys)
+            assertTrue(failed.getValue("s3://bodies/a/1.json")!!.contains("s3://bodies/a/1.json"))
+        }
+    }
+
+    /** A loopback S3 that answers every DeleteObjects request with [status]. */
+    private class FakeS3(private val server: com.sun.net.httpserver.HttpServer) : AutoCloseable {
+        val port: Int get() = server.address.port
+        override fun close() = server.stop(0)
+    }
+
+    private fun fakeS3(status: Int, onDelete: (String) -> Unit): FakeS3 {
+        val server = com.sun.net.httpserver.HttpServer.create(
+            java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0), 0,
+        )
+        server.createContext("/") { ex ->
+            val body = ex.requestBody.readBytes().decodeToString()
+            if (ex.requestMethod == "POST" && ex.requestURI.query?.contains("delete") == true) {
+                onDelete(body)
+                val xml = """<?xml version="1.0" encoding="UTF-8"?>""" +
+                    """<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"""
+                ex.responseHeaders.add("Content-Type", "application/xml")
+                ex.sendResponseHeaders(status, xml.length.toLong())
+                ex.responseBody.use { it.write(xml.toByteArray()) }
+            } else {
+                ex.sendResponseHeaders(405, -1)
+                ex.close()
+            }
+        }
+        server.start()
+        return FakeS3(server)
+    }
 }

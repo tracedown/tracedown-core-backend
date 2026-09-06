@@ -5,6 +5,8 @@ import io.minio.GetPresignedObjectUrlArgs
 import io.minio.Http
 import io.minio.MinioClient
 import io.minio.RemoveObjectArgs
+import io.minio.RemoveObjectsArgs
+import io.minio.messages.DeleteRequest
 import io.minio.SourceObject
 import java.nio.file.Files
 import java.nio.file.Path
@@ -108,6 +110,41 @@ open class BodyStorageClient(
     }
 
     /**
+     * Deletes many bodies and returns the ones that could not be deleted, URI to
+     * reason. A missing object is not a failure.
+     *
+     * S3 keys go in bulk — one `DeleteObjects` request per bucket per
+     * [S3_DELETE_CHUNK] keys — instead of a round trip each: retention removes
+     * hundreds of bodies per batch, and at ~100 ms per object the whole tick
+     * budget went on waiting for the store. A request the store rejects outright
+     * marks every key it carried as failed; the caller records those for
+     * [BodyDeletionRetryJob] the same way as a single failed delete.
+     *
+     * Files are deleted one by one — that is a local call — through [delete], so
+     * a client that overrides the single delete keeps its behaviour here.
+     */
+    open fun deleteAll(uris: Collection<String>): Map<String, String?> {
+        val failed = LinkedHashMap<String, String?>()
+        // bucket → (key, uri)
+        val s3ByBucket = LinkedHashMap<String, MutableList<Pair<String, String>>>()
+        for (uri in uris) {
+            try {
+                when (val parsed = StorageUri.parse(uri)) {
+                    is StorageUri.File -> delete(uri)
+                    is StorageUri.S3 -> {
+                        confineS3(parsed.bucket, parsed.key)
+                        s3ByBucket.getOrPut(parsed.bucket) { mutableListOf() }.add(parsed.key to uri)
+                    }
+                }
+            } catch (e: Exception) {
+                failed[uri] = e.message
+            }
+        }
+        for ((bucket, entries) in s3ByBucket) failed.putAll(deleteS3Bulk(bucket, entries))
+        return failed
+    }
+
+    /**
      * Relocates a body from an agent-reported [sourceUri] to a server-derived
      * [destKey] within the confined backend, returning the canonical storage URI
      * that should be persisted.
@@ -192,6 +229,35 @@ open class BodyStorageClient(
             throw StorageDeleteException("failed to delete s3://$bucket/$key: ${e.message}", e)
         }
         return true
+    }
+
+    private fun deleteS3Bulk(bucket: String, entries: List<Pair<String, String>>): Map<String, String?> {
+        val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+        val uriByKey = entries.toMap()
+        val failed = LinkedHashMap<String, String?>()
+        for (chunk in entries.chunked(S3_DELETE_CHUNK)) {
+            try {
+                // The result is lazy: iterating it is what sends the request.
+                // Only per-key errors come back; a deleted or already-missing
+                // key produces nothing.
+                val errors = client.removeObjects(
+                    RemoveObjectsArgs.builder()
+                        .bucket(bucket)
+                        .objects(chunk.map { (key, _) -> DeleteRequest.Object(key) })
+                        .build()
+                )
+                for (result in errors) {
+                    val error = result.get()
+                    val uri = uriByKey[error.objectName()] ?: "s3://$bucket/${error.objectName()}"
+                    failed[uri] = "${error.code()}: ${error.message()}"
+                }
+            } catch (e: Exception) {
+                for ((key, uri) in chunk) {
+                    if (uri !in failed) failed[uri] = "failed to delete s3://$bucket/$key: ${e.message}"
+                }
+            }
+        }
+        return failed
     }
 
     private fun presignS3(bucket: String, key: String): String {
@@ -288,3 +354,6 @@ open class BodyStorageClient(
         return clean
     }
 }
+
+/** S3's ceiling for one DeleteObjects request. */
+private const val S3_DELETE_CHUNK = 1000
