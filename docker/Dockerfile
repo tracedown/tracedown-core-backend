@@ -8,7 +8,7 @@
 # via build targets.
 
 # ── Build stage ──
-FROM eclipse-temurin:17-jdk-alpine AS build
+FROM eclipse-temurin:21-jdk-alpine AS build
 
 WORKDIR /app
 
@@ -57,61 +57,61 @@ RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
 
 # ── Runtime images (one per service) ──
 
-FROM eclipse-temurin:17-jre-alpine AS migrator
+FROM eclipse-temurin:21-jre-alpine AS migrator
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/schema-migrator/build/install/schema-migrator ./
 CMD ["./bin/schema-migrator"]
 
-FROM eclipse-temurin:17-jre-alpine AS gateway
+FROM eclipse-temurin:21-jre-alpine AS gateway
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/api-gateway/build/install/api-gateway ./
 ENV PORT=20714
 EXPOSE 20714
 CMD ["./bin/api-gateway"]
 
-FROM eclipse-temurin:17-jre-alpine AS scheduler
+FROM eclipse-temurin:21-jre-alpine AS scheduler
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/probe-scheduler/build/install/probe-scheduler ./
 ENV PORT=20810
 EXPOSE 20810
 CMD ["./bin/probe-scheduler"]
 
-FROM eclipse-temurin:17-jre-alpine AS ingestor
+FROM eclipse-temurin:21-jre-alpine AS ingestor
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/result-ingestor/build/install/result-ingestor ./
 ENV PORT=20820
 EXPOSE 20820
 CMD ["./bin/result-ingestor"]
 
-FROM eclipse-temurin:17-jre-alpine AS dispatcher
+FROM eclipse-temurin:21-jre-alpine AS dispatcher
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/notification-dispatcher/build/install/notification-dispatcher ./
 ENV PORT=20830
 EXPOSE 20830
 CMD ["./bin/notification-dispatcher"]
 
-FROM eclipse-temurin:17-jre-alpine AS email
+FROM eclipse-temurin:21-jre-alpine AS email
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/email-service/build/install/email-service ./
 ENV PORT=20840
 EXPOSE 20840
 CMD ["./bin/email-service"]
 
-FROM eclipse-temurin:17-jre-alpine AS metrics
+FROM eclipse-temurin:21-jre-alpine AS metrics
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/metrics-service/build/install/metrics-service ./
 ENV PORT=20850
 EXPOSE 20850
 CMD ["./bin/metrics-service"]
 
-FROM eclipse-temurin:17-jre-alpine AS worker
+FROM eclipse-temurin:21-jre-alpine AS worker
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/aggregate-worker/build/install/aggregate-worker ./
 ENV PORT=20860
 EXPOSE 20860
 CMD ["./bin/aggregate-worker"]
 
-FROM eclipse-temurin:17-jre-alpine AS realtime
+FROM eclipse-temurin:21-jre-alpine AS realtime
 WORKDIR /app
 COPY --from=build /app/core/tracedown-core-backend/realtime-service/build/install/realtime-service ./
 ENV PORT=20870

@@ -58,7 +58,7 @@ services:
   # point here. For most deployments, it would be enough.
   # For larger environments, the architecture supports splitting them out - see the commented blocks below.
   tracedown-redis-a:
-    image: redis:7-alpine
+    image: redis:8-alpine
     container_name: tracedown-redis-a
     networks: [tracedown-net]
     command: redis-server --appendonly yes
@@ -82,7 +82,7 @@ services:
   # URL layer, not the data layer.
 
 #  tracedown-redis-b:
-#    image: redis:7-alpine
+#    image: redis:8-alpine
 #    container_name: tracedown-redis-b
 #    networks: [tracedown-net]
 #    command: redis-server --save "" --maxmemory 64mb --maxmemory-policy allkeys-lru
@@ -93,7 +93,7 @@ services:
 #      retries: 5
 #
 #  tracedown-redis-c:
-#    image: redis:7-alpine
+#    image: redis:8-alpine
 #    container_name: tracedown-redis-c
 #    networks: [tracedown-net]
 #    command: redis-server --save "" --maxmemory 128mb --maxmemory-policy allkeys-lru

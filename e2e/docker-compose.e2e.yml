@@ -17,7 +17,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     ports:
       - "16379:6379"
     command: redis-server --save ""
@@ -28,7 +28,7 @@ services:
       retries: 10
 
   migrator:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../schema-migrator/build/install/schema-migrator:/app
     command: /app/bin/schema-migrator
@@ -41,7 +41,7 @@ services:
         condition: service_healthy
 
   gateway:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../api-gateway/build/install/api-gateway:/app
     command: /app/bin/api-gateway
@@ -74,7 +74,7 @@ services:
       start_period: 10s
 
   scheduler:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../probe-scheduler/build/install/probe-scheduler:/app
     command: /app/bin/probe-scheduler
@@ -99,7 +99,7 @@ services:
         condition: service_healthy
 
   ingestor:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../result-ingestor/build/install/result-ingestor:/app
     command: /app/bin/result-ingestor
@@ -114,7 +114,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../aggregate-worker/build/install/aggregate-worker:/app
     command: /app/bin/aggregate-worker
@@ -136,7 +136,7 @@ services:
         condition: service_healthy
 
   dispatcher:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../notification-dispatcher/build/install/notification-dispatcher:/app
     command: /app/bin/notification-dispatcher
@@ -152,7 +152,7 @@ services:
         condition: service_healthy
 
   metrics:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../metrics-service/build/install/metrics-service:/app
     command: /app/bin/metrics-service
@@ -170,7 +170,7 @@ services:
         condition: service_healthy
 
   email:
-    image: eclipse-temurin:17-jre-alpine
+    image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../email-service/build/install/email-service:/app
     command: /app/bin/email-service

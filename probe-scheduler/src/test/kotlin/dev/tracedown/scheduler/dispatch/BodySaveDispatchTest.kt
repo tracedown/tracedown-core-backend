@@ -58,7 +58,7 @@ class BodySaveDispatchTest {
 
         @Container
         @JvmStatic
-        val redis = GenericContainer("redis:7-alpine")
+        val redis = GenericContainer("redis:8-alpine")
             .withExposedPorts(6379)
             .waitingFor(Wait.forListeningPort())
     }

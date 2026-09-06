@@ -6,7 +6,7 @@ plugins {
 allprojects {
     group = "dev.tracedown"
 
-    version = "0.4.15"
+    version = "0.4.16"
 
     repositories {
         mavenCentral()

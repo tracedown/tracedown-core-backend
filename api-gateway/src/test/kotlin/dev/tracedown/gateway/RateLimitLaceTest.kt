@@ -53,7 +53,7 @@ class RateLimitLaceTest {
         /** This class's own limiter store — see the note on the class. */
         @Container
         @JvmStatic
-        val redis: GenericContainer<*> = GenericContainer(DockerImageName.parse("redis:7-alpine"))
+        val redis: GenericContainer<*> = GenericContainer(DockerImageName.parse("redis:8-alpine"))
             .withExposedPorts(6379)
 
         private val redisUrl: String

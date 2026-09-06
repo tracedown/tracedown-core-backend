@@ -8,7 +8,7 @@ import org.testcontainers.utility.DockerImageName
  * Reused across all test classes via static reference.
  */
 object TestRedis {
-    val container: GenericContainer<*> = GenericContainer(DockerImageName.parse("redis:7-alpine"))
+    val container: GenericContainer<*> = GenericContainer(DockerImageName.parse("redis:8-alpine"))
         .withExposedPorts(6379)
 
     init {

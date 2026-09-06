@@ -11,7 +11,7 @@
 name: tracedown
 
 x-service: &service
-  image: eclipse-temurin:17-jre
+  image: eclipse-temurin:21-jre
   restart: unless-stopped
   env_file: .env
   environment:
@@ -31,7 +31,7 @@ x-service: &service
 services:
   # One-shot: downloads the pinned (or latest) release artifacts.
   tracedown-artifacts:
-    image: alpine:3.20
+    image: alpine:3.24
     environment:
       BACKEND_VERSION: ${BACKEND_VERSION:-latest}
       FRONTEND_VERSION: ${FRONTEND_VERSION:-latest}
@@ -66,7 +66,7 @@ services:
 
   tracedown-redis-a:
     # Operational Redis (AOF): queues, outbox nudges, pub/sub, locks.
-    image: redis:7-alpine
+    image: redis:8-alpine
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
@@ -82,13 +82,13 @@ services:
   # REDIS_B_URL / REDIS_C_URL in .env. A single instance is fine to start.
   #
   # tracedown-redis-b:
-  #   image: redis:7-alpine
+  #   image: redis:8-alpine
   #   restart: unless-stopped
   #   command: ["redis-server", "--save", "", "--maxmemory-policy", "allkeys-lru"]
   #   networks: [tracedown-net]
   #
   # tracedown-redis-c:
-  #   image: redis:7-alpine
+  #   image: redis:8-alpine
   #   restart: unless-stopped
   #   command: ["redis-server", "--save", "", "--maxmemory-policy", "allkeys-lru"]
   #   networks: [tracedown-net]
@@ -96,7 +96,7 @@ services:
   # One-shot: applies the schema. Runs from the installDist layout — the
   # migrator must not run as a merged jar (Flyway would find no migrations).
   tracedown-migrator:
-    image: eclipse-temurin:17-jre
+    image: eclipse-temurin:21-jre
     env_file: .env
     environment:
       DATABASE_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
