@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.controllers.metrics
 
+import dev.tracedown.common.config.PlatformDefaults
 import dev.tracedown.gateway.data.UsageResponse
 import io.lettuce.core.api.sync.RedisCommands
 import java.time.Instant
@@ -13,7 +14,9 @@ import java.util.UUID
  * the per-level hourly usage buckets the metrics-service writes to Redis B
  * (`metrics:usage:{svc|proj|ws|org}:{id}:h:{yyyyMMddHH}`). Buckets are
  * immutable once their hour passes; the window is capped to the shorter of the
- * request, 7 days, and the probe-result retention period.
+ * request, 7 days, and the probe-result retention period — the organization's
+ * own where the platform sets one per organization (the [RetentionConfig]
+ * seam), else the global value.
  */
 object UsageController {
 
@@ -21,25 +24,31 @@ object UsageController {
     const val MIN_WINDOW_HOURS = 2
 
     private lateinit var redisProvider: () -> RedisCommands<String, String>
-    private var retentionHours: Int = MAX_WINDOW_HOURS
+    private var globalRetentionHours: Int = MAX_WINDOW_HOURS
     private val redis get() = redisProvider()
 
     private val hourFormatter = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
 
     fun init(redis: () -> RedisCommands<String, String>, resultRetentionDays: Int) {
         this.redisProvider = redis
-        this.retentionHours = if (resultRetentionDays > 0) resultRetentionDays * 24 else MAX_WINDOW_HOURS
+        this.globalRetentionHours = if (resultRetentionDays > 0) resultRetentionDays * 24 else MAX_WINDOW_HOURS
     }
 
-    fun forService(serviceId: UUID, requestedHours: Int): UsageResponse = usage("svc", serviceId, requestedHours)
-    fun forProject(projectId: UUID, requestedHours: Int): UsageResponse = usage("proj", projectId, requestedHours)
-    fun forWorkspace(workspaceId: UUID, requestedHours: Int): UsageResponse = usage("ws", workspaceId, requestedHours)
-    fun forOrg(orgId: UUID, requestedHours: Int): UsageResponse = usage("org", orgId, requestedHours)
+    /** The retention cap for [orgId]: its own period where the platform sets one, else the global. */
+    private fun retentionHours(orgId: UUID): Int {
+        val days = PlatformDefaults.retentionConfig.resultRetentionDays(orgId)
+        return if (days > 0) days * 24 else globalRetentionHours
+    }
 
-    private fun usage(level: String, id: UUID, requestedHours: Int): UsageResponse {
+    fun forService(orgId: UUID, serviceId: UUID, requestedHours: Int): UsageResponse = usage("svc", serviceId, requestedHours, orgId)
+    fun forProject(orgId: UUID, projectId: UUID, requestedHours: Int): UsageResponse = usage("proj", projectId, requestedHours, orgId)
+    fun forWorkspace(orgId: UUID, workspaceId: UUID, requestedHours: Int): UsageResponse = usage("ws", workspaceId, requestedHours, orgId)
+    fun forOrg(orgId: UUID, requestedHours: Int): UsageResponse = usage("org", orgId, requestedHours, orgId)
+
+    private fun usage(level: String, id: UUID, requestedHours: Int, orgId: UUID): UsageResponse {
         val hours = requestedHours
             .coerceIn(MIN_WINDOW_HOURS, MAX_WINDOW_HOURS)
-            .coerceAtMost(retentionHours)
+            .coerceAtMost(retentionHours(orgId))
             .coerceAtLeast(1)
 
         val now = Instant.now()

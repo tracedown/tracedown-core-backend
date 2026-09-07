@@ -43,7 +43,7 @@ fun Route.usageRoutes() {
                 throw NotFoundException()
             }
         }
-        call.respond(UsageController.forService(serviceId, resource.hours))
+        call.respond(UsageController.forService(orgId, serviceId, resource.hours))
     }
 
     get<ProjectUsage> { resource ->
@@ -56,7 +56,7 @@ fun Route.usageRoutes() {
                 throw NotFoundException()
             }
         }
-        call.respond(UsageController.forProject(projectId, resource.hours))
+        call.respond(UsageController.forProject(orgId, projectId, resource.hours))
     }
 
     get<WorkspaceUsage> { resource ->
@@ -69,7 +69,7 @@ fun Route.usageRoutes() {
                 throw NotFoundException()
             }
         }
-        call.respond(UsageController.forWorkspace(workspaceId, resource.hours))
+        call.respond(UsageController.forWorkspace(orgId, workspaceId, resource.hours))
     }
 
     /** Org-wide usage — the aggregate view, gated by admin write. */
