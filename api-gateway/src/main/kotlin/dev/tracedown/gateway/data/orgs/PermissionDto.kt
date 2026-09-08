@@ -37,6 +37,12 @@ data class ResourceGrant(
  * object — extension keys appear as siblings of the built-in keys, so the
  * representation matches the permission cache. With no registered sections the
  * output is byte-identical to the built-in-only form.
+ *
+ * Every section registered with [PermissionSections] is always written, at 0
+ * when the row stores nothing for it. A row created before a section was
+ * registered — or by a seed that only fills the sections it cares about — has
+ * no entry in its extension map, and a client that renders the matrix from the
+ * registry would otherwise meet an absent key where it expects a level.
  */
 @Serializable(with = OrgSectionPermissionsSerializer::class)
 data class OrgSectionPermissions(
@@ -66,8 +72,13 @@ object OrgSectionPermissionsSerializer : KSerializer<OrgSectionPermissions> {
             put("notifications", value.notifications.toInt())
             put("admin", value.admin.toInt())
             put("workspaces", value.workspaces.toInt())
+            for (key in PermissionSections.registered()) {
+                put(key, (value.extra[key] ?: 0).toInt())
+            }
+            // Levels stored under keys no module registers in this process are
+            // still relayed, as they always were: the data is the row's, not ours.
             for ((key, level) in value.extra) {
-                put(key, level.toInt())
+                if (key !in PermissionSections.registered()) put(key, level.toInt())
             }
         }
         jsonEncoder.encodeJsonElement(obj)
