@@ -283,6 +283,22 @@ object ServiceController {
      * A successful save bumps the version. The scheduler treats that column as
      * its "this service changed" marker, so a schedule edit now moves it too and
      * the consistency sweep sees the change even if the nudge is missed.
+     *
+     * ## The first save switches the service on
+     *
+     * A service is created switched off, because at that moment it has no script
+     * and nothing to run. The save that gives it one is therefore the moment it
+     * becomes runnable, and flipping the toggle afterwards is a separate step
+     * nobody means to skip and everybody does — the symptom being a service that
+     * looks finished and never probes anything.
+     *
+     * [Services.version] is what makes this safe to do automatically: it is 1
+     * only on a service that has never been saved, and a service that has never
+     * been saved cannot have been switched off on purpose (enabling one requires
+     * a valid script, and writing that script is itself a save). So a service
+     * whose owner later disabled it is at version 2 or more and is never touched
+     * here. The enable rides the same UPDATE and is reported by the
+     * `isActive` of the returned [ServiceSummary].
      */
     fun update(orgId: UUID, serviceId: UUID, request: UpdateServiceRequest, userId: UUID): ServiceSummary {
         // A script write must say what it is replacing. Rejected before the
@@ -408,7 +424,18 @@ object ServiceController {
                 }
             }
 
+            // The first save of a never-saved service switches it on — see the
+            // KDoc. Held to the same bar the toggle endpoint applies: a script
+            // that is present and valid. A save carrying one has already been
+            // parsed above, so only a config-only first save pays for the parse,
+            // and only once in a service's life.
+            val autoEnable = currentVersion == 1 &&
+                !old[Services.isActive] &&
+                effectiveScript.isNotBlank() &&
+                (request.script != null || validateScript(effectiveScript).isEmpty())
+
             Services.update({ (Services.id eq serviceId) and (Services.projectId eq ctx.projectId) }) {
+                if (autoEnable) it[isActive] = true
                 request.name?.let { v -> it[name] = v }
                 request.label?.let { v -> it[label] = v }
                 request.schedule?.let { v -> it[schedule] = v }
@@ -439,6 +466,16 @@ object ServiceController {
                             ),
                         )
                     }.toString(),
+                )
+            }
+
+            // Its own entry, under the same action the toggle endpoint writes:
+            // "who switched this on" has one answer wherever it was switched on.
+            if (autoEnable) {
+                AuditService.log(
+                    orgId, userId, "enable.service", "service", serviceId.toString(),
+                    entityDisplayName = old[Services.name],
+                    diff = auditDiff(Triple("isActive", false, true)),
                 )
             }
 

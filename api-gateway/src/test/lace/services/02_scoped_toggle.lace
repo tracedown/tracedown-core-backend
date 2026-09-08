@@ -33,7 +33,9 @@ post("$baseUrl/api/v1/projects", {
 
 // ── Project A: two runnable services ──
 // Services are created disabled with an empty script, so each needs a valid one
-// before it can be enabled at all.
+// before it can be enabled at all. That first save also switches the service on,
+// so each is switched back off here — this file is about the scoped toggle, and
+// it needs something left to change.
 post("$baseUrl/api/v1/services", {
   headers: { Authorization: "Bearer $$token" },
   body: json({ projectId: "$$projA", name: "A One", label: "a-one" })
@@ -47,6 +49,12 @@ patch("$baseUrl/api/v1/services/$$svcA1/script", {
 })
 .expect(status: 200)
 
+patch("$baseUrl/api/v1/services/$$svcA1/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: false })
+})
+.expect(status: 200)
+
 post("$baseUrl/api/v1/services", {
   headers: { Authorization: "Bearer $$token" },
   body: json({ projectId: "$$projA", name: "A Two", label: "a-two" })
@@ -57,6 +65,12 @@ post("$baseUrl/api/v1/services", {
 patch("$baseUrl/api/v1/services/$$svcA2/script", {
   headers: { Authorization: "Bearer $$token" },
   body: json({ script: "get(\"https://example.com\").expect(status: 200)", version: 1 })
+})
+.expect(status: 200)
+
+patch("$baseUrl/api/v1/services/$$svcA2/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: false })
 })
 .expect(status: 200)
 
@@ -123,6 +137,12 @@ post("$baseUrl/api/v1/services", {
 patch("$baseUrl/api/v1/services/$$svcB1/script", {
   headers: { Authorization: "Bearer $$token" },
   body: json({ script: "get(\"https://example.com\").expect(status: 200)", version: 1 })
+})
+.expect(status: 200)
+
+patch("$baseUrl/api/v1/services/$$svcB1/toggle", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ isActive: false })
 })
 .expect(status: 200)
 
