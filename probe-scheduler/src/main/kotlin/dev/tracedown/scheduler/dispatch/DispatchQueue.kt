@@ -37,6 +37,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
+ * Skip reasons written for ticks the unverified-domain policy (spec §18.4)
+ * withholds. Policy outcomes, not capacity: the ingestor raises no alert for
+ * them, and the history explains itself.
+ */
+const val SKIP_UNVERIFIED_INCLUDES = "unverified_includes"
+const val SKIP_UNVERIFIED_MAX_CALLS = "unverified_max_calls"
+const val SKIP_UNVERIFIED_THROTTLE = "unverified_throttle"
+
+/**
  * Bounded dispatch queue that decouples Quartz trigger timing from agent HTTP dispatch.
  *
  * Quartz jobs enqueue service IDs instantly (non-blocking). A fixed pool of dispatcher
@@ -349,7 +358,9 @@ class DispatchQueue(
             // max 3 calls, no body saving, min 5-minute interval. The rule
             // below narrows the service's own setting — it never widens it, so
             // a service that saves bodies still loses them on unverified
-            // domains.
+            // domains. A tick the policy withholds is recorded as a skipped
+            // result naming the rule: a silent gap in the history reads as a
+            // scheduler fault, and the operator has no way to tell it from one.
             var allowBodySave = service[Services.saveResponseBodies]
             if (!trustedDomainMode) {
                 val policy = transaction { DomainPolicy.evaluate(script, resolvedVars, ctx.orgId) }
@@ -359,6 +370,8 @@ class DispatchQueue(
                             "service {} uses includes() against unverified domains — skipping (anti-scraping, §18.4)",
                             serviceId,
                         )
+                        recordSkipped(serviceId, SKIP_UNVERIFIED_INCLUDES, Instant.now())
+                        accounted.set(true)
                         return
                     }
                     if (policy.callCount > DomainPolicy.MAX_CALLS) {
@@ -366,10 +379,14 @@ class DispatchQueue(
                             "service {} targets unverified domains with {} calls (max {}) — skipping",
                             serviceId, policy.callCount, DomainPolicy.MAX_CALLS,
                         )
+                        recordSkipped(serviceId, SKIP_UNVERIFIED_MAX_CALLS, Instant.now())
+                        accounted.set(true)
                         return
                     }
                     if (!queuePolicy.allowUnverifiedTick(serviceId, DomainPolicy.MIN_INTERVAL_SECONDS)) {
                         log.debug("service {} throttled (unverified domains, 5m minimum)", serviceId)
+                        recordSkipped(serviceId, SKIP_UNVERIFIED_THROTTLE, Instant.now())
+                        accounted.set(true)
                         return
                     }
                     allowBodySave = false

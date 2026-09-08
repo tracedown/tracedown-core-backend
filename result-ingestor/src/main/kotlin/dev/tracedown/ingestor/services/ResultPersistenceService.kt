@@ -458,6 +458,10 @@ object ResultPersistenceService {
         // the same, so a host could reroute it too if it chose.
         if (status == "skipped") {
             val reason = rawResult["reason"]?.jsonPrimitive?.contentOrNull ?: "unknown"
+            // A tick the unverified-domain policy withheld (§18.4) is that
+            // policy working, not a fault: the skipped row says why, and a
+            // capacity banner would send the org the wrong way.
+            if (reason.startsWith("unverified_")) return PersistOutcome.PERSISTED
             val data = buildJsonObject {
                 put("reason", reason)
             }

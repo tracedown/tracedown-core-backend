@@ -103,11 +103,18 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
     /**
      * Rate limit for unverified-domain probes: at most one dispatch per
      * window. Returns true when this tick may proceed.
+     *
+     * The key lives slightly *less* than the window (see
+     * [unverifiedThrottleTtlSeconds]): a service scheduled at exactly the
+     * minimum interval fires each tick a few milliseconds after the previous
+     * one set the key, so a full-length TTL would still be running and every
+     * second tick would vanish. Cron granularity is a minute, so the next
+     * faster schedule is a whole minute shorter and stays throttled.
      */
     fun allowUnverifiedTick(serviceId: UUID, windowSeconds: Long): Boolean {
         val acquired = redis.set(
             "unverified_throttle:$serviceId", "1",
-            SetArgs().nx().ex(windowSeconds),
+            SetArgs().nx().ex(unverifiedThrottleTtlSeconds(windowSeconds)),
         )
         return acquired != null
     }
@@ -115,6 +122,17 @@ class QueuePolicyManager(private val redis: RedisCommands<String, String>) {
     companion object {
         /** Matches AgentDispatchService's per-agent client overhead over the probe timeout. */
         const val DISPATCH_OVERHEAD_MS = 15_000L
+
+        /**
+         * How much earlier than the window the unverified-domain throttle key
+         * expires. Absorbs the tick-versus-key race at a schedule equal to the
+         * window without admitting the next faster cron schedule (a minute
+         * shorter). Never lets the TTL drop below one second.
+         */
+        const val UNVERIFIED_THROTTLE_TOLERANCE_SECONDS = 30L
+
+        fun unverifiedThrottleTtlSeconds(windowSeconds: Long): Long =
+            (windowSeconds - UNVERIFIED_THROTTLE_TOLERANCE_SECONDS).coerceAtLeast(1L)
 
         /** Extra headroom so the lock never lapses mid-dispatch. */
         const val SAFETY_MARGIN_MS = 15_000L
