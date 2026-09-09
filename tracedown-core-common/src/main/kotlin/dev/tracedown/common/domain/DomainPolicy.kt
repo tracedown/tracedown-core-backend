@@ -40,7 +40,18 @@ object DomainPolicy {
     // the caller's vars map decides which keys exist.
     private val VAR_RE = Regex("""\$\{?([a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_])\}?|\$([a-zA-Z_])\}?""")
 
-    data class Evaluation(val covered: Boolean, val callCount: Int, val usesIncludes: Boolean = false)
+    /**
+     * [unverifiedHosts] names what keeps [covered] false: each target host no
+     * verified domain covers, or the raw URL when its host could not be
+     * resolved (a variable with no value). Distinct, in script order, empty
+     * when covered — the client shows them beside the setting they restrict.
+     */
+    data class Evaluation(
+        val covered: Boolean,
+        val callCount: Int,
+        val usesIncludes: Boolean = false,
+        val unverifiedHosts: List<String> = emptyList(),
+    )
 
     /** Must be called within a transaction. `vars` is a flat name→value map. */
     fun evaluate(script: String, vars: Map<String, String>, orgId: UUID): Evaluation {
@@ -49,7 +60,10 @@ object DomainPolicy {
         if (urls.isEmpty()) return Evaluation(covered = true, callCount = 0, usesIncludes = usesIncludes)
 
         val hosts = urls.map { hostOf(substituteVars(it, vars)) }
-        if (hosts.any { it == null }) return Evaluation(covered = false, callCount = urls.size, usesIncludes = usesIncludes)
+        if (hosts.any { it == null }) {
+            val unresolved = urls.filterIndexed { i, _ -> hosts[i] == null }.distinct()
+            return Evaluation(covered = false, callCount = urls.size, usesIncludes = usesIncludes, unverifiedHosts = unresolved)
+        }
 
         val domains = OrgDomains.selectAll()
             .where {
@@ -60,8 +74,15 @@ object DomainPolicy {
             }
             .map { Triple(it[OrgDomains.domain], it[OrgDomains.wildcardEnabled], it[OrgDomains.exceptions] ?: emptyList()) }
 
-        val covered = hosts.all { host -> domains.any { covers(host!!, it.first, it.second, it.third) } }
-        return Evaluation(covered = covered, callCount = urls.size, usesIncludes = usesIncludes)
+        val uncovered = hosts.filter { host -> domains.none { covers(host!!, it.first, it.second, it.third) } }
+            .map { it!! }
+            .distinct()
+        return Evaluation(
+            covered = uncovered.isEmpty(),
+            callCount = urls.size,
+            usesIncludes = usesIncludes,
+            unverifiedHosts = uncovered,
+        )
     }
 
     /** Replaces `$ident` / `${ident}` with resolved variable values. */

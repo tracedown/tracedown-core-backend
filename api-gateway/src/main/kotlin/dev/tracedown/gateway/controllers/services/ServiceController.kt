@@ -249,7 +249,22 @@ object ServiceController {
             val ctx = ResourceResolver.resolveService(serviceId, orgId)
             val cached = requireCachedPermissions(orgId, userId)
             requireServiceAccess(ctx.serviceId, ctx.projectId, ctx.workspaceId, cached)
-            serviceSummary(serviceId)
+            val base = serviceSummary(serviceId)
+            // The same evaluation dispatch applies (DomainPolicy §18.4), so the
+            // client can lock body saving where the scheduler would ignore it
+            // anyway, and name the host to verify. Detail read only: a list of
+            // services would pay one domain query per row for a hint nobody
+            // sees there.
+            if (trustedDomainMode) {
+                base
+            } else {
+                val policy = DomainPolicy.evaluate(
+                    base.script,
+                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
+                    orgId,
+                )
+                base.copy(unverifiedTargets = policy.unverifiedHosts)
+            }
         }
         // Same enrichment the list applies — consumers replace list rows with
         // this payload, so a leaner shape would erase state client-side.

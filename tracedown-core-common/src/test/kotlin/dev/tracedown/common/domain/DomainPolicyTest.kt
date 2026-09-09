@@ -2,6 +2,7 @@ package dev.tracedown.common.domain
 
 import java.util.UUID
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -23,6 +24,24 @@ class DomainPolicyTest {
         )
         assertFalse(e.covered, "unresolvable host is not covered")
         assertTrue(e.usesIncludes, "includes() must be detected")
+    }
+
+    @Test
+    fun `an unresolvable target is named by its raw url`() {
+        val e = DomainPolicy.evaluate(
+            """get("${'$'}x/health"); get("${'$'}x/health"); get("${'$'}y")""",
+            emptyMap(),
+            org,
+        )
+        assertFalse(e.covered)
+        assertEquals(listOf("${'$'}x/health", "${'$'}y"), e.unverifiedHosts, "distinct, in script order")
+    }
+
+    @Test
+    fun `a script with no calls names nothing`() {
+        val e = DomainPolicy.evaluate("// nothing to fetch", emptyMap(), org)
+        assertTrue(e.covered)
+        assertEquals(emptyList(), e.unverifiedHosts)
     }
 
     @Test

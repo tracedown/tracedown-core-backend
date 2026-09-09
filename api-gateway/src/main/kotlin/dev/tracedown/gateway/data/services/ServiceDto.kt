@@ -170,6 +170,15 @@ data class ServiceSummary(
     val serviceWindow: String?,
     /** When false, runs are dispatched with body saving off — no stored body to inspect. */
     val saveResponseBodies: Boolean,
+    /**
+     * Target hosts no verified domain of the organization covers (raw URL when
+     * the host cannot be resolved). Non-empty means the unverified-domain rule
+     * applies to this service: bodies are never saved whatever
+     * [saveResponseBodies] says, so the client locks that setting and says why.
+     * Filled on the single-service read only; empty on list rows and in
+     * trusted-domain mode.
+     */
+    val unverifiedTargets: List<String> = emptyList(),
     val isActive: Boolean,
     val lastStatus: String?,
     val lastStatusSince: String?,
