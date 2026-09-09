@@ -8,6 +8,7 @@ import dev.tracedown.gateway.data.metrics.RegionSeries
 import dev.tracedown.gateway.data.metrics.ServiceStatisticsDto
 import dev.tracedown.gateway.data.metrics.StatBucket
 import dev.tracedown.gateway.data.services.ProbePoint
+import dev.tracedown.gateway.util.HourBuckets
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -19,6 +20,7 @@ import dev.tracedown.gateway.data.metrics.MetricsState
 import dev.tracedown.gateway.data.metrics.ResponsePercentiles
 import dev.tracedown.gateway.data.metrics.ServiceMetricsDto
 import io.lettuce.core.LettuceFutures
+import io.lettuce.core.RedisFuture
 import io.lettuce.core.SetArgs
 import io.lettuce.core.api.sync.RedisCommands
 import java.util.concurrent.TimeUnit
@@ -36,7 +38,7 @@ import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.time.Instant
-import java.time.ZoneOffset
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 import java.util.UUID
@@ -53,12 +55,26 @@ object DashboardMetricsController {
 
     private lateinit var redisProvider: () -> RedisCommands<String, String>
 
-    private val hourFormatter = DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
+    private val historyLog = org.slf4j.LoggerFactory.getLogger("dev.tracedown.gateway.metrics.history")
 
-    /** Initialize with a Redis B connection provider. */
-    fun init(redis: () -> RedisCommands<String, String>) {
+    /**
+     * TTL given to an hourly bucket this controller seals — the same one the
+     * ingest path sets when it creates a bucket, so a sealed hour lives exactly
+     * as long as a written one.
+     */
+    private var hourlyBucketTtlSeconds: Long = DEFAULT_HOURLY_BUCKET_TTL_SECONDS
+
+    /** Initialize with a Redis B connection provider and the hourly-bucket TTL. */
+    fun init(
+        redis: () -> RedisCommands<String, String>,
+        hourlyBucketTtlSeconds: Long = DEFAULT_HOURLY_BUCKET_TTL_SECONDS,
+    ) {
         this.redisProvider = redis
+        this.hourlyBucketTtlSeconds = hourlyBucketTtlSeconds
     }
+
+    /** Matches the metrics-service default for `METRICS_HOURLY_BUCKET_TTL_SECONDS`. */
+    const val DEFAULT_HOURLY_BUCKET_TTL_SECONDS = 90000L
 
     private val redis get() = redisProvider()
 
@@ -360,21 +376,28 @@ object DashboardMetricsController {
     /**
      * Aggregates hourly buckets across multiple services for the last [hours] hours.
      * Each hour bucket sums total/success/failure/timeout/sumMs across all services.
+     *
+     * Closed hours come from sealed Redis hashes only — an unsealed one is
+     * recomputed from `probe_results` and sealed, see [readClosedBuckets]. The
+     * hour in progress is read from Redis as it stands.
      */
     fun getAggregatedHistory(serviceIds: List<UUID>, hours: Int): List<HourlyBucket> {
         val now = Instant.now()
-        val bucketKeys = (hours - 1 downTo 0).map { hourFormatter.format(now.minusSeconds(it * 3600L)) }
+        val bucketKeys = HourBuckets.window(now, hours)
+        if (bucketKeys.isEmpty()) return emptyList()
         if (serviceIds.isEmpty()) {
-            return bucketKeys.map { HourlyBucket(hour = it, total = 0, success = 0, failure = 0, timeout = 0, sumMs = 0) }
+            return bucketKeys.map { emptyBucket(it) }
         }
 
-        val currentKey = bucketKeys.last()
-        val closedKeys = bucketKeys.dropLast(1)
+        // window() ends on the hour in progress, so that is the one open key
+        // and everything before it is closed and final.
+        val (closedKeys, openKeys) = HourBuckets.splitClosed(bucketKeys, now)
+        val currentKey = openKeys.last()
 
-        // Closed hours are immutable — cache them until the hour rolls over
-        // (the key embeds the current hour, so rollover is a natural miss).
-        // Keyed by the exact visible service set so per-user access
-        // differences can never leak. Worst case: one full recompute per
+        // Closed hours are immutable — cache the assembled series until the
+        // hour rolls over (the key embeds the current hour, so rollover is a
+        // natural miss). Keyed by the exact visible service set so per-user
+        // access differences can never leak. Worst case: one full recompute per
         // id-set per hour, instead of one per 30 seconds.
         val closedCacheKey = "metrics:agg:history:closed:$hours:$currentKey:${idSetHash(serviceIds)}"
         val closed: List<HourlyBucket> = redis.get(closedCacheKey)?.let { cached ->
@@ -384,8 +407,7 @@ object DashboardMetricsController {
                 null // stale shape — recompute
             }
         } ?: run {
-            val computed = closedKeys.map { readHourBucket(serviceIds, it) }.toMutableList()
-            fillEmptiesFromDb(serviceIds, computed)
+            val computed = readClosedBuckets(serviceIds, closedKeys, now)
             redis.set(closedCacheKey, Json.encodeToString<List<HourlyBucket>>(computed), SetArgs.Builder.ex(CLOSED_CACHE_SECONDS))
             computed
         }
@@ -407,38 +429,143 @@ object DashboardMetricsController {
      * allocation to one hour's worth of futures.
      */
     private fun readHourBucket(serviceIds: List<UUID>, bucketKey: String): HourlyBucket {
+        val sum = BucketSum()
+        for (data in readHourHashes(serviceIds, bucketKey)) sum.add(data)
+        return sum.toBucket(bucketKey)
+    }
+
+    /** One pipelined `HGETALL` per service for one hour, in [serviceIds] order. */
+    private fun readHourHashes(serviceIds: List<UUID>, bucketKey: String): List<Map<String, String>> {
         val async = redis.statefulConnection.async()
         val futures = serviceIds.map { id -> async.hgetall("metrics:svc:$id:h:$bucketKey") }
         LettuceFutures.awaitAll(30, TimeUnit.SECONDS, *futures.toTypedArray())
-
-        var total = 0L; var success = 0L; var failure = 0L
-        var timeout = 0L; var sumMs = 0L; var callCount = 0L
-        for (future in futures) {
-            val data = future.get()
-            if (data.isNotEmpty()) {
-                total += data["total"]?.toLongOrNull() ?: 0
-                success += data["success"]?.toLongOrNull() ?: 0
-                failure += data["failure"]?.toLongOrNull() ?: 0
-                timeout += data["timeout"]?.toLongOrNull() ?: 0
-                sumMs += data["sum_ms"]?.toLongOrNull() ?: 0
-                callCount += data["call_count"]?.toLongOrNull() ?: 0
-            }
-        }
-        return HourlyBucket(hour = bucketKey, total = total, success = success, failure = failure, timeout = timeout, sumMs = sumMs, callCount = callCount)
+        return futures.map { it.get() }
     }
 
     /**
-     * Hours Redis knows nothing about (cache flush / restart): fill from the
-     * DB with ONE grouped query over the whole gap span — never by loading
-     * raw rows per hour.
+     * Assembles the closed hours of a request.
+     *
+     * A closed hour is trusted only where the service's Redis hash carries the
+     * seal. Everything else is recomputed: from the outside there is no telling
+     * a complete hour from one a mid-hour Redis B restart cut in half, from one
+     * the cache dropped whole, or from an hour that genuinely had no runs — the
+     * hash holds a number either way. All of those go to `probe_results` in ONE
+     * grouped query, are written back sealed, and are what the response carries.
+     * The hour is over, so the recomputed value is final.
      */
-    private fun fillEmptiesFromDb(serviceIds: List<UUID>, buckets: MutableList<HourlyBucket>) {
-        val emptyHours = buckets.filter { it.total == 0L }.map { it.hour }
-        if (emptyHours.isEmpty()) return
-        val dbBuckets = dbHistoryBuckets(serviceIds, emptyHours.min(), emptyHours.max())
-        for ((idx, bucket) in buckets.withIndex()) {
-            if (bucket.total == 0L) dbBuckets[bucket.hour]?.let { buckets[idx] = it }
+    private fun readClosedBuckets(serviceIds: List<UUID>, closedKeys: List<String>, now: Instant): List<HourlyBucket> {
+        if (closedKeys.isEmpty()) return emptyList()
+
+        val totals = closedKeys.associateWith { BucketSum() }
+        val unsealed = linkedMapOf<String, MutableList<UUID>>()
+
+        for (hourKey in closedKeys) {
+            for ((index, data) in readHourHashes(serviceIds, hourKey).withIndex()) {
+                if (HourBuckets.isSealed(data)) {
+                    totals.getValue(hourKey).add(data)
+                } else {
+                    unsealed.getOrPut(hourKey) { mutableListOf() }.add(serviceIds[index])
+                }
+            }
         }
+
+        if (unsealed.isNotEmpty()) {
+            val services = unsealed.values.flatten().distinct()
+            val fromDb = dbHistoryBucketsByService(services, unsealed.keys.min(), unsealed.keys.max())
+            val seals = mutableListOf<Triple<UUID, String, HourlyBucket>>()
+            for ((hourKey, ids) in unsealed) {
+                for (id in ids) {
+                    val bucket = fromDb[id]?.get(hourKey) ?: emptyBucket(hourKey)
+                    totals.getValue(hourKey).add(bucket)
+                    // Hours older than the bucket TTL are answered from the DB
+                    // but not written back — the cache would drop them again
+                    // before anyone read them.
+                    if (HourBuckets.isWithinRetention(hourKey, now, hourlyBucketTtlSeconds)) {
+                        seals += Triple(id, hourKey, bucket)
+                    }
+                }
+            }
+            sealBuckets(seals)
+        }
+
+        return closedKeys.map { totals.getValue(it).toBucket(it) }
+    }
+
+    /**
+     * Writes recomputed closed hours back to their Redis hashes, sealed, with
+     * the TTL the ingest path gives an hourly bucket — one pipelined batch, so
+     * a cold cache costs round trips once rather than per bucket.
+     *
+     * Best effort: the DB already answered the request, so a cache that refuses
+     * the write must not fail it. The hours simply stay unsealed and are
+     * recomputed on the next read.
+     */
+    private fun sealBuckets(seals: List<Triple<UUID, String, HourlyBucket>>) {
+        if (seals.isEmpty()) return
+        try {
+            val async = redis.statefulConnection.async()
+            val futures = mutableListOf<RedisFuture<*>>()
+            for ((serviceId, hourKey, bucket) in seals) {
+                val key = "metrics:svc:$serviceId:h:$hourKey"
+                futures += async.hset(key, mapOf(
+                    "total" to bucket.total.toString(),
+                    "success" to bucket.success.toString(),
+                    "failure" to bucket.failure.toString(),
+                    "timeout" to bucket.timeout.toString(),
+                    "sum_ms" to bucket.sumMs.toString(),
+                    "call_count" to bucket.callCount.toString(),
+                    HourBuckets.SEALED_FIELD to HourBuckets.SEALED_VALUE,
+                ))
+                futures += async.expire(key, hourlyBucketTtlSeconds)
+            }
+            if (!LettuceFutures.awaitAll(30, TimeUnit.SECONDS, *futures.toTypedArray())) {
+                historyLog.warn("sealing {} hourly buckets timed out", seals.size)
+            }
+        } catch (e: Exception) {
+            historyLog.warn("sealing {} hourly buckets failed: {}", seals.size, e.message)
+        }
+    }
+
+    private fun emptyBucket(hour: String) =
+        HourlyBucket(hour = hour, total = 0, success = 0, failure = 0, timeout = 0, sumMs = 0)
+
+    /** Running total of one hour across services. */
+    private class BucketSum {
+        private var total = 0L
+        private var success = 0L
+        private var failure = 0L
+        private var timeout = 0L
+        private var sumMs = 0L
+        private var callCount = 0L
+
+        fun add(hash: Map<String, String>) {
+            if (hash.isEmpty()) return
+            total += hash["total"]?.toLongOrNull() ?: 0
+            success += hash["success"]?.toLongOrNull() ?: 0
+            failure += hash["failure"]?.toLongOrNull() ?: 0
+            timeout += hash["timeout"]?.toLongOrNull() ?: 0
+            sumMs += hash["sum_ms"]?.toLongOrNull() ?: 0
+            callCount += hash["call_count"]?.toLongOrNull() ?: 0
+        }
+
+        fun add(bucket: HourlyBucket) {
+            total += bucket.total
+            success += bucket.success
+            failure += bucket.failure
+            timeout += bucket.timeout
+            sumMs += bucket.sumMs
+            callCount += bucket.callCount
+        }
+
+        fun toBucket(hour: String) = HourlyBucket(
+            hour = hour,
+            total = total,
+            success = success,
+            failure = failure,
+            timeout = timeout,
+            sumMs = sumMs,
+            callCount = callCount,
+        )
     }
 
     /** Just past an hour: the key embeds the hour, the TTL is only cleanup. */
@@ -452,16 +579,41 @@ object DashboardMetricsController {
 
     /**
      * Aggregates probe_results into hourly buckets in SQL for the inclusive
-     * hour-key range [firstHour, lastHour]. Returns buckets keyed by hour.
+     * hour-key range [firstHour, lastHour], summed over [serviceIds]. Returns
+     * buckets keyed by hour.
      */
     private fun dbHistoryBuckets(serviceIds: List<UUID>, firstHour: String, lastHour: String): Map<String, HourlyBucket> {
-        val sqlTsFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneOffset.UTC)
-        val start = java.time.LocalDateTime.parse(firstHour + "0000", DateTimeFormatter.ofPattern("yyyyMMddHHmmss")).toInstant(ZoneOffset.UTC)
-        val end = java.time.LocalDateTime.parse(lastHour + "0000", DateTimeFormatter.ofPattern("yyyyMMddHHmmss")).toInstant(ZoneOffset.UTC).plusSeconds(3600)
+        val sums = mutableMapOf<String, BucketSum>()
+        for (perHour in dbHistoryBucketsByService(serviceIds, firstHour, lastHour).values) {
+            for ((hour, bucket) in perHour) sums.getOrPut(hour) { BucketSum() }.add(bucket)
+        }
+        return sums.mapValues { (hour, sum) -> sum.toBucket(hour) }
+    }
+
+    /**
+     * The same aggregation kept per service, so a recomputed hour can be
+     * written back to the per-service Redis hash it came from. One query for
+     * every service and every hour in the inclusive range [firstHour, lastHour]
+     * — never raw rows, never a query per hour.
+     */
+    private fun dbHistoryBucketsByService(serviceIds: List<UUID>, firstHour: String, lastHour: String): Map<UUID, Map<String, HourlyBucket>> {
+        if (serviceIds.isEmpty()) return emptyMap()
+        // `started_at` is a timestamp WITHOUT a zone, and the ingestor stores an
+        // Instant in it through the JDBC driver — i.e. as the writing JVM's
+        // local wall clock. So the bounds go in that same wall clock, and the
+        // column is converted back to UTC before it is bucketed, because the
+        // hour keys these buckets answer to are UTC. On a UTC deployment both
+        // are no-ops; anywhere else they are what keeps an hour's rows in the
+        // hour Redis filed them under.
+        val zone = ZoneId.systemDefault()
+        val sqlTsFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(zone)
+        val start = HourBuckets.start(firstHour)
+        val end = HourBuckets.start(lastHour).plusSeconds(3600)
         // Service ids come from the DB (UUID objects) — safe to inline.
         val idArray = serviceIds.joinToString(",") { "'$it'" }
         val sql = """
-            SELECT to_char(date_trunc('hour', started_at), 'YYYYMMDDHH24') AS hr,
+            SELECT service_id AS svc,
+                   to_char(date_trunc('hour', started_at AT TIME ZONE '${zone.id}' AT TIME ZONE 'UTC'), 'YYYYMMDDHH24') AS hr,
                    count(*) AS total,
                    count(*) FILTER (WHERE status = 'success') AS success,
                    count(*) FILTER (WHERE status = 'failure') AS failure,
@@ -477,15 +629,16 @@ object DashboardMetricsController {
               -- Redis hourly buckets exclude it as well; without this the DB
               -- fallback for the same hour would return a different number.
               AND status != 'skipped'
-            GROUP BY 1
+            GROUP BY 1, 2
         """.trimIndent()
 
-        val out = mutableMapOf<String, HourlyBucket>()
+        val out = mutableMapOf<UUID, MutableMap<String, HourlyBucket>>()
         transaction {
             exec(sql) { rs ->
                 while (rs.next()) {
+                    val svc = UUID.fromString(rs.getString("svc"))
                     val hr = rs.getString("hr")
-                    out[hr] = HourlyBucket(
+                    out.getOrPut(svc) { mutableMapOf() }[hr] = HourlyBucket(
                         hour = hr,
                         total = rs.getLong("total"),
                         success = rs.getLong("success"),

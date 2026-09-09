@@ -221,7 +221,13 @@ fun Application.module() {
     // In the default single-instance setup this is the same server either way.
     val rateLimiter = RateLimiter(redis = { redisA }, config = rateLimitConfig)
 
-    dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.init { redisB }
+    // The seal the history endpoint writes on a closed hour has to live as
+    // long as an hourly bucket the ingest path writes, so both sides read the
+    // same variable (see the metrics-service's `metrics.hourlyBucketTtlSeconds`).
+    val hourlyBucketTtlSeconds = environment.config.propertyOrNull("metrics.hourlyBucketTtlSeconds")
+        ?.getString()?.toLongOrNull()?.takeIf { it > 0 }
+        ?: dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.DEFAULT_HOURLY_BUCKET_TTL_SECONDS
+    dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.init({ redisB }, hourlyBucketTtlSeconds)
     dev.tracedown.gateway.controllers.metrics.UsageController.init({ redisB }, appConfig.systemLimits.resultRetentionDays)
     // Body storage, same root/bucket the agent writes and the ingestor
     // relocates in. Without the S3 config an s3:// body URI cannot be

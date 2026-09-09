@@ -11,13 +11,19 @@ import io.ktor.server.netty.NettyApplicationEngine
 import io.lettuce.core.RedisClient
 import dev.tracedown.common.models.ProbeAggregates
 import dev.tracedown.common.models.ProbeAgents
+import dev.tracedown.common.models.ProbeResults
+import dev.tracedown.common.models.Workspaces
+import dev.tracedown.gateway.util.HourBuckets
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.long
+import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -62,6 +68,9 @@ class DashboardMetricsTest {
         private const val PASSWORD = "Down2trace!"
         private const val EMAIL = "admin@tracedown.dev"
         private lateinit var serviceId: UUID
+        private lateinit var projectId: UUID
+        private lateinit var workspaceId: UUID
+        private lateinit var organizationId: UUID
 
         @BeforeAll
         @JvmStatic
@@ -112,8 +121,59 @@ class DashboardMetricsTest {
             val projBody = post("/api/v1/projects", """{"workspaceId":"$wsId","name":"MetricsProj"}""", token)
             val projId = Json.parseToJsonElement(projBody).jsonObject["id"]!!.jsonPrimitive.content
 
+            workspaceId = UUID.fromString(wsId)
+            projectId = UUID.fromString(projId)
+            organizationId = transaction {
+                Workspaces.selectAll().where { Workspaces.id eq workspaceId }.single()[Workspaces.organizationId]
+            }
+
             val svcBody = post("/api/v1/services", """{"projectId":"$projId","name":"Metrics Svc"}""", token)
             serviceId = UUID.fromString(Json.parseToJsonElement(svcBody).jsonObject["id"]!!.jsonPrimitive.content)
+        }
+
+        /** A service of its own, so probe_results seeded for it cannot reach another test. */
+        private fun createService(name: String): UUID {
+            val body = post("/api/v1/services", """{"projectId":"$projectId","name":"$name"}""", login())
+            return UUID.fromString(Json.parseToJsonElement(body).jsonObject["id"]!!.jsonPrimitive.content)
+        }
+
+        /** Inserts [count] finished probes into the hour [hourKey] names. */
+        private fun seedProbeResults(svcId: UUID, hourKey: String, count: Int, status: String) {
+            val startedAt = HourBuckets.start(hourKey).plusSeconds(1800)
+            val projId = projectId
+            val wsId = workspaceId
+            val orgId = organizationId
+            transaction {
+                repeat(count) {
+                    ProbeResults.insert {
+                        it[id] = UUID.randomUUID()
+                        it[ProbeResults.serviceId] = svcId
+                        it[ProbeResults.projectId] = projId
+                        it[ProbeResults.workspaceId] = wsId
+                        it[ProbeResults.organizationId] = orgId
+                        it[ProbeResults.startedAt] = startedAt
+                        it[ProbeResults.status] = status
+                        it[runDurationMs] = 10
+                        it[totalResponseMs] = 100
+                        it[rawResult] = JsonObject(emptyMap())
+                    }
+                }
+            }
+        }
+
+        private fun hourHash(svcId: UUID, hourKey: String): Map<String, String> =
+            redisClient.connect().use { it.sync().hgetall("metrics:svc:$svcId:h:$hourKey") }
+
+        private fun seedHourHash(svcId: UUID, hourKey: String, fields: Map<String, String>) {
+            redisClient.connect().use { it.sync().hset("metrics:svc:$svcId:h:$hourKey", fields) }
+        }
+
+        /** The assembled-closed-series cache, which would otherwise outlive a test. */
+        private fun clearClosedHistoryCache() {
+            redisClient.connect().use { conn ->
+                val keys = conn.sync().keys("metrics:agg:history:closed:*")
+                if (keys.isNotEmpty()) conn.sync().del(*keys.toTypedArray())
+            }
         }
 
         private fun login(): String {
@@ -312,6 +372,75 @@ class DashboardMetricsTest {
             assertEquals(0, bucket["sumMs"]!!.jsonPrimitive.int)
             assertNotNull(bucket["hour"]!!.jsonPrimitive.content)
         }
+    }
+
+    @Test
+    fun `a closed hour left half-counted by a Redis restart is recomputed and sealed`() {
+        clearClosedHistoryCache()
+        val svcId = createService("Sealing Svc")
+        val closedHour = HourBuckets.key(Instant.now().minusSeconds(3600))
+
+        // The durable truth: 24 probes ran in that hour.
+        seedProbeResults(svcId, closedHour, 22, "success")
+        seedProbeResults(svcId, closedHour, 2, "failure")
+
+        // What Redis B kept after restarting mid-hour: half the count, no seal,
+        // and nothing in the hash to say the difference.
+        seedHourHash(svcId, closedHour, mapOf(
+            "total" to "12", "success" to "11", "failure" to "1",
+            "timeout" to "0", "sum_ms" to "1200", "call_count" to "12",
+        ))
+
+        val (status, body) = get("/api/v1/services/$svcId/metrics/history?hours=2", login())
+        assertEquals(200, status)
+
+        val list = Json.parseToJsonElement(body).jsonArray
+        assertEquals(2, list.size)
+        val bucket = list[0].jsonObject
+        assertEquals(closedHour, bucket["hour"]!!.jsonPrimitive.content)
+        assertEquals(24, bucket["total"]!!.jsonPrimitive.long)
+        assertEquals(22, bucket["success"]!!.jsonPrimitive.long)
+        assertEquals(2, bucket["failure"]!!.jsonPrimitive.long)
+        assertEquals(2400, bucket["sumMs"]!!.jsonPrimitive.long)
+
+        // ...and the hash is now sealed at the durable numbers, so the next
+        // read is served from Redis without going near the DB.
+        val hash = hourHash(svcId, closedHour)
+        assertEquals("1", hash["sealed"])
+        assertEquals("24", hash["total"])
+        assertEquals("22", hash["success"])
+        assertEquals("2", hash["failure"])
+    }
+
+    @Test
+    fun `a sealed closed hour is served as it stands`() {
+        clearClosedHistoryCache()
+        val svcId = createService("Sealed Svc")
+        val closedHour = HourBuckets.key(Instant.now().minusSeconds(2 * 3600))
+
+        // Sealed values the DB cannot produce — probe_results holds nothing for
+        // this service — so a recompute would answer 0 and only the seal can
+        // answer 7.
+        seedHourHash(svcId, closedHour, mapOf(
+            "total" to "7", "success" to "6", "failure" to "1",
+            "timeout" to "0", "sum_ms" to "700", "call_count" to "7",
+            "sealed" to "1",
+        ))
+
+        val (status, body) = get("/api/v1/services/$svcId/metrics/history?hours=3", login())
+        assertEquals(200, status)
+
+        val list = Json.parseToJsonElement(body).jsonArray
+        assertEquals(3, list.size)
+        val bucket = list[0].jsonObject
+        assertEquals(closedHour, bucket["hour"]!!.jsonPrimitive.content)
+        assertEquals(7, bucket["total"]!!.jsonPrimitive.long)
+        assertEquals(6, bucket["success"]!!.jsonPrimitive.long)
+        assertEquals(1, bucket["failure"]!!.jsonPrimitive.long)
+        assertEquals(700, bucket["sumMs"]!!.jsonPrimitive.long)
+
+        // Untouched: nothing recomputed it, nothing re-sealed it.
+        assertEquals("7", hourHash(svcId, closedHour)["total"])
     }
 
 }

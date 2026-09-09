@@ -136,6 +136,36 @@ class MetricsWriterTest {
         assertEquals(HOURLY_TTL, redis.ttls[hourKey])
     }
 
+    @Test
+    fun `record leaves a sealed hourly bucket alone`() {
+        val serviceId = UUID.randomUUID()
+        val hourKey = "metrics:svc:$serviceId:h:${currentHourBucket()}"
+
+        // The hour closed and the API recomputed it from probe_results.
+        redis.hashes[hourKey] = mutableMapOf(
+            "total" to "24", "success" to "22", "failure" to "2",
+            "timeout" to "0", "sum_ms" to "2400", "call_count" to "24",
+            "sealed" to "1",
+        )
+
+        // A result whose hour key was taken just before the hour rolled over.
+        writer.record(serviceId, "success", 200)
+
+        val bucket = redis.hashes[hourKey]!!
+        assertEquals("24", bucket["total"])
+        assertEquals("22", bucket["success"])
+        assertEquals("2400", bucket["sum_ms"])
+        assertEquals("1", bucket["sealed"])
+
+        // The rest of the write is unaffected — only the sealed hour is skipped.
+        assertEquals("1", redis.hashes["metrics:svc:$serviceId:counters"]!!["probes_total"])
+        assertEquals("success", redis.hashes["metrics:svc:$serviceId:state"]!!["last_status"])
+    }
+
+    private fun currentHourBucket(): String = DateTimeFormatter.ofPattern("yyyyMMddHH")
+        .withZone(ZoneOffset.UTC)
+        .format(Instant.now())
+
     /**
      * Minimal fake Redis backed by in-memory maps. Implements only the methods
      * used by MetricsWriter via a JDK dynamic proxy on RedisCommands.

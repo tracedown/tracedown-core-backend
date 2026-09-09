@@ -33,6 +33,14 @@ class MetricsWriter(
     companion object {
         /** Maximum number of recent-probe entries kept per service. */
         const val RECENT_PROBES_MAX_SIZE = 50L
+
+        /**
+         * Field the API sets on an hourly bucket it has recomputed from
+         * probe_results once the hour closed. Redis B has no persistence, so a
+         * bucket without it can have been cut short by a restart; a bucket with
+         * it is final and this writer leaves it alone.
+         */
+        const val SEALED_FIELD = "sealed"
     }
 
     /**
@@ -69,12 +77,23 @@ class MetricsWriter(
         ))
         setInitialTtlIfNew(stateKey, metricsTtlSeconds)
 
-        // Hourly bucket
-        redisB.hincrby(hourKey, "total", 1)
-        redisB.hincrby(hourKey, status, 1)
-        redisB.hincrby(hourKey, "sum_ms", totalResponseMs.toLong())
-        redisB.hincrby(hourKey, "call_count", callCount.toLong())
-        setInitialTtlIfNew(hourKey, hourlyBucketTtlSeconds)
+        // Hourly bucket. A sealed bucket is SKIPPED, not merged: the seal means
+        // the API already recomputed that hour from probe_results, which is
+        // where this result is stored too, so incrementing would either
+        // double-count it or — worse — leave a hand-counted hour that no longer
+        // matches the durable data while still claiming to. This only ever
+        // fires on the hour boundary (a result whose hour key was taken just
+        // before the hour rolled over, landing after the API sealed it); the
+        // row itself is already in probe_results either way.
+        if (redisB.hget(hourKey, SEALED_FIELD) == null) {
+            redisB.hincrby(hourKey, "total", 1)
+            redisB.hincrby(hourKey, status, 1)
+            redisB.hincrby(hourKey, "sum_ms", totalResponseMs.toLong())
+            redisB.hincrby(hourKey, "call_count", callCount.toLong())
+            setInitialTtlIfNew(hourKey, hourlyBucketTtlSeconds)
+        } else {
+            log.debug("hour bucket {} is sealed — leaving it to the durable data", hourKey)
+        }
 
         // Recent probes: ring buffer of recent probe points.
         // LPUSHX only appends if key exists — the API endpoint creates the key
