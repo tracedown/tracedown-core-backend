@@ -307,8 +307,14 @@ object ResultPersistenceService {
                         // (body saving disabled), `bodyTooLarge`, or `timeout` (no body received)
                         // — spec §9 response.bodyNotCapturedReason. A body that was captured but
                         // could not be taken into server-owned storage is recorded as unavailable.
-                        it[bodyNotStoredReason] = response?.get("bodyNotCapturedReason")?.jsonPrimitive?.contentOrNull
-                            ?: if (index in bodyRelocationFailed) "storageUnavailable" else null
+                        // When the scheduler withheld the bodies itself (unverified
+                        // target, §18.4) the executor still says `notRequested`; the
+                        // envelope carries the real reason — see BodyNotStoredReason.
+                        it[bodyNotStoredReason] = BodyNotStoredReason.resolve(
+                            reported = response?.get("bodyNotCapturedReason")?.jsonPrimitive?.contentOrNull,
+                            withheld = envelope["bodiesWithheld"]?.jsonPrimitive?.contentOrNull,
+                            relocationFailed = index in bodyRelocationFailed,
+                        )
                         it[error] = call["error"]?.jsonPrimitive?.contentOrNull
                         it[createdAt] = startedAt
                     }

@@ -44,6 +44,8 @@ import java.util.concurrent.atomic.AtomicLong
 const val SKIP_UNVERIFIED_INCLUDES = "unverified_includes"
 const val SKIP_UNVERIFIED_MAX_CALLS = "unverified_max_calls"
 const val SKIP_UNVERIFIED_THROTTLE = "unverified_throttle"
+/** `body_not_stored_reason` for a body the §18.4 unverified-domain rule withheld. */
+const val BODIES_WITHHELD_UNVERIFIED = "unverifiedTarget"
 
 /**
  * Bounded dispatch queue that decouples Quartz trigger timing from agent HTTP dispatch.
@@ -362,6 +364,10 @@ class DispatchQueue(
             // result naming the rule: a silent gap in the history reads as a
             // scheduler fault, and the operator has no way to tell it from one.
             var allowBodySave = service[Services.saveResponseBodies]
+            // Set only when the policy, not the service, withheld the bodies —
+            // the executor reports both as `notRequested`, and the history has
+            // to say which it was.
+            var bodiesWithheld: String? = null
             if (!trustedDomainMode) {
                 val policy = transaction { DomainPolicy.evaluate(script, resolvedVars, ctx.orgId) }
                 if (!policy.covered) {
@@ -389,6 +395,7 @@ class DispatchQueue(
                         accounted.set(true)
                         return
                     }
+                    if (allowBodySave) bodiesWithheld = BODIES_WITHHELD_UNVERIFIED
                     allowBodySave = false
                 }
             }
@@ -455,6 +462,7 @@ class DispatchQueue(
                     rawResult = redacted,
                     startedAt = startedAt,
                     agentEgressBytes = execution.egressBytes,
+                    bodiesWithheld = bodiesWithheld,
                 )
                 published++
                 accounted.set(true)

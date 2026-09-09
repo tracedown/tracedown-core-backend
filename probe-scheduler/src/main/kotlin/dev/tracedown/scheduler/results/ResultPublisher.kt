@@ -63,6 +63,14 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
         rawResult: JsonObject,
         startedAt: Instant,
         agentEgressBytes: Long = 0L,
+        /**
+         * Why the scheduler told the executor not to save bodies on this run,
+         * when that was the scheduler's decision and not the service's own
+         * setting (e.g. `unverifiedTarget`). Null when the service decided.
+         * The executor reports every withheld body as `notRequested`; this is
+         * what lets the ingestor record the actual reason instead.
+         */
+        bodiesWithheld: String? = null,
     ): UUID {
         // Minted before the push, not after the pop: the id has to be a property
         // of the message so that every delivery of it — including one the
@@ -80,6 +88,7 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
             put("rawResult", rawResult)
             put("startedAt", startedAt.toString())
             put("agentEgressBytes", agentEgressBytes)
+            if (bodiesWithheld != null) put("bodiesWithheld", bodiesWithheld)
         }
 
         redis.lpush(QUEUE_KEY, envelope.toString())
