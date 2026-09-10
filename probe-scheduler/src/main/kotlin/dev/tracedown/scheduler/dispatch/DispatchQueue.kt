@@ -296,6 +296,18 @@ class DispatchQueue(
             return
         }
 
+        // Ask the host whether this tick may run at all. Deliberately no
+        // skipped row and no unschedule: a hold is the host's own state, shown
+        // where it was set, and a history row per tick would claim the platform
+        // failed to observe a target it was never asked to. The tick counts as
+        // accounted for so the wrapper does not file it as a dispatch error,
+        // and the schedule stays in place so the next tick asks again.
+        if (!DispatchGate.provider.allows(serviceId)) {
+            log.debug("service {} is held by the dispatch gate — skipping", serviceId)
+            accounted.set(true)
+            return
+        }
+
         // Check service window (clock fields evaluate in the spec's own
         // timezone when present, else the org default — only resolved when a
         // window is actually set)
