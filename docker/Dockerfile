@@ -27,6 +27,7 @@ COPY core/tracedown-core-backend/email-service/build.gradle.kts ./core/tracedown
 COPY core/tracedown-core-backend/metrics-service/build.gradle.kts ./core/tracedown-core-backend/metrics-service/build.gradle.kts
 COPY core/tracedown-core-backend/aggregate-worker/build.gradle.kts ./core/tracedown-core-backend/aggregate-worker/build.gradle.kts
 COPY core/tracedown-core-backend/realtime-service/build.gradle.kts ./core/tracedown-core-backend/realtime-service/build.gradle.kts
+COPY core/tracedown-core-backend/tracedown-monolith/build.gradle.kts ./core/tracedown-core-backend/tracedown-monolith/build.gradle.kts
 
 # ── 3. Warm dependency cache (layer cached until build scripts change) ──
 WORKDIR /app/core/tracedown-core-backend
@@ -49,6 +50,7 @@ COPY core/tracedown-core-backend/email-service ./core/tracedown-core-backend/ema
 COPY core/tracedown-core-backend/metrics-service ./core/tracedown-core-backend/metrics-service
 COPY core/tracedown-core-backend/aggregate-worker ./core/tracedown-core-backend/aggregate-worker
 COPY core/tracedown-core-backend/realtime-service ./core/tracedown-core-backend/realtime-service
+COPY core/tracedown-core-backend/tracedown-monolith ./core/tracedown-core-backend/tracedown-monolith
 
 # ── 5. Build (dependencies already cached via mount) ──
 WORKDIR /app/core/tracedown-core-backend
