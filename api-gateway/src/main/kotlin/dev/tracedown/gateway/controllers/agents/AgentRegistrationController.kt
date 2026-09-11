@@ -92,9 +92,10 @@ object AgentRegistrationController {
             }
 
             // Sign the CSR. Identity is bound to the token's slug server-side —
-            // the CSR's own subject is ignored (see CaService.signCsr).
+            // the CSR's own subject is ignored (see CaService.signCsr) — and the
+            // host the scheduler will dial is named on the certificate too.
             val (agentCertPem, caCertPem) = try {
-                CaService.signCsr(request.csrPem, slug)
+                CaService.signCsr(request.csrPem, slug, agentUri)
             } catch (e: CaService.CsrValidationException) {
                 throw BadRequestException(ErrorCodes.FIELD_INVALID)
             }
@@ -195,9 +196,10 @@ object AgentRegistrationController {
             }
 
             // Sign the new CSR with the CA. Identity stays bound to this agent's
-            // slug — the CSR subject is ignored (see CaService.signCsr).
+            // slug — the CSR subject is ignored (see CaService.signCsr) — and the
+            // dialed host is the stored agent_uri, not anything the request says.
             val (agentCertPem, caCertPem) = try {
-                CaService.signCsr(request.csrPem, request.slug)
+                CaService.signCsr(request.csrPem, request.slug, agentRow[ProbeAgents.agentUri])
             } catch (e: CaService.CsrValidationException) {
                 throw BadRequestException(ErrorCodes.FIELD_INVALID)
             }

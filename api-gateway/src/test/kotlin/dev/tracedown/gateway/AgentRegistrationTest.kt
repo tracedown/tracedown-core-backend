@@ -368,6 +368,68 @@ class AgentRegistrationTest {
 
     // ── Helpers ──
 
+    // ── Advertised host on the certificate ──
+
+    private val csrJsonOf: (String) -> String =
+        { Json.encodeToString(kotlinx.serialization.serializer<String>(), it) }
+
+    /** Registers [slug] at [agentUri]; returns the agent's key and its issued certificate. */
+    private fun registerAt(slug: String, agentUri: String): Pair<java.security.KeyPair, X509Certificate> {
+        val token = createToken(slug)
+        val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(3072, SecureRandom()) }.generateKeyPair()
+        val body = """{"bootstrapToken":"$token","csrPem":${csrJsonOf(generateCsr(keyPair, slug))},"agentUri":"$agentUri"}"""
+        val response = post("/internal/agents/register", body)
+        assertEquals(200, response.statusCode(), "Registration should succeed. Body: ${response.body()}")
+        val pem = Json.parseToJsonElement(response.body()).jsonObject["certificatePem"]!!.jsonPrimitive.content
+        return keyPair to parseCert(pem)
+    }
+
+    private fun sansOf(cert: X509Certificate, type: Int): List<String> =
+        cert.subjectAlternativeNames.orEmpty().filter { it[0] == type }.map { it[1] as String }
+
+    @Test
+    @Order(20)
+    fun `an agent at a public name gets a certificate naming it next to the slug`() {
+        val (_, cert) = registerAt("named-runner", "https://runner.example.com:8443")
+        assertEquals(listOf("named-runner", "runner.example.com"), sansOf(cert, 2))
+        assertEquals(emptyList<String>(), sansOf(cert, 7))
+    }
+
+    @Test
+    @Order(21)
+    fun `an agent at an IP literal gets an IP SAN`() {
+        val (_, cert) = registerAt("ip-runner", "https://203.0.113.10:8443")
+        assertEquals(listOf("ip-runner"), sansOf(cert, 2))
+        assertEquals(listOf("203.0.113.10"), sansOf(cert, 7))
+    }
+
+    @Test
+    @Order(22)
+    fun `an agent at its own slug gets a single SAN`() {
+        val (_, cert) = registerAt("slug-runner", "https://slug-runner:8443")
+        assertEquals(listOf(listOf<Any>(2, "slug-runner")), cert.subjectAlternativeNames.orEmpty().map { it.toList() })
+    }
+
+    @Test
+    @Order(23)
+    fun `renewal names the stored agent address, not anything in the request`() {
+        val (oldKey, _) = registerAt("renew-runner", "https://renew.example.com:8443")
+
+        val newKey = KeyPairGenerator.getInstance("RSA").apply { initialize(3072, SecureRandom()) }.generateKeyPair()
+        val csrPem = generateCsr(newKey, "renew.attacker.example")
+        val signature = java.security.Signature.getInstance("SHA256withRSA").run {
+            initSign(oldKey.private)
+            update(csrPem.toByteArray(Charsets.UTF_8))
+            java.util.Base64.getEncoder().encodeToString(sign())
+        }
+        val body = """{"slug":"renew-runner","csrPem":${csrJsonOf(csrPem)},"signature":"$signature"}"""
+        val response = post("/internal/agents/renew", body)
+        assertEquals(200, response.statusCode(), "Renewal should succeed. Body: ${response.body()}")
+
+        val pem = Json.parseToJsonElement(response.body()).jsonObject["certificatePem"]!!.jsonPrimitive.content
+        assertEquals(listOf("renew-runner", "renew.example.com"), sansOf(parseCert(pem), 2))
+    }
+
     private fun parseCert(pem: String): X509Certificate =
         CertificateFactory.getInstance("X.509").generateCertificate(pem.byteInputStream()) as X509Certificate
 

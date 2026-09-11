@@ -19,6 +19,7 @@ import org.bouncycastle.openssl.jcajce.JcaPEMWriter
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import org.bouncycastle.operator.jcajce.JcaContentVerifierProviderBuilder
 import org.bouncycastle.pkcs.PKCS10CertificationRequest
+import org.bouncycastle.util.IPAddress
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -178,6 +179,11 @@ object CaService {
      *  - Subject is ignored: CN and SubjectAltName are set server-side to
      *    [subjectSlug], so a CSR cannot claim `CN=tracedown-scheduler` or any
      *    other identity. The SAN (DNS = slug) is what the scheduler pins.
+     *  - The host of [agentUri] — the address the scheduler dials, taken from
+     *    the agent's stored record, never from the CSR — is added as a second
+     *    SAN (see [subjectAltNames]). The scheduler's TLS client checks the
+     *    dialed host against the certificate, so without it an agent reached
+     *    at any name other than its bare slug fails every handshake.
      *  - Constrained usage: basicConstraints CA:false, keyUsage
      *    digitalSignature+keyEncipherment, EKU serverAuth only — an agent
      *    certificate can act as a TLS server but never as a client (so it can
@@ -185,10 +191,12 @@ object CaService {
      *
      * @param csrPem PEM-encoded PKCS#10 CSR from the agent.
      * @param subjectSlug the agent slug to bind as the certificate identity.
+     * @param agentUri the address the scheduler dials the agent at, or null for
+     *   a slug-only certificate.
      * @return pair of (signed agent certificate PEM, CA trust-bundle PEM).
      * @throws CsrValidationException if the CSR is malformed or fails policy.
      */
-    fun signCsr(csrPem: String, subjectSlug: String): Pair<String, String> {
+    fun signCsr(csrPem: String, subjectSlug: String, agentUri: String? = null): Pair<String, String> {
         val caRow = activeCaRow()
             ?: throw IllegalStateException("CA root not initialized — run --agent-bootstrap first")
 
@@ -235,9 +243,10 @@ object CaService {
         val notAfter = now.plus(Duration.ofDays(AGENT_CERT_VALIDITY_DAYS))
         val serial = BigInteger(128, SecureRandom())
 
-        // Identity is assigned by us, not the CSR: CN + DNS SAN = the slug.
+        // Identity is assigned by us, not the CSR: CN + DNS SAN = the slug,
+        // plus the host the agent is dialed at.
         val subject = X500Name("CN=$subjectSlug")
-        val sanDns = GeneralNames(GeneralName(GeneralName.dNSName, subjectSlug))
+        val sanDns = GeneralNames(subjectAltNames(subjectSlug, agentUri).toTypedArray())
 
         val certHolder = JcaX509v3CertificateBuilder(
             caCert,
@@ -269,6 +278,39 @@ object CaService {
 
         val agentCertPem = holderToPem(certHolder)
         return agentCertPem to caBundle()
+    }
+
+    /**
+     * The SubjectAltNames of an agent certificate: a DNS name for [subjectSlug]
+     * — the identity the scheduler pins — followed by the host of [agentUri],
+     * the name the scheduler's TLS client verifies against the address it
+     * dialed. The host is a DNS SAN for a name and an IP SAN for an IP literal,
+     * and is left out when it is the slug itself or [agentUri] has no host.
+     *
+     * The scheduler's TLS client names an IP-literal peer by its reverse-DNS
+     * name when one exists, so an agent at an IP with a PTR record verifies
+     * against that name, not the IP SAN — such an agent is best addressed by name.
+     */
+    fun subjectAltNames(subjectSlug: String, agentUri: String?): List<GeneralName> {
+        val names = mutableListOf(GeneralName(GeneralName.dNSName, subjectSlug))
+        val host = agentUri?.let { hostOf(it) } ?: return names
+        if (host.equals(subjectSlug, ignoreCase = true)) return names
+        names += if (IPAddress.isValid(host)) {
+            GeneralName(GeneralName.iPAddress, host)
+        } else {
+            GeneralName(GeneralName.dNSName, host.lowercase())
+        }
+        return names
+    }
+
+    /** The host of [uri], without the brackets of an IPv6 literal; null if it has none. */
+    private fun hostOf(uri: String): String? {
+        val host = try {
+            java.net.URI(uri.trim()).host
+        } catch (e: java.net.URISyntaxException) {
+            null
+        } ?: return null
+        return host.removePrefix("[").removeSuffix("]").trimEnd('.').takeIf { it.isNotBlank() }
     }
 
     /** Computes the SHA-256 fingerprint of a PEM certificate. */
