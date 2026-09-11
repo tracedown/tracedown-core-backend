@@ -116,6 +116,9 @@ object AgentRegistrationController {
                 it[lastPingDelayMs] = 0
                 it[lastPongDeltaMs] = 0
                 it[createdAt] = now
+                // The store the token was minted for — set in the same
+                // transaction, so the agent never runs on the wrong store.
+                it[bodyStoreId] = tokenRow[AgentBootstrapTokens.bodyStoreId]
             } get ProbeAgents.id
 
             // Store the signed certificate.

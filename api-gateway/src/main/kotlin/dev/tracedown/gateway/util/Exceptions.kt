@@ -26,6 +26,10 @@ class ForbiddenException(code: String = ErrorCodes.FORBIDDEN) :
 class NotFoundException(code: String = ErrorCodes.NOT_FOUND) :
     ApiException(HttpStatusCode.NotFound, code)
 
+/** The resource existed but is permanently unavailable (410). */
+class GoneException(code: String) :
+    ApiException(HttpStatusCode.Gone, code)
+
 class BadRequestException(code: String = ErrorCodes.FIELD_INVALID) :
     ApiException(HttpStatusCode.BadRequest, code)
 

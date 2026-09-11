@@ -203,6 +203,8 @@ services:
     environment:
       <<: *db-env
       REDIS_A_URL: ${REDIS_A_URL}
+      # Decrypts a body store's credentials when an agent imports from it.
+      PLATFORM_AES_KEY: ${PLATFORM_AES_KEY}
       PORT: 20820
     depends_on:
       tracedown-migrator:

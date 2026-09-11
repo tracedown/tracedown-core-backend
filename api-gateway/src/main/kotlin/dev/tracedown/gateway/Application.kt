@@ -43,6 +43,7 @@ import dev.tracedown.gateway.routes.v1.metrics.usageRoutes
 import dev.tracedown.gateway.routes.v1.orgs.permissionRoutes
 import dev.tracedown.gateway.routes.v1.orgs.resourceAccessRoutes
 import dev.tracedown.gateway.routes.v1.agents.agentAdminRoutes
+import dev.tracedown.gateway.routes.v1.agents.bodyStoreRoutes
 import dev.tracedown.gateway.routes.v1.presets.rulePresetRoutes
 import dev.tracedown.gateway.routes.v1.projects.projectRoutes
 import dev.tracedown.gateway.routes.v1.services.serviceRoutes
@@ -245,17 +246,36 @@ fun Application.module() {
                 timeoutSeconds = storageConf.propertyOrNull("storage.s3.timeoutSeconds")?.getString()?.toLongOrNull() ?: 30L,
             )
         }
+    val storageRoot = storageConf.propertyOrNull("storage.filesystemRoot")?.getString() ?: "/data/bodies"
+    val storageBucket = storageConf.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() }
+    val storagePrefix = storageConf.propertyOrNull("storage.s3.prefix")?.getString() ?: ""
     dev.tracedown.gateway.controllers.results.ProbeResultController.init(
         dev.tracedown.common.storage.BodyStorageClient(
             s3Config = storageS3,
             confinement = dev.tracedown.common.storage.BodyConfinement(
-                filesystemRoot = java.nio.file.Path.of(
-                    storageConf.propertyOrNull("storage.filesystemRoot")?.getString() ?: "/data/bodies",
-                ),
-                s3Bucket = storageConf.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() },
-                s3KeyPrefix = storageConf.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+                filesystemRoot = java.nio.file.Path.of(storageRoot),
+                s3Bucket = storageBucket,
+                s3KeyPrefix = storagePrefix,
             ),
         )
+    )
+    // Body stores: other places agents may keep bodies. The registry builds a
+    // confined client per store; the default store above is described for the
+    // dashboard (and so a store can never be created over it).
+    dev.tracedown.common.storage.BodyStoreRegistry.configure(
+        deploymentEnvironment = storageConf.propertyOrNull("deployment.environment")?.getString(),
+        filesystemBases = storageConf.propertyOrNull("storage.stores.filesystemBases")?.getString(),
+        timeoutSeconds = storageS3?.timeoutSeconds ?: 30L,
+    )
+    dev.tracedown.common.storage.BodyStoreService.configureDefault(
+        if (storageS3 != null) {
+            dev.tracedown.common.storage.DefaultBodyStore(
+                kind = "s3", bucket = storageBucket, prefix = storagePrefix.trim('/').ifEmpty { null },
+                endpoint = storageS3.endpoint, filesystemRoot = storageRoot,
+            )
+        } else {
+            dev.tracedown.common.storage.DefaultBodyStore(kind = "filesystem", rootPath = storageRoot, filesystemRoot = storageRoot)
+        },
     )
 
     // Provider, not an instance: constructing it must not force the lazy
@@ -498,6 +518,7 @@ fun Application.module() {
         resourceAccessRoutes()
         rulePresetRoutes()
         agentAdminRoutes()
+        bodyStoreRoutes()
         workspaceRoutes()
         projectRoutes()
         serviceRoutes()

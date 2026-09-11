@@ -32,4 +32,11 @@ class BodyNotStoredReasonTest {
     fun `a stored body has no reason`() {
         assertNull(BodyNotStoredReason.resolve(null, null, false))
     }
+
+    @Test
+    fun `a location outside the agent's store is named as such`() {
+        assertEquals("outsideAssignedStore", BodyNotStoredReason.resolve(null, null, false, outsideAssignedStore = true))
+        // The executor's own reason still wins: no body was captured at all.
+        assertEquals("bodyTooLarge", BodyNotStoredReason.resolve("bodyTooLarge", null, false, outsideAssignedStore = true))
+    }
 }

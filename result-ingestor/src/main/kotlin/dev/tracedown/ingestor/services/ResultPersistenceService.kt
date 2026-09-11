@@ -9,6 +9,9 @@ import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
+import dev.tracedown.common.storage.BodyStorageClient
+import dev.tracedown.common.storage.BodyStore
+import dev.tracedown.common.storage.BodyStoreRegistry
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -140,6 +143,22 @@ object ResultPersistenceService {
         this.bodyRelocator = relocator
     }
 
+    /** Whether [agentPath] lies inside [store] — the confinement check, no I/O. */
+    private fun inPlaceContains(store: BodyStore, agentPath: String): Boolean = try {
+        BodyStorageClient(confinement = BodyStoreRegistry.confinementOf(store)).contains(agentPath)
+    } catch (e: Exception) {
+        log.warn("body store {} cannot confine bodies: {}", store.id, e.message)
+        false
+    }
+
+    /** A client confined to [store] to import from, or null when the store is unusable. */
+    private fun importSourceFor(store: BodyStore, serviceId: UUID, resultId: UUID): BodyStorageClient? = try {
+        BodyStoreRegistry.clientFor(store)
+    } catch (e: Exception) {
+        log.warn("body store {} is unusable for service {} result {}: {}", store.id, serviceId, resultId, e.message)
+        null
+    }
+
     /**
      * Agent writeback (`.store()`) may only write METRIC variables — those with
      * secret=false AND encrypted=false. A writeback key that collides with a
@@ -223,22 +242,70 @@ object ResultPersistenceService {
         // across tenants and could point at arbitrary files). Indices that had a
         // body but could not be relocated are remembered so the step is recorded
         // as body-unavailable instead of silently pointing nowhere.
+        //
+        // Where the agent wrote the body depends on the body store it is
+        // assigned (probe_agents.body_store_id):
+        //   none      — the default store, relocated within it as above;
+        //   import    — the agent's store; the body is copied into the default
+        //               store (through a client confined to the agent's store)
+        //               and recorded there, exactly like a relocated one;
+        //   in_place  — the body stays in the agent's store. Its location is
+        //               accepted only if it lies inside that store, and is then
+        //               recorded verbatim with the store's id; anything outside
+        //               it is recorded as `outsideAssignedStore`, never trusted.
         val relocatedBodies = HashMap<Int, String>()
         val bodyRelocationFailed = HashSet<Int>()
+        val inPlaceBodies = HashSet<Int>()
+        val outsideAssignedStore = HashSet<Int>()
+        var inPlaceStoreId: UUID? = null
         if (calls != null) {
             val relocator = bodyRelocator
-            for ((index, callElement) in calls.withIndex()) {
-                val resp = callElement.jsonObject["response"] as? JsonObject ?: continue
-                val agentPath = resp["bodyPath"]?.jsonPrimitive?.contentOrNull ?: continue
-                if (agentPath.isBlank()) continue
-                val relocated = relocator?.relocate(
-                    agentBodyPath = agentPath,
-                    organizationId = organizationId,
-                    serviceId = serviceId,
-                    resultId = resultId,
-                    callIndex = index,
-                )
-                if (relocated != null) relocatedBodies[index] = relocated else bodyRelocationFailed.add(index)
+            val reported = calls.withIndex().mapNotNull { (index, callElement) ->
+                val resp = callElement.jsonObject["response"] as? JsonObject ?: return@mapNotNull null
+                val agentPath = resp["bodyPath"]?.jsonPrimitive?.contentOrNull
+                if (agentPath.isNullOrBlank()) null else index to agentPath
+            }
+            val store = if (reported.isNotEmpty() && agentId != null) BodyStoreRegistry.storeOfAgent(agentId) else null
+            if (store?.inPlace == true) inPlaceStoreId = store.id
+            // Built at most once per result: the source side of an import.
+            val importSource by lazy { store?.let { importSourceFor(it, serviceId, resultId) } }
+            for ((index, agentPath) in reported) {
+                when {
+                    store == null -> {
+                        val relocated = relocator?.relocate(
+                            agentBodyPath = agentPath,
+                            organizationId = organizationId,
+                            serviceId = serviceId,
+                            resultId = resultId,
+                            callIndex = index,
+                        )
+                        if (relocated != null) relocatedBodies[index] = relocated else bodyRelocationFailed.add(index)
+                    }
+                    store.inPlace -> {
+                        if (inPlaceContains(store, agentPath)) {
+                            relocatedBodies[index] = agentPath
+                            inPlaceBodies.add(index)
+                        } else {
+                            log.warn(
+                                "agent {} reported a body outside its store {} for service {} result {}",
+                                agentId, store.id, serviceId, resultId,
+                            )
+                            outsideAssignedStore.add(index)
+                        }
+                    }
+                    else -> {
+                        val source = importSource
+                        val imported = if (source == null) null else relocator?.importFrom(
+                            source = source,
+                            agentBodyPath = agentPath,
+                            organizationId = organizationId,
+                            serviceId = serviceId,
+                            resultId = resultId,
+                            callIndex = index,
+                        )
+                        if (imported != null) relocatedBodies[index] = imported else bodyRelocationFailed.add(index)
+                    }
+                }
             }
         }
 
@@ -301,8 +368,11 @@ object ResultPersistenceService {
                         // Header names are lower-cased per spec §9. Null when the call set no cookies.
                         it[cookies] = responseHeaders?.get("set-cookie")
                         // Server-derived, tenant-scoped URI from the relocation
-                        // pre-pass — never the agent-reported path.
+                        // pre-pass — never the agent-reported path, except for a
+                        // body kept in the agent's in_place store (checked to lie
+                        // inside it), which is recorded with that store's id.
                         it[responseBodyStorageUrl] = relocatedBodies[index]
+                        it[bodyStoreId] = if (index in inPlaceBodies) inPlaceStoreId else null
                         // Present exactly when the body was not captured/stored: `notRequested`
                         // (body saving disabled), `bodyTooLarge`, or `timeout` (no body received)
                         // — spec §9 response.bodyNotCapturedReason. A body that was captured but
@@ -314,6 +384,7 @@ object ResultPersistenceService {
                             reported = response?.get("bodyNotCapturedReason")?.jsonPrimitive?.contentOrNull,
                             withheld = envelope["bodiesWithheld"]?.jsonPrimitive?.contentOrNull,
                             relocationFailed = index in bodyRelocationFailed,
+                            outsideAssignedStore = index in outsideAssignedStore,
                         )
                         it[error] = call["error"]?.jsonPrimitive?.contentOrNull
                         it[createdAt] = startedAt

@@ -1,6 +1,7 @@
 package dev.tracedown.common.models
 
 import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.java.javaUUID
 import org.jetbrains.exposed.v1.javatime.timestamp
 
 object ProbeAgents : Table("probe_agents") {
@@ -33,6 +34,9 @@ object ProbeAgents : Table("probe_agents") {
      */
     val supportsEncryptedPayload = bool("supports_encrypted_payload").default(false)
     val createdAt = timestamp("created_at")
+
+    /** The body store this agent writes response bodies to; null = the default store. */
+    val bodyStoreId = javaUUID("body_store_id").references(BodyStores.id).nullable()
 
     override val primaryKey = PrimaryKey(id)
 }

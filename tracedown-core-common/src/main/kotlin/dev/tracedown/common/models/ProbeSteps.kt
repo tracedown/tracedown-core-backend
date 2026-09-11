@@ -27,6 +27,13 @@ object ProbeSteps : Table("probe_steps") {
     val error = text("error").nullable()
     val responseBodyStorageUrl = text("response_body_storage_url").nullable()
     val bodyNotStoredReason = varchar("body_not_stored_reason", 64).nullable()
+
+    /**
+     * The body store [responseBodyStorageUrl] lives in; null = the default store.
+     * Set only for bodies kept in an `in_place` store, which the platform reads
+     * through that store and never deletes.
+     */
+    val bodyStoreId = javaUUID("body_store_id").references(BodyStores.id).nullable()
     val createdAt = timestamp("created_at")
 
     override val primaryKey = PrimaryKey(id)

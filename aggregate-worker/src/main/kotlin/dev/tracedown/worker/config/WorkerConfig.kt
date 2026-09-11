@@ -1,7 +1,9 @@
 package dev.tracedown.worker.config
 
+import dev.tracedown.common.storage.BodyConfinement
 import dev.tracedown.common.storage.S3Config
 import io.ktor.server.application.ApplicationEnvironment
+import java.nio.file.Path
 import java.time.Duration
 
 data class DatabaseConfig(
@@ -48,6 +50,12 @@ data class WorkerConfig(
     val jobIntervals: JobIntervals,
     /** S3-compatible storage config. Null if only filesystem storage is used. */
     val s3Config: S3Config?,
+    /**
+     * Where platform storage lives — the same root, bucket and prefix the ingestor
+     * relocates bodies into. Deletions are confined to it: a stored URI outside it
+     * names a body the platform does not own and is skipped, never deleted.
+     */
+    val bodyConfinement: BodyConfinement,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -97,6 +105,14 @@ data class WorkerConfig(
                         timeoutSeconds = config.propertyOrNull("storage.s3.timeoutSeconds")?.getString()?.toLongOrNull() ?: 30L,
                     )
                 },
+                bodyConfinement = BodyConfinement(
+                    filesystemRoot = Path.of(
+                        config.propertyOrNull("storage.filesystemRoot")?.getString()?.takeIf { it.isNotBlank() }
+                            ?: "/data/bodies",
+                    ),
+                    s3Bucket = config.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() },
+                    s3KeyPrefix = config.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+                ),
             )
         }
     }

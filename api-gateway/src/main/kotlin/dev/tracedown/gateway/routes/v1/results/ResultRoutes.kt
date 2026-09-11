@@ -39,9 +39,10 @@ class Results(val serviceId: String) {
  * cross-origin redirect is sent with `Origin: null`, which no origin-scoped
  * bucket CORS policy can match — fetching the URL directly preserves the
  * page's origin, so the bucket policy can stay restricted to the dashboard.
+ * [contentType] accompanies inlined content when its reader knows it.
  */
 @Serializable
-data class StepBodyResponse(val content: String? = null, val url: String? = null)
+data class StepBodyResponse(val content: String? = null, val url: String? = null, val contentType: String? = null)
 
 /** Registers routes for querying probe results. */
 fun Route.resultRoutes() {
@@ -83,7 +84,7 @@ fun Route.resultRoutes() {
         val resultId = parseUuid(resource.parent.resultId, "result ID")
         val stepId = parseUuid(resource.stepId, "step ID")
         when (val body = ProbeResultController.getStepBody(orgId, svcId, resultId, stepId, principal.userId)) {
-            is BodyStorageClient.BodyContent.Inline -> call.respond(StepBodyResponse(content = body.content))
+            is BodyStorageClient.BodyContent.Inline -> call.respond(StepBodyResponse(content = body.content, contentType = body.contentType))
             is BodyStorageClient.BodyContent.Redirect -> call.respond(StepBodyResponse(url = body.url))
             is BodyStorageClient.BodyContent.NotFound -> call.respond(HttpStatusCode.NoContent, "")
         }

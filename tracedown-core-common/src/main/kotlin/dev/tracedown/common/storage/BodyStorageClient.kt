@@ -1,13 +1,21 @@
 package dev.tracedown.common.storage
 
 import io.minio.CopyObjectArgs
+import io.minio.GetObjectArgs
 import io.minio.GetPresignedObjectUrlArgs
 import io.minio.Http
+import io.minio.ListObjectsArgs
 import io.minio.MinioClient
+import io.minio.PutObjectArgs
+import io.minio.StatObjectArgs
+import io.minio.errors.ErrorResponseException
 import io.minio.RemoveObjectArgs
 import io.minio.RemoveObjectsArgs
 import io.minio.messages.DeleteRequest
 import io.minio.SourceObject
+import org.slf4j.LoggerFactory
+import java.io.ByteArrayInputStream
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -65,11 +73,17 @@ data class BodyConfinement(
  *
  * The S3 client is lazily initialized — no connection is made unless S3 URIs
  * are actually encountered.
+ *
+ * [httpClient] replaces the default HTTP client of the S3 backend; a body store
+ * passes the SSRF-guarded one from [StoreEndpointGuard.httpClient].
  */
 open class BodyStorageClient(
     private val s3Config: S3Config? = null,
     private val confinement: BodyConfinement? = null,
+    private val httpClient: okhttp3.OkHttpClient? = null,
 ) {
+
+    private val log = LoggerFactory.getLogger(BodyStorageClient::class.java)
 
     private val s3Client: MinioClient? by lazy {
         s3Config?.let { cfg ->
@@ -80,7 +94,7 @@ open class BodyStorageClient(
                 .region(cfg.region)
                 // MinIO's own default client waits five minutes per phase.
                 .httpClient(
-                    okhttp3.OkHttpClient.Builder()
+                    httpClient ?: okhttp3.OkHttpClient.Builder()
                         .connectTimeout(timeout)
                         .readTimeout(timeout)
                         .writeTimeout(timeout)
@@ -122,6 +136,11 @@ open class BodyStorageClient(
      *
      * Files are deleted one by one — that is a local call — through [delete], so
      * a client that overrides the single delete keeps its behaviour here.
+     *
+     * A URI this client refuses on confinement is skipped, not failed: it names a
+     * body kept outside platform storage (for example in an agent's own body
+     * store), which is not the platform's to delete. Reporting it as failed would park it
+     * in the deletion retry table forever; it is logged at debug and left alone.
      */
     open fun deleteAll(uris: Collection<String>): Map<String, String?> {
         val failed = LinkedHashMap<String, String?>()
@@ -136,11 +155,21 @@ open class BodyStorageClient(
                         s3ByBucket.getOrPut(parsed.bucket) { mutableListOf() }.add(parsed.key to uri)
                     }
                 }
+            } catch (e: StorageConfinementException) {
+                log.debug("not deleting body outside platform storage {}: {}", uri, e.message)
             } catch (e: Exception) {
                 failed[uri] = e.message
             }
         }
-        for ((bucket, entries) in s3ByBucket) failed.putAll(deleteS3Bulk(bucket, entries))
+        for ((bucket, entries) in s3ByBucket) {
+            // No S3 backend configured throws before any request is made; that is
+            // a failure of these keys, not of the whole call.
+            try {
+                failed.putAll(deleteS3Bulk(bucket, entries))
+            } catch (e: Exception) {
+                for ((_, uri) in entries) failed[uri] = e.message
+            }
+        }
         return failed
     }
 
@@ -195,8 +224,151 @@ open class BodyStorageClient(
         }
     }
 
+    /**
+     * Whether [uri] lies inside this client's confined location (root, or bucket
+     * + prefix). False when the client is not confined at all, or the URI is
+     * malformed. Nothing is read or touched.
+     */
+    fun contains(uri: String): Boolean {
+        if (confinement == null) return false
+        return try {
+            when (val parsed = StorageUri.parse(uri)) {
+                is StorageUri.File -> confineFilePath(parsed.path)
+                is StorageUri.S3 -> confineS3(parsed.bucket, parsed.key)
+            }
+            true
+        } catch (_: StorageConfinementException) {
+            false
+        } catch (_: IllegalArgumentException) {
+            false
+        }
+    }
+
+    /** What [readBytes] found at a URI. */
+    sealed class StoredBody {
+        /** The body; [contentType] as the store reported it (filesystem stores report none). */
+        class Found(val bytes: ByteArray, val contentType: String?) : StoredBody()
+        data object Missing : StoredBody()
+        class TooLarge(val sizeBytes: Long) : StoredBody()
+    }
+
+    /**
+     * Reads the bytes at [uri], never more than [maxBytes]. Confinement applies
+     * (throws [StorageConfinementException]); an unreachable store or refused
+     * credentials throw as well. A missing object is [StoredBody.Missing].
+     */
+    open fun readBytes(uri: String, maxBytes: Long): StoredBody {
+        return when (val parsed = StorageUri.parse(uri)) {
+            is StorageUri.File -> {
+                val file = confineFilePath(parsed.path)
+                if (!Files.isRegularFile(file)) return StoredBody.Missing
+                val size = Files.size(file)
+                if (size > maxBytes) StoredBody.TooLarge(size) else StoredBody.Found(Files.readAllBytes(file), null)
+            }
+            is StorageUri.S3 -> {
+                confineS3(parsed.bucket, parsed.key)
+                val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+                val stat = try {
+                    client.statObject(StatObjectArgs.builder().bucket(parsed.bucket).`object`(parsed.key).build())
+                } catch (e: ErrorResponseException) {
+                    if (e.errorResponse()?.code() in MISSING_CODES || e.response()?.code == 404) return StoredBody.Missing
+                    throw e
+                }
+                if (stat.size() > maxBytes) return StoredBody.TooLarge(stat.size())
+                client.getObject(GetObjectArgs.builder().bucket(parsed.bucket).`object`(parsed.key).build()).use { input ->
+                    val bytes = input.readNBytes((maxBytes + 1).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+                    if (bytes.size > maxBytes) StoredBody.TooLarge(bytes.size.toLong())
+                    else StoredBody.Found(bytes, stat.contentType())
+                }
+            }
+        }
+    }
+
+    /**
+     * Writes [bytes] under the server-derived [key] inside this client's confined
+     * location — the S3 bucket + prefix when an S3 backend is configured, the
+     * filesystem root otherwise — and returns the URI to persist.
+     */
+    open fun put(key: String, bytes: ByteArray, contentType: String?): String {
+        val conf = confinement ?: throw IllegalStateException("put requires a configured BodyConfinement")
+        val cleanKey = sanitizeKey(key)
+        val bucket = conf.s3Bucket
+        val client = s3Client
+        if (client != null && bucket != null) {
+            val prefix = conf.normalizedS3Prefix
+            val fullKey = if (prefix.isEmpty()) cleanKey else "$prefix/$cleanKey"
+            val args = PutObjectArgs.builder()
+                .bucket(bucket)
+                .`object`(fullKey)
+                .stream(ByteArrayInputStream(bytes), bytes.size.toLong(), -1L)
+            if (!contentType.isNullOrBlank()) args.contentType(contentType)
+            client.putObject(args.build())
+            return "s3://$bucket/$fullKey"
+        }
+        val root = conf.normalizedRoot ?: throw StorageConfinementException("no filesystem root is confined")
+        val dest = root.resolve(cleanKey).normalize()
+        if (!dest.startsWith(root)) throw StorageConfinementException("dest key $key escapes confined root $root")
+        dest.parent?.let { Files.createDirectories(it) }
+        Files.write(dest, bytes)
+        return "file://$dest"
+    }
+
+    /**
+     * Moves a body from another store into this one: reads [sourceUri] through
+     * [source] (confined to that store), writes it under [destKey] here, then
+     * removes the source. A source that cannot be removed is logged and left —
+     * the copy is what counts. Throws when the source is missing, larger than
+     * [maxBytes], outside [source]'s confinement, or unreachable.
+     */
+    open fun relocateFrom(source: BodyStorageClient, sourceUri: String, destKey: String, maxBytes: Long): String {
+        val body = when (val read = source.readBytes(sourceUri, maxBytes)) {
+            is StoredBody.Found -> read
+            StoredBody.Missing -> throw IllegalStateException("source body does not exist: $sourceUri")
+            is StoredBody.TooLarge -> throw IllegalStateException("source body is ${read.sizeBytes} bytes, over $maxBytes")
+        }
+        val stored = put(destKey, body.bytes, body.contentType)
+        try {
+            source.delete(sourceUri)
+        } catch (e: Exception) {
+            log.warn("imported body {} but could not remove the source: {}", sourceUri, e.message)
+        }
+        return stored
+    }
+
+    /**
+     * Read-only reachability check of the confined location: lists at most one
+     * key under the S3 prefix, or checks that the filesystem root is a readable
+     * directory. Returns null when it answered, otherwise a short reason code
+     * (`blocked_endpoint`, `bucket_not_found`, `access_denied`, `unreachable`,
+     * `unexpected_response`, `not_a_directory`, `not_readable`).
+     */
+    open fun probe(): String? {
+        val conf = confinement ?: return "not_configured"
+        val bucket = conf.s3Bucket
+        if (s3Config != null && bucket != null) {
+            return try {
+                val client = s3Client ?: return "not_configured"
+                val prefix = conf.normalizedS3Prefix.let { if (it.isEmpty()) "" else "$it/" }
+                val listing = client.listObjects(
+                    ListObjectsArgs.builder().bucket(bucket).prefix(prefix).maxKeys(1).build(),
+                ).iterator()
+                if (listing.hasNext()) listing.next().get()
+                null
+            } catch (e: Exception) {
+                failureReason(e)
+            }
+        }
+        val root = conf.normalizedRoot ?: return "not_configured"
+        return when {
+            !Files.isDirectory(root) -> "not_a_directory"
+            !Files.isReadable(root) -> "not_readable"
+            else -> null
+        }
+    }
+
     sealed class BodyContent {
-        data class Inline(val content: String) : BodyContent()
+        /** [contentType] is set only when the reader knows it; platform storage does not record one. */
+        data class Inline(val content: String, val contentType: String? = null) : BodyContent()
         data class Redirect(val url: String) : BodyContent()
         data object NotFound : BodyContent()
     }
@@ -357,3 +529,24 @@ open class BodyStorageClient(
 
 /** S3's ceiling for one DeleteObjects request. */
 private const val S3_DELETE_CHUNK = 1000
+
+/** S3 error codes that mean "there is nothing at this key". */
+private val MISSING_CODES = setOf("NoSuchKey", "NoSuchBucket", "NoSuchObject", "NotFound")
+
+/** A short, machine-readable reason for a failed store call (see [BodyStorageClient.probe]). */
+internal fun failureReason(e: Throwable): String {
+    if (StoreEndpointGuard.isBlocked(e)) return "blocked_endpoint"
+    var cause: Throwable? = e
+    while (cause != null) {
+        if (cause is ErrorResponseException) {
+            return when (cause.errorResponse()?.code()) {
+                "NoSuchBucket" -> "bucket_not_found"
+                "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken" -> "access_denied"
+                else -> "unexpected_response"
+            }
+        }
+        if (cause is IOException) return "unreachable"
+        cause = cause.cause?.takeIf { it !== cause }
+    }
+    return "unexpected_response"
+}

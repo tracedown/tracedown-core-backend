@@ -8,6 +8,8 @@ import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.storage.BodyConfinement
 import dev.tracedown.common.storage.BodyStorageClient
+import dev.tracedown.common.storage.BodyStoreRegistry
+import dev.tracedown.common.util.VariableCrypto
 import dev.tracedown.ingestor.config.IngestorConfig
 import dev.tracedown.ingestor.consumers.ProbeResultConsumer
 import dev.tracedown.ingestor.services.BodyRelocator
@@ -49,9 +51,19 @@ fun Application.module() {
         environment.config.propertyOrNull("deployment.environment")?.getString(),
         "result-ingestor",
         checks = emptyMap(),
-        credentials = config.storage.s3
-            ?.let { mapOf("STORAGE_S3_SECRET_KEY" to it.secretKey) }
-            ?: emptyMap(),
+        credentials = (
+            config.storage.s3?.let { mapOf("STORAGE_S3_SECRET_KEY" to it.secretKey) } ?: emptyMap()
+            ) + (config.aesKey?.let { mapOf("PLATFORM_AES_KEY" to it) } ?: emptyMap()),
+    )
+
+    // Body stores: an agent may write to a store of its own (import or
+    // in_place). Importing reads that store with its credentials, which are
+    // encrypted with the platform key.
+    config.aesKey?.let { VariableCrypto.init(it) }
+    BodyStoreRegistry.configure(
+        deploymentEnvironment = config.deploymentEnvironment,
+        filesystemBases = config.storage.bodyStoreFilesystemBases,
+        timeoutSeconds = config.storage.s3?.timeoutSeconds ?: 30L,
     )
 
     // Database

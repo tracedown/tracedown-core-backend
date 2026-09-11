@@ -57,8 +57,12 @@ fun Application.module() {
         maximumPoolSize = 5,
     )
 
-    // Body storage client (for deleting bodies during retention and purge)
-    val storageClient = BodyStorageClient(s3Config = config.s3Config)
+    // Body storage client (for deleting bodies during retention and purge),
+    // confined to platform storage: a stored URI outside it is skipped.
+    val storageClient = BodyStorageClient(s3Config = config.s3Config, confinement = config.bodyConfinement)
+    if (config.s3Config != null && config.bodyConfinement.s3Bucket == null) {
+        log.warn("storage.s3.endpoint is set but storage.s3.bucket is not — s3:// bodies will not be deleted; set STORAGE_S3_BUCKET")
+    }
 
     // Redis B (ephemeral cache) — lazy init for metrics percentile cache
     val redisB by lazy {

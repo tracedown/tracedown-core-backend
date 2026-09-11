@@ -8,6 +8,7 @@ import dev.tracedown.common.storage.BodyStorageClient
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.isNull
 import org.jetbrains.exposed.v1.core.less
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.select
@@ -128,10 +129,11 @@ class RetentionJob(
             if (resultIds.isEmpty()) return deleted to false
 
             // Body URIs for exactly this page, projected on their own — the old
-            // query read whole step rows to reach one nullable column.
+            // query read whole step rows to reach one nullable column. Bodies in
+            // an in_place body store are the store owner's to keep or delete.
             val bodyUris = ioTransaction {
                 ProbeSteps.select(ProbeSteps.responseBodyStorageUrl)
-                    .where { ProbeSteps.probeResultId inList resultIds }
+                    .where { (ProbeSteps.probeResultId inList resultIds) and ProbeSteps.bodyStoreId.isNull() }
                     .mapNotNull { it[ProbeSteps.responseBodyStorageUrl] }
             }
 

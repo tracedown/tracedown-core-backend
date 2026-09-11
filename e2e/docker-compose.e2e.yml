@@ -108,6 +108,7 @@ services:
       DATABASE_USER: tracedown
       DATABASE_PASSWORD: tracedown
       REDIS_A_URL: redis://redis:6379
+      PLATFORM_AES_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       PORT: 8082
     depends_on:
       gateway:

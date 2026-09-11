@@ -15,6 +15,9 @@ import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.agents.AgentEnrolmentAddress
 import dev.tracedown.common.agents.FleetAudience
+import dev.tracedown.common.storage.BodyStoreService
+import dev.tracedown.common.storage.BodyStoreSummary
+import dev.tracedown.gateway.util.bodyStoreCall
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
 import kotlinx.serialization.json.buildJsonObject
@@ -33,6 +36,7 @@ import io.ktor.server.resources.delete
 import io.ktor.server.resources.get
 import io.ktor.server.resources.patch
 import io.ktor.server.resources.post
+import io.ktor.server.resources.put
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -59,14 +63,22 @@ data class AgentSummary(
     val encryptPayload: Boolean,
     val supportsEncryptedPayload: Boolean,
     val createdAt: String,
+    /** The body store the agent writes to; null = the default store. */
+    val bodyStoreId: String?,
 )
 
 @Serializable
-data class CreateBootstrapTokenRequest(val slug: String, val label: String? = null) : Validatable {
+data class CreateBootstrapTokenRequest(
+    val slug: String,
+    val label: String? = null,
+    /** The body store the agent enrolled with this token starts on; null = the default store. */
+    val bodyStoreId: String? = null,
+) : Validatable {
     override fun validate() = buildList {
         Validators.notBlank("slug", slug)?.let(::add)
         Validators.maxLen("slug", slug, 64)?.let(::add)
         Validators.maxLen("label", label, 64)?.let(::add)
+        if (bodyStoreId != null && runCatching { UUID.fromString(bodyStoreId) }.isFailure) add(ErrorCodes.INVALID_UUID)
     }
 }
 
@@ -77,6 +89,10 @@ data class CreateBootstrapTokenRequest(val slug: String, val label: String? = nu
  * (`PROBE_AGENT_SCHEDULER_URL`), from [AgentEnrolmentAddress]; null when the
  * deployment has not configured one, in which case the dashboard shows a
  * placeholder rather than an address that is only right on one network.
+ *
+ * `bodyStore` describes the store the agent will write to (null = the default
+ * store), so the dashboard can print the agent's storage settings with the
+ * token. Never a credential: the agent is configured with a key of its own.
  */
 @Serializable
 data class BootstrapTokenResponse(
@@ -84,7 +100,12 @@ data class BootstrapTokenResponse(
     val token: String,
     val expiresAt: String,
     val schedulerUrl: String? = null,
+    val bodyStore: BodyStoreSummary? = null,
 )
+
+/** Body of `PUT /api/v1/agents/{slug}/body-store`; a null [storeId] moves the agent to the default store. */
+@Serializable
+data class AssignBodyStoreRequest(val storeId: String? = null)
 
 /**
  * Partial update — an absent field is left as it is.
@@ -128,6 +149,11 @@ class AgentAdmin {
         @Serializable
         @Resource("checks")
         class Checks(val parent: BySlug, val hours: Int = 24)
+
+        /** The agent's body store (see the body-store routes). */
+        @Serializable
+        @Resource("body-store")
+        class BodyStoreAssignment(val parent: BySlug)
     }
 }
 
@@ -165,19 +191,29 @@ fun Route.agentAdminRoutes() {
                         encryptPayload = row[ProbeAgents.encryptPayload],
                         supportsEncryptedPayload = row[ProbeAgents.supportsEncryptedPayload],
                         createdAt = row[ProbeAgents.createdAt].toString(),
+                        bodyStoreId = row[ProbeAgents.bodyStoreId]?.toString(),
                     )
                 }
         }
         call.respond(agents)
     }
 
-    /** Creates a one-time agent bootstrap token (1h TTL, shown once). */
+    /**
+     * Creates a one-time agent bootstrap token (1h TTL, shown once).
+     *
+     * An optional `bodyStoreId` stamps the token with a body store: the agent it
+     * enrolls starts on that store, and the response's `bodyStore` describes it.
+     * The stamp is an assignment, so it passes the `agent.bodyStore.assign` hook.
+     */
     post<AgentAdmin.BootstrapToken> {
         val (principal, orgId) = requireAuthWithOrg(call)
         val body = tryReceive<CreateBootstrapTokenRequest>(call)
         val slug = body.slug.trim()
         if (!SLUG_RE.matches(slug)) throw BadRequestException(ErrorCodes.FIELD_INVALID)
         val label = body.label?.trim()?.ifBlank { null } ?: slug
+        val bodyStoreId = body.bodyStoreId?.let {
+            runCatching { UUID.fromString(it) }.getOrNull() ?: throw BadRequestException(ErrorCodes.INVALID_UUID)
+        }
 
         val token = ByteArray(TOKEN_BYTES).also { SecureRandom().nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
@@ -188,7 +224,7 @@ fun Route.agentAdminRoutes() {
         // this key; a before-hook (with the requesting org/user in context) may
         // deny it, atomically with the token insert.
         val tokenId = UUID.randomUUID()
-        Interceptors.injectableInTx(
+        bodyStoreCall { Interceptors.injectableInTx(
             "agent.bootstrap.create",
             // Carry the slug and the created token's id so a hook can act on
             // exactly this token, never on another row that shares the slug.
@@ -204,6 +240,9 @@ fun Route.agentAdminRoutes() {
             // their slug (it is renamed to free it), so any row counts.
             val taken = ProbeAgents.selectAll().where { ProbeAgents.slug eq slug }.empty().not()
             if (taken) throw ConflictException(ErrorCodes.AGENT_SLUG_TAKEN)
+            BodyStoreService.checkTokenAssignment(
+                slug, bodyStoreId, InterceptorContext(orgId = orgId, userId = principal.userId),
+            )
             // The signing CA is created lazily on the very first bootstrap.
             CaService.ensureCaRoot()
             // A fresh token supersedes any outstanding one for the slug — the
@@ -224,9 +263,10 @@ fun Route.agentAdminRoutes() {
                 it[AgentBootstrapTokens.expiresAt] = expiresAt
                 it[createdBy] = principal.userId
                 it[createdAt] = Instant.now()
+                it[AgentBootstrapTokens.bodyStoreId] = bodyStoreId
             }
             AuditService.log(orgId, principal.userId, "create.agent_bootstrap_token", "agent", slug, entityDisplayName = slug)
-        }
+        } }
 
         call.respond(
             BootstrapTokenResponse(
@@ -234,6 +274,7 @@ fun Route.agentAdminRoutes() {
                 token = token,
                 expiresAt = expiresAt.toString(),
                 schedulerUrl = AgentEnrolmentAddress.resolve(),
+                bodyStore = BodyStoreService.summary(bodyStoreId),
             ),
         )
     }
@@ -298,6 +339,8 @@ fun Route.agentAdminRoutes() {
                 it[isActive] = false
                 it[deleted] = true
                 it[slug] = freedSlug
+                // A decommissioned agent holds no store, so the store can be removed.
+                it[bodyStoreId] = null
             }
             AgentCertificates.update({
                 (AgentCertificates.probeAgentId eq agentId) and (AgentCertificates.revoked eq false)
@@ -319,6 +362,30 @@ fun Route.agentAdminRoutes() {
         val removedEvent = buildJsonObject { put("agentSlug", resource.slug) }
         FleetAudience.publish(resource.slug, "agent.removed", removedEvent)
 
+        call.respond(mapOf("ok" to true))
+    }
+
+    /**
+     * Moves an agent to a body store (`storeId`), or back to the default store
+     * (`storeId: null`). Bodies already stored stay where they are; only the
+     * agent's next results follow. Runs the `agent.bodyStore.assign` hook.
+     * An agent the caller cannot see answers 404, like every other slug route.
+     */
+    put<AgentAdmin.BySlug.BodyStoreAssignment> { resource ->
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val slug = resource.parent.slug
+        val body = tryReceive<AssignBodyStoreRequest>(call)
+        val storeId = body.storeId?.let {
+            runCatching { UUID.fromString(it) }.getOrNull() ?: throw BadRequestException(ErrorCodes.INVALID_UUID)
+        }
+        bodyStoreCall {
+            transaction {
+                requireOrgWrite(orgId, principal.userId) { it.settings }
+                if (!AgentVisibility.canSee(orgId, principal.userId, slug)) throw NotFoundException()
+                BodyStoreService.assignAgent(slug, storeId, InterceptorContext(orgId = orgId, userId = principal.userId))
+                AuditService.log(orgId, principal.userId, "update.agent", "agent", slug, entityDisplayName = slug)
+            }
+        }
         call.respond(mapOf("ok" to true))
     }
 

@@ -3,6 +3,7 @@ package dev.tracedown.worker.jobs
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import dev.tracedown.common.models.ApiKeys
+import dev.tracedown.common.models.BodyStores
 import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgEncryptionKeys
@@ -1031,6 +1032,195 @@ class PurgeJobTest {
                 .where { PendingBodyDeletions.storageUrl eq "s3://bodies/expired-unreachable" }
                 .single()
             assertEquals("bucket down", pending[PendingBodyDeletions.lastError])
+        }
+    }
+
+    @Test
+    fun `a body outside platform storage is skipped, not failed, and the purge completes`() {
+        val root = java.nio.file.Files.createTempDirectory("purge-confined").toRealPath()
+        val outside = java.nio.file.Files.createTempFile("kept-at-source", ".json")
+            .also { java.nio.file.Files.writeString(it, "not the platform's") }
+        val platformBody = root.resolve("platform.json").also { java.nio.file.Files.writeString(it, "{}") }
+        lateinit var svc: UUID
+        lateinit var result: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            svc = insertService(proj, purge = true)
+            result = insertResult(svc, proj, ws, org)
+            insertStep(result, "file://$platformBody")
+            insertStep(result, "file://$outside")
+            insertStep(result, "s3://host-bucket/kept/body.json")
+        }
+
+        // The real client, confined to [root] and with no S3 backend at all: the
+        // two foreign URIs are refused on confinement before anything is touched.
+        runPurge(
+            BodyStorageClient(
+                confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = root),
+            ),
+        )
+
+        transaction {
+            assertEquals(0, count(Services, Services.id eq svc), "the purge completed")
+            assertEquals(0, count(ProbeSteps, ProbeSteps.probeResultId eq result))
+            for (uri in listOf("file://$outside", "s3://host-bucket/kept/body.json")) {
+                assertEquals(
+                    0, count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq uri),
+                    "a refused URI is not queued for retry: $uri",
+                )
+            }
+        }
+        assertFalse(java.nio.file.Files.exists(platformBody), "the platform's own body is deleted")
+        assertTrue(java.nio.file.Files.exists(outside), "a body outside platform storage is left alone")
+        java.nio.file.Files.deleteIfExists(outside)
+    }
+
+    /** A filesystem in_place body store rooted at [root], and a step whose body it holds. */
+    private fun insertInPlaceStep(resultId: UUID, root: java.nio.file.Path, bodyUrl: String): UUID {
+        val storeId = UUID.randomUUID()
+        BodyStores.insert {
+            it[id] = storeId
+            it[name] = "in-place-$storeId"
+            it[kind] = "filesystem"
+            it[mode] = "in_place"
+            it[rootPath] = root.toString()
+            it[createdAt] = NOW
+            it[updatedAt] = NOW
+        }
+        ProbeSteps.insert {
+            it[id] = UUID.randomUUID()
+            it[probeResultId] = resultId
+            it[stepNum] = 2
+            it[requestUrl] = "https://example.test/"
+            it[responseBodyStorageUrl] = bodyUrl
+            it[bodyStoreId] = storeId
+            it[createdAt] = NOW
+        }
+        return storeId
+    }
+
+    @Test
+    fun `purge leaves an in_place body in its store and still deletes default ones`() {
+        // Both bodies sit inside the default root, so only body_store_id stands
+        // between the in_place one and the delete — confinement would not.
+        val root = java.nio.file.Files.createTempDirectory("purge-in-place").toRealPath()
+        val defaultBody = root.resolve("default.json").also { java.nio.file.Files.writeString(it, "{}") }
+        val inPlaceBody = root.resolve("kept.json").also { java.nio.file.Files.writeString(it, "store owner's") }
+        lateinit var svc: UUID
+        lateinit var result: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            svc = insertService(proj, purge = true)
+            result = insertResult(svc, proj, ws, org)
+            insertStep(result, "file://$defaultBody")
+            insertInPlaceStep(result, root, "file://$inPlaceBody")
+        }
+
+        runPurge(BodyStorageClient(confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = root)))
+
+        transaction {
+            assertEquals(0, count(Services, Services.id eq svc), "the purge completed")
+            assertEquals(0, count(ProbeSteps, ProbeSteps.probeResultId eq result), "both rows are gone")
+            assertEquals(0, count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq "file://$inPlaceBody"))
+        }
+        assertFalse(java.nio.file.Files.exists(defaultBody), "the default store's body is deleted")
+        assertTrue(java.nio.file.Files.exists(inPlaceBody), "the in_place body is left to its store")
+    }
+
+    @Test
+    fun `retention leaves an in_place body in its store and still deletes default ones`() {
+        val root = java.nio.file.Files.createTempDirectory("retention-in-place").toRealPath()
+        val defaultBody = root.resolve("default.json").also { java.nio.file.Files.writeString(it, "{}") }
+        val inPlaceBody = root.resolve("kept.json").also { java.nio.file.Files.writeString(it, "store owner's") }
+        lateinit var result: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            val svc = insertService(proj)
+            result = insertResult(svc, proj, ws, org)
+            ProbeResults.update({ ProbeResults.id eq result }) {
+                it[startedAt] = NOW.minus(40, ChronoUnit.DAYS)
+            }
+            insertStep(result, "file://$defaultBody")
+            insertInPlaceStep(result, root, "file://$inPlaceBody")
+        }
+
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 30,
+                storageClient = BodyStorageClient(
+                    confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = root),
+                ),
+            ).execute()
+        }
+
+        transaction { assertEquals(0, count(ProbeResults, ProbeResults.id eq result)) }
+        assertFalse(java.nio.file.Files.exists(defaultBody), "the default store's body is deleted")
+        assertTrue(java.nio.file.Files.exists(inPlaceBody), "the in_place body is left to its store")
+    }
+
+    @Test
+    fun `retention skips a body outside platform storage and still drops the rows`() {
+        val root = java.nio.file.Files.createTempDirectory("retention-confined").toRealPath()
+        lateinit var result: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            val svc = insertService(proj)
+            result = insertResult(svc, proj, ws, org)
+            ProbeResults.update({ ProbeResults.id eq result }) {
+                it[startedAt] = NOW.minus(40, ChronoUnit.DAYS)
+            }
+            insertStep(result, "s3://host-bucket/kept/expired.json")
+        }
+
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 30,
+                storageClient = BodyStorageClient(
+                    confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = root),
+                ),
+            ).execute()
+        }
+
+        transaction {
+            assertEquals(0, count(ProbeResults, ProbeResults.id eq result))
+            assertEquals(
+                0,
+                count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq "s3://host-bucket/kept/expired.json"),
+            )
+        }
+    }
+
+    @Test
+    fun `the retry job clears a pending body that is outside platform storage`() {
+        val root = java.nio.file.Files.createTempDirectory("retry-confined").toRealPath()
+        transaction { PendingBodyDeletion.record(listOf("s3://host-bucket/kept/stale.json"), "recorded before") }
+
+        runBlocking {
+            BodyDeletionRetryJob(
+                storageClient = BodyStorageClient(
+                    confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = root),
+                ),
+            ).execute()
+        }
+
+        transaction {
+            assertEquals(
+                0,
+                count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq "s3://host-bucket/kept/stale.json"),
+                "a URI the platform will never delete is not retried forever",
+            )
         }
     }
 

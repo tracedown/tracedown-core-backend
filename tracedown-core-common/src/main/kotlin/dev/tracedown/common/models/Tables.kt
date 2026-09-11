@@ -37,6 +37,7 @@ object Tables {
         AgentBootstrapTokens,
         AgentCertificates,
         AgentHealthChecks,
+        BodyStores,
         ApiKeys,
         CaRoot,
         GrafanaIntegrations,

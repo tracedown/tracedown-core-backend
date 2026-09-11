@@ -136,12 +136,17 @@ class PurgeJob(
      * purged (steps of [purgingResults]), so storage objects never outlive the
      * rows pointing at them. Storage failures are logged and tolerated — a
      * broken bucket must not stop the database purge.
+     *
+     * A body kept in an `in_place` body store (`body_store_id` set) is not the
+     * platform's: its retention belongs to the store's owner, so it is left
+     * where it is and only the row goes.
      */
     private fun JdbcTransaction.deleteStoredBodies(purgingResults: String) {
         val uris = mutableListOf<String>()
         exec(
             "SELECT response_body_storage_url FROM probe_steps " +
-                "WHERE response_body_storage_url IS NOT NULL AND probe_result_id IN ($purgingResults)"
+                "WHERE response_body_storage_url IS NOT NULL AND body_store_id IS NULL " +
+                "AND probe_result_id IN ($purgingResults)"
         ) { rs ->
             while (rs.next()) uris.add(rs.getString(1))
         }

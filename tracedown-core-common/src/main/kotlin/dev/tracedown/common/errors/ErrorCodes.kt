@@ -50,8 +50,26 @@ object ErrorCodes {
     const val NOT_FOUND = "not_found"
     const val ALREADY_EXISTS = "already_exists"
     const val VERSION_CONFLICT = "version_conflict"
+    /** A stored response body the step still names can no longer be read at its location (410). */
+    const val BODY_GONE = "body_gone"
     /** A bootstrap token was requested for a slug an agent is already registered under. */
     const val AGENT_SLUG_TAKEN = "agent_slug_taken"
+    /**
+     * A stored response body is larger than the API serves inline (413). Only
+     * bodies read through a body store are capped this way; the default store
+     * hands out a URL instead.
+     */
+    const val BODY_TOO_LARGE = "body_too_large"
+
+    // ── Body stores ──
+    const val BODY_STORE_NOT_FOUND = "body_store_not_found"
+    /** A store still named by an agent, an outstanding bootstrap token or a stored body (409). */
+    const val BODY_STORE_IN_USE = "body_store_in_use"
+    const val BODY_STORE_NAME_TAKEN = "body_store_name_taken"
+    const val INVALID_STORE_KIND = "invalid_store_kind"
+    const val INVALID_STORE_MODE = "invalid_store_mode"
+    /** A field the store's kind needs is missing; `details.field` names it. */
+    const val STORE_FIELD_REQUIRED = "store_field_required"
 
     // ── Variables ──
     /** The resource already holds as many variables as the operator allows. */

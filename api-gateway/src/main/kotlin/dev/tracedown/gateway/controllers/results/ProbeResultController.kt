@@ -1,16 +1,22 @@
 package dev.tracedown.gateway.controllers.results
 
 import dev.tracedown.common.auth.canAccessResource
+import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.storage.BodyStorageClient
+import dev.tracedown.common.storage.BodyStoreRegistry
+import dev.tracedown.gateway.util.ApiException
+import io.ktor.http.HttpStatusCode
+import org.slf4j.LoggerFactory
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.gateway.data.results.ProbeResultDetail
 import dev.tracedown.gateway.data.results.ProbeResultSummary
 import dev.tracedown.gateway.data.results.ProbeStepSummary
+import dev.tracedown.gateway.util.GoneException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
 import dev.tracedown.gateway.util.requireCachedPermissions
@@ -31,6 +37,8 @@ import java.util.UUID
  * Resolves the service's parent chain and checks resource-level read access.
  */
 object ProbeResultController {
+
+    private val log = LoggerFactory.getLogger(ProbeResultController::class.java)
 
     private var storageClient: BodyStorageClient? = null
 
@@ -153,9 +161,20 @@ object ProbeResultController {
         }
     }
 
-    /** Retrieves the stored response body for a probe step. Returns null if no body stored. */
+    /**
+     * Retrieves the stored response body for a probe step; [BodyStorageClient.BodyContent.NotFound]
+     * when none is stored.
+     *
+     * A body in the default store is served as before (a presigned URL for S3,
+     * content for the filesystem). A body kept in an `in_place` body store
+     * (`probe_steps.body_store_id`) is read through that store's confined client
+     * and always served as **content**, never a URL — a store owner must not have
+     * to open their bucket's CORS to the dashboard. Capped at
+     * [BodyStoreRegistry.MAX_BODY_BYTES] (413 `body_too_large`); a missing object,
+     * a location the store refuses or an unreachable store is 410 `body_gone`.
+     */
     fun getStepBody(orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID): BodyStorageClient.BodyContent {
-        val storageUrl = transaction {
+        val (storageUrl, bodyStoreId) = transaction {
             val ctx = ResourceResolver.resolveService(serviceId, orgId)
             val cached = requireCachedPermissions(orgId, userId)
             val parentChain = listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
@@ -171,7 +190,7 @@ object ProbeResultController {
             // apply the same three terms the sibling `get` puts on the result.
             val step = ProbeSteps
                 .join(ProbeResults, JoinType.INNER, ProbeSteps.probeResultId, ProbeResults.id)
-                .select(ProbeSteps.responseBodyStorageUrl)
+                .select(ProbeSteps.responseBodyStorageUrl, ProbeSteps.bodyStoreId)
                 .where {
                     (ProbeSteps.id eq stepId) and
                         (ProbeSteps.probeResultId eq resultId) and
@@ -180,10 +199,31 @@ object ProbeResultController {
                 }
                 .firstOrNull() ?: throw NotFoundException()
 
-            step[ProbeSteps.responseBodyStorageUrl]
-        } ?: return BodyStorageClient.BodyContent.NotFound
+            step[ProbeSteps.responseBodyStorageUrl] to step[ProbeSteps.bodyStoreId]
+        }
+        if (storageUrl == null) return BodyStorageClient.BodyContent.NotFound
+        if (bodyStoreId != null) return readFromStore(bodyStoreId, storageUrl)
 
         val client = storageClient ?: return BodyStorageClient.BodyContent.NotFound
         return client.readBody(storageUrl)
+    }
+
+    /** Reads a body kept in an in_place body store. Called outside any transaction. */
+    private fun readFromStore(storeId: UUID, uri: String): BodyStorageClient.BodyContent {
+        val store = BodyStoreRegistry.load(storeId) ?: throw GoneException(ErrorCodes.BODY_GONE)
+        val read = try {
+            BodyStoreRegistry.clientFor(store).readBytes(uri, BodyStoreRegistry.MAX_BODY_BYTES)
+        } catch (e: Exception) {
+            log.warn("stored body in store {} could not be read: {}", storeId, e.message)
+            throw GoneException(ErrorCodes.BODY_GONE)
+        }
+        return when (read) {
+            is BodyStorageClient.StoredBody.Found -> BodyStorageClient.BodyContent.Inline(
+                content = read.bytes.toString(Charsets.UTF_8),
+                contentType = read.contentType,
+            )
+            BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
+            is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE)
+        }
     }
 }

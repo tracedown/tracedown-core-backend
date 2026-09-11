@@ -1,6 +1,7 @@
 package dev.tracedown.ingestor.services
 
 import dev.tracedown.common.storage.BodyStorageClient
+import dev.tracedown.common.storage.BodyStoreRegistry
 import org.slf4j.LoggerFactory
 import java.util.UUID
 
@@ -45,6 +46,29 @@ class BodyRelocator(private val storage: BodyStorageClient) {
             // source bytes, or an unreachable backend all land here. Never fall
             // back to persisting the agent path — drop the body reference.
             log.warn("body relocation failed for service {} result {}: {}", serviceId, resultId, e.message)
+            null
+        }
+    }
+
+    /**
+     * Imports the body at [agentBodyPath] from the agent's own `import` body
+     * store — read through [source], which is confined to that store — into the
+     * canonical key in this relocator's (default) store, removing it from the
+     * source. Same contract as [relocate]: the server-derived URI, or null.
+     */
+    fun importFrom(
+        source: BodyStorageClient,
+        agentBodyPath: String,
+        organizationId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+        callIndex: Int,
+    ): String? {
+        val destKey = "$organizationId/$serviceId/$resultId/call_${callIndex}_response${extensionOf(agentBodyPath)}"
+        return try {
+            storage.relocateFrom(source, agentBodyPath, destKey, BodyStoreRegistry.MAX_BODY_BYTES)
+        } catch (e: Exception) {
+            log.warn("body import failed for service {} result {}: {}", serviceId, resultId, e.message)
             null
         }
     }

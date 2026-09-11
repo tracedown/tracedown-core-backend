@@ -21,6 +21,8 @@ data class StorageConfig(
     val s3: S3Config?,
     val s3Bucket: String?,
     val s3Prefix: String,
+    /** Comma-separated directories a filesystem body store's root must lie inside. */
+    val bodyStoreFilesystemBases: String?,
 )
 
 data class IngestorConfig(
@@ -28,6 +30,13 @@ data class IngestorConfig(
     val redisAUrl: String,
     val popTimeoutSeconds: Long,
     val storage: StorageConfig,
+    /**
+     * The platform key, needed to decrypt a body store's credentials when an
+     * agent imports from its own store. Null when not configured: such imports
+     * then fail and the body is recorded as unavailable.
+     */
+    val aesKey: String?,
+    val deploymentEnvironment: String?,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -59,7 +68,10 @@ data class IngestorConfig(
                     s3Bucket = config.propertyOrNull("storage.s3.bucket")?.getString()
                         ?.takeIf { it.isNotBlank() },
                     s3Prefix = config.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+                    bodyStoreFilesystemBases = config.propertyOrNull("storage.stores.filesystemBases")?.getString(),
                 ),
+                aesKey = config.propertyOrNull("platform.aesKey")?.getString()?.takeIf { it.isNotBlank() },
+                deploymentEnvironment = config.propertyOrNull("deployment.environment")?.getString(),
             )
         }
     }

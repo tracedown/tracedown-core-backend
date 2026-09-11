@@ -17,14 +17,27 @@ object BodyNotStoredReason {
     const val STORAGE_UNAVAILABLE = "storageUnavailable"
 
     /**
+     * The agent writes to an `in_place` body store, but reported a body location
+     * outside that store — nothing is recorded rather than trusting the path.
+     */
+    const val OUTSIDE_ASSIGNED_STORE = "outsideAssignedStore"
+
+    /**
      * [reported] is the executor's `bodyNotCapturedReason` (spec §9), [withheld]
      * the scheduler's own reason when it overrode the service's setting, and
      * [relocationFailed] whether a captured body could not be taken into
-     * server-owned storage.
+     * server-owned storage, and [outsideAssignedStore] whether the agent's
+     * `in_place` store refused the location it reported.
      */
-    fun resolve(reported: String?, withheld: String?, relocationFailed: Boolean): String? = when {
+    fun resolve(
+        reported: String?,
+        withheld: String?,
+        relocationFailed: Boolean,
+        outsideAssignedStore: Boolean = false,
+    ): String? = when {
         reported == NOT_REQUESTED && !withheld.isNullOrBlank() -> withheld
         reported != null -> reported
+        outsideAssignedStore -> OUTSIDE_ASSIGNED_STORE
         relocationFailed -> STORAGE_UNAVAILABLE
         else -> null
     }

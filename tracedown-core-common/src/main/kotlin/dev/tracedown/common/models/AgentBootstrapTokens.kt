@@ -24,5 +24,8 @@ object AgentBootstrapTokens : Table("agent_bootstrap_tokens") {
     val createdBy = javaUUID("created_by").references(Users.id).nullable()
     val createdAt = timestamp("created_at")
 
+    /** Copied onto the agent at registration (null = the default store). */
+    val bodyStoreId = javaUUID("body_store_id").references(BodyStores.id).nullable()
+
     override val primaryKey = PrimaryKey(id)
 }

@@ -75,6 +75,8 @@ dependencies {
     testImplementation(libs.testcontainers)
     testImplementation(libs.testcontainers.junit.jupiter)
     testImplementation(libs.testcontainers.postgresql)
+    // MinIO, as an S3-compatible body store in the body-store tests.
+    testImplementation(libs.minio)
 
     implementation(libs.okhttp)
 }
