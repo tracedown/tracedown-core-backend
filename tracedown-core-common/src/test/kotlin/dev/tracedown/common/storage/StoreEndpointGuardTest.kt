@@ -1,7 +1,10 @@
 package dev.tracedown.common.storage
 
 import com.sun.net.httpserver.HttpServer
+import org.apache.http.HttpHost
+import org.apache.http.protocol.BasicHttpContext
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -50,41 +53,41 @@ class StoreEndpointGuardTest {
 
     @Test
     fun `internal-only names are refused`() {
-        assertEquals("internal_host", StoreEndpointGuard.validate("https://minio.railway.internal", false))
+        assertEquals("internal_host", StoreEndpointGuard.validate("https://storage.railway.internal", false))
         assertEquals("internal_host", StoreEndpointGuard.validate("https://metadata.internal", false))
         assertEquals("internal_host", StoreEndpointGuard.validate("https://store.local", false))
     }
 
     @Test
     fun `a single-label host is refused`() {
-        // `minio` is whatever the container runtime's search domain says, which
+        // `storage` is whatever the container runtime's search domain says, which
         // is a different machine in every network and inside a stack an internal
         // one. A store endpoint has to name a host the same way everywhere.
-        assertEquals("single_label_host", StoreEndpointGuard.validate("https://minio", false))
+        assertEquals("single_label_host", StoreEndpointGuard.validate("https://storage", false))
         assertEquals("single_label_host", StoreEndpointGuard.validate("https://storage.", false))
-        assertNull(StoreEndpointGuard.validate("https://minio.example.com", false))
+        assertNull(StoreEndpointGuard.validate("https://storage.example.com", false))
         // With private endpoints allowed, a bare service name is exactly what an
         // operator means, and is accepted.
-        assertNull(StoreEndpointGuard.validate("http://minio", allowPrivate = true))
+        assertNull(StoreEndpointGuard.validate("http://storage", allowPrivate = true))
     }
 
     @Test
     fun `plain http and private hosts are refused unless private endpoints are allowed`() {
         for (endpoint in listOf(
             "http://s3.example.com", "http://localhost:9000", "http://127.0.0.1:9000",
-            "http://minio:9000", "https://10.0.0.5:9000",
+            "http://storage:9000", "https://10.0.0.5:9000",
         )) {
             assertNotNull(StoreEndpointGuard.validate(endpoint, allowPrivate = false), endpoint)
         }
         for (endpoint in listOf(
             "http://s3.example.com", "http://localhost:9000", "http://127.0.0.1:9000",
-            "http://minio:9000", "https://10.0.0.5:9000", "http://minio.railway.internal:9000",
+            "http://storage:9000", "https://10.0.0.5:9000", "http://storage.railway.internal:9000",
         )) {
             assertNull(StoreEndpointGuard.validate(endpoint, allowPrivate = true), endpoint)
         }
         // The setting relaxes the network, never the URL shape.
-        assertEquals("scheme_not_https", StoreEndpointGuard.validate("ftp://minio", allowPrivate = true))
-        assertEquals("has_path", StoreEndpointGuard.validate("http://minio/bucket", allowPrivate = true))
+        assertEquals("scheme_not_https", StoreEndpointGuard.validate("ftp://storage", allowPrivate = true))
+        assertEquals("has_path", StoreEndpointGuard.validate("http://storage/bucket", allowPrivate = true))
     }
 
     @Test
@@ -112,15 +115,40 @@ class StoreEndpointGuardTest {
     fun `without the setting no name reaches an internal host or loopback`() {
         val dns = StoreEndpointGuard.GuardedDns(allowPrivate = false) { listOf(InetAddress.getByName("127.0.0.1")) }
         assertThrows(StoreEndpointBlockedException::class.java) { dns.lookup("evil.example.com") }
-        assertThrows(StoreEndpointBlockedException::class.java) { dns.lookup("minio.railway.internal") }
+        assertThrows(StoreEndpointBlockedException::class.java) { dns.lookup("storage.railway.internal") }
     }
 
     @Test
     fun `with the setting private and internal answers are allowed`() {
         val loopback = InetAddress.getByName("127.0.0.1")
         val dns = StoreEndpointGuard.GuardedDns(allowPrivate = true) { listOf(loopback) }
-        assertEquals(listOf(loopback), dns.lookup("minio"))
-        assertEquals(listOf(loopback), dns.lookup("minio.railway.internal"))
+        assertEquals(listOf(loopback), dns.lookup("storage"))
+        assertEquals(listOf(loopback), dns.lookup("storage.railway.internal"))
+    }
+
+    @Test
+    fun `the socket factory refuses the address it is asked to connect to`() {
+        // The last layer, and the only one that sees the address a connect is
+        // actually made to. It is the TLS factory, which is every endpoint the
+        // guard protects: without `allowPrivate`, validate() admits https alone.
+        val guarded = StoreEndpointGuard.GuardedSocketFactory(allowPrivate = false)
+        val host = HttpHost("store.example.com", 443, "https")
+        assertThrows(StoreEndpointBlockedException::class.java) {
+            guarded.connectSocket(
+                1_000, null, host,
+                InetSocketAddress(InetAddress.getByName("10.1.2.3"), 443), null, BasicHttpContext(),
+            )
+        }
+        // And with the setting, the same address is dialled — the delegate is
+        // reached, and fails as a connection failure rather than a refusal.
+        val open = StoreEndpointGuard.GuardedSocketFactory(allowPrivate = true)
+        val reached = assertThrows(Exception::class.java) {
+            open.connectSocket(
+                50, null, HttpHost("localhost", 1, "https"),
+                InetSocketAddress(InetAddress.getLoopbackAddress(), 1), null, BasicHttpContext(),
+            )
+        }
+        assertFalse(reached is StoreEndpointBlockedException, "the guard did not stand in the way")
     }
 
     @Test

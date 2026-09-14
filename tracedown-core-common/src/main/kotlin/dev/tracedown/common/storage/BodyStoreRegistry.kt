@@ -8,6 +8,7 @@ import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import software.amazon.awssdk.http.SdkHttpClient
 import java.nio.file.Path
 import java.time.Instant
 import java.util.UUID
@@ -126,6 +127,9 @@ object BodyStoreRegistry {
 
     private val cache = ConcurrentHashMap<UUID, Entry>()
 
+    /** Guarded HTTP clients, one per (allowPrivateEndpoints, timeoutSeconds). */
+    private val httpClients = ConcurrentHashMap<Pair<Boolean, Long>, SdkHttpClient>()
+
     /**
      * [filesystemBases] is a comma-separated list of directories (unset = no
      * filesystem stores); [allowPrivateEndpoints] is `BODY_STORE_PRIVATE_ENDPOINTS`.
@@ -231,6 +235,23 @@ object BodyStoreRegistry {
         for (id in held) if (id !in alive) cache.remove(id)
     }
 
+    /**
+     * The one guarded HTTP client every S3 store shares, rebuilt only when the
+     * settings it is made from change. Clients are built per store — and, for an
+     * agent's own corner of one, per result — so a connection pool each would be
+     * a pool per body written.
+     */
+    private fun guardedHttpClient(): SdkHttpClient {
+        val current = settings.allowPrivateEndpoints to settings.timeoutSeconds
+        httpClients[current]?.let { return it }
+        // Never closed on replacement: a client already handed out is held by
+        // cached store clients, and the key only changes when an operator
+        // reconfigures the process, which happens once at startup.
+        return httpClients.computeIfAbsent(current) { (allowPrivate, timeout) ->
+            StoreEndpointGuard.httpClient(timeout, allowPrivate)
+        }
+    }
+
     private fun realPath(path: Path): Path {
         val absolute = path.toAbsolutePath().normalize()
         return try {
@@ -269,7 +290,7 @@ object BodyStoreRegistry {
                 timeoutSeconds = settings.timeoutSeconds,
             ),
             confinement = confinement,
-            httpClient = StoreEndpointGuard.httpClient(settings.timeoutSeconds, settings.allowPrivateEndpoints),
+            httpClient = guardedHttpClient(),
         )
     }
 }

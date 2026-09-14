@@ -162,7 +162,7 @@ class BodyStoreRoutesTest {
             DefaultBodyStore(kind = "filesystem", rootPath = defaultRoot.toString(), filesystemRoot = defaultRoot.toString()),
         )
         ProbeResultController.init(BodyStorageClient(confinement = BodyConfinement(filesystemRoot = defaultRoot)))
-        TestMinio.bucket(BUCKET)
+        TestS3.bucket(BUCKET)
 
         transaction {
             for ((userId, label) in listOf(ownerId to "owner", readerId to "reader", otherOwnerId to "other")) {
@@ -320,9 +320,9 @@ class BodyStoreRoutesTest {
         mode: String = "in_place",
         bucket: String? = BUCKET,
         prefix: String? = unique("bodies"),
-        endpoint: String? = TestMinio.endpoint,
-        secret: String? = TestMinio.PASSWORD,
-        accessKeyId: String? = TestMinio.USER,
+        endpoint: String? = TestS3.endpoint,
+        secret: String? = TestS3.PASSWORD,
+        accessKeyId: String? = TestS3.USER,
         region: String? = null,
     ): String = buildJsonObject {
         put("name", name)
@@ -363,8 +363,8 @@ class BodyStoreRoutesTest {
         UUID.fromString(BodyStoreService.create(orgId, input).id)
 
     private fun s3Input(name: String, mode: String = "in_place", prefix: String? = "bodies") = BodyStoreInput(
-        name = name, kind = "s3", mode = mode, endpoint = TestMinio.endpoint, bucket = BUCKET,
-        prefix = prefix, accessKeyId = TestMinio.USER, secretAccessKey = TestMinio.PASSWORD,
+        name = name, kind = "s3", mode = mode, endpoint = TestS3.endpoint, bucket = BUCKET,
+        prefix = prefix, accessKeyId = TestS3.USER, secretAccessKey = TestS3.PASSWORD,
     )
 
     private fun insertAgent(slug: String, deleted: Boolean = false) = transaction {
@@ -423,20 +423,20 @@ class BodyStoreRoutesTest {
         assertEquals("s3", store["kind"]!!.jsonPrimitive.content)
         assertEquals("in_place", store["mode"]!!.jsonPrimitive.content)
         assertEquals(prefix, store["prefix"]!!.jsonPrimitive.content)
-        assertEquals(TestMinio.USER, store["accessKeyId"]!!.jsonPrimitive.content)
+        assertEquals(TestS3.USER, store["accessKeyId"]!!.jsonPrimitive.content)
         assertEquals("true", store["hasSecret"]!!.jsonPrimitive.content)
         assertEquals(0, store["agents"]!!.jsonPrimitive.int)
         assertEquals(JsonNull, store["lastFailure"], "a store that has not failed says so with null")
         assertFalse(store.containsKey("secretAccessKey"))
         assertFalse(store.containsKey("secretEnc"))
         assertFalse(store.containsKey("organizationId"), "the owning org is not part of the API")
-        assertFalse(created.toString().contains(TestMinio.PASSWORD), "the secret is never returned")
+        assertFalse(created.toString().contains(TestS3.PASSWORD), "the secret is never returned")
 
         val storedSecret = storeRow(UUID.fromString(id))
             .let { it[BodyStores.secretEnc]!! to it[BodyStores.secretIv]!! }
-        assertNotEquals(TestMinio.PASSWORD, storedSecret.first, "encrypted at rest")
+        assertNotEquals(TestS3.PASSWORD, storedSecret.first, "encrypted at rest")
         assertEquals(
-            TestMinio.PASSWORD,
+            TestS3.PASSWORD,
             BodyStoreCrypto.decryptBound(storedSecret.first, storedSecret.second, "body_store:$id"),
         )
 
@@ -444,7 +444,7 @@ class BodyStoreRoutesTest {
         assertEquals(HttpStatusCode.OK, listStatus)
         val listed = list!!.jsonArray.single { it.jsonObject["id"]!!.jsonPrimitive.content == id }.jsonObject
         assertEquals(STORE_KEYS, listed.keys)
-        assertFalse(list.toString().contains(TestMinio.PASSWORD))
+        assertFalse(list.toString().contains(TestS3.PASSWORD))
 
         // An omitted secret keeps the stored one; the response is the updated row.
         val renamed = unique("crud-renamed")
@@ -456,7 +456,7 @@ class BodyStoreRoutesTest {
         assertEquals(STORE_KEYS, updated.jsonObject.keys)
         val afterUpdate = storeRow(UUID.fromString(id))
             .let { BodyStoreCrypto.decryptBound(it[BodyStores.secretEnc]!!, it[BodyStores.secretIv]!!, "body_store:$id") }
-        assertEquals(TestMinio.PASSWORD, afterUpdate)
+        assertEquals(TestS3.PASSWORD, afterUpdate)
 
         val (deleteStatus, _) = call(HttpMethod.Delete, "$STORES/$id")
         assertEquals(HttpStatusCode.OK, deleteStatus)
@@ -521,7 +521,7 @@ class BodyStoreRoutesTest {
 
             // And no store may be created over the platform's own bodies, whatever
             // endpoint spelling it names them by.
-            for (endpoint in listOf("https://platform.example.com", "https://platform.example.com:443", TestMinio.endpoint)) {
+            for (endpoint in listOf("https://platform.example.com", "https://platform.example.com:443", TestS3.endpoint)) {
                 assertError(
                     call(HttpMethod.Post, STORES, s3Store(unique("over"), bucket = "platform-bodies", prefix = "p/sub", endpoint = endpoint)),
                     HttpStatusCode.BadRequest, ErrorCodes.FIELD_INVALID, field = "prefix", reason = "overlaps_default",
@@ -642,9 +642,9 @@ class BodyStoreRoutesTest {
             "https://10.0.0.5" to "private_address",
             "https://169.254.169.254" to "private_address",
             "https://192.168.0.10:9000" to "private_address",
-            "https://minio.railway.internal" to "internal_host",
+            "https://storage.railway.internal" to "internal_host",
             "http://s3.example.com" to "scheme_not_https",
-            "https://minio" to "single_label_host",
+            "https://storage" to "single_label_host",
             "https://s3.example.com/bucket" to "has_path",
         )) {
             assertError(
@@ -652,7 +652,7 @@ class BodyStoreRoutesTest {
                 HttpStatusCode.BadRequest, ErrorCodes.FIELD_INVALID, field = "endpoint", reason = reason,
             )
         }
-        // The local MinIO the rest of this suite uses is refused too.
+        // The local store the rest of this suite uses is refused too.
         assertError(
             call(HttpMethod.Post, STORES, s3Store(unique("local"))),
             HttpStatusCode.BadRequest, ErrorCodes.FIELD_INVALID, field = "endpoint",
@@ -661,7 +661,7 @@ class BodyStoreRoutesTest {
         // With the setting on, a private object store is exactly what is meant.
         configureStores(allowPrivateEndpoints = true)
         createStore(s3Store(unique("private-ok"), endpoint = "http://10.0.0.5:9000"))
-        createStore(s3Store(unique("private-name"), endpoint = "http://minio:9000", prefix = "other"))
+        createStore(s3Store(unique("private-name"), endpoint = "http://storage:9000", prefix = "other"))
     }
 
     @Test
@@ -1100,7 +1100,7 @@ class BodyStoreRoutesTest {
         // The agent writes under its own corner of the store, and that is what
         // the dashboard prints as PROBE_AGENT_S3_PREFIX.
         assertEquals("enrol", bodyStore["prefix"]!!.jsonPrimitive.content)
-        assertFalse(minted.toString().contains(TestMinio.PASSWORD), "a token response carries no credential")
+        assertFalse(minted.toString().contains(TestS3.PASSWORD), "a token response carries no credential")
 
         val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(3072, SecureRandom()) }.generateKeyPair()
         val uri = "https://$slug.example.test:8443"
@@ -1175,7 +1175,7 @@ class BodyStoreRoutesTest {
     @Test
     fun `an in_place body is served as content from its store`() {
         val store = store(orgId, s3Input(unique("read"), prefix = "read-bodies"))
-        TestMinio.put(BUCKET, "read-bodies/run-1/call_0.json", """{"in":"place"}""".toByteArray(), "application/json")
+        TestS3.put(BUCKET, "read-bodies/run-1/call_0.json", """{"in":"place"}""".toByteArray(), "application/json")
 
         val body = readBody(insertStep("s3://$BUCKET/read-bodies/run-1/call_0.json", store))
 
@@ -1186,7 +1186,7 @@ class BodyStoreRoutesTest {
     fun `a binary in_place body comes back base64, never mangled`() {
         val store = store(orgId, s3Input(unique("binary"), prefix = "binary-bodies"))
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF.toByte(), 0xFE.toByte())
-        TestMinio.put(BUCKET, "binary-bodies/call_0.png", png, "image/png")
+        TestS3.put(BUCKET, "binary-bodies/call_0.png", png, "image/png")
 
         val body = readBody(insertStep("s3://$BUCKET/binary-bodies/call_0.png", store))
 
@@ -1201,7 +1201,7 @@ class BodyStoreRoutesTest {
         val store = store(orgId, s3Input(unique("gone"), prefix = "gone-bodies"))
         // Written, but outside the store: the confinement refusal is a real one,
         // not "there was nothing there anyway".
-        TestMinio.put(BUCKET, "outside-the-store/call_0.json", "not yours".toByteArray())
+        TestS3.put(BUCKET, "outside-the-store/call_0.json", "not yours".toByteArray())
 
         for (uri in listOf(
             "s3://$BUCKET/gone-bodies/never-written.json",
@@ -1212,7 +1212,7 @@ class BodyStoreRoutesTest {
             assertEquals(HttpStatusCode.Gone, e.status, uri)
             assertEquals(ErrorCodes.BODY_GONE, e.code, uri)
         }
-        assertEquals("not yours", String(TestMinio.get(BUCKET, "outside-the-store/call_0.json")), "untouched")
+        assertEquals("not yours", String(TestS3.get(BUCKET, "outside-the-store/call_0.json")), "untouched")
 
         // A store nobody is listening on, and one whose key the store refuses:
         // the body is probably still there, so this is not `body_gone`.
@@ -1221,18 +1221,18 @@ class BodyStoreRoutesTest {
             BodyStoreInput(
                 name = unique("unreachable"), kind = "s3", mode = "in_place",
                 endpoint = "http://127.0.0.1:1", bucket = BUCKET, prefix = "unreachable",
-                accessKeyId = TestMinio.USER, secretAccessKey = TestMinio.PASSWORD,
+                accessKeyId = TestS3.USER, secretAccessKey = TestS3.PASSWORD,
             ),
         )
         val wrongSecret = store(
             orgId,
             BodyStoreInput(
                 name = unique("wrong-secret"), kind = "s3", mode = "in_place",
-                endpoint = TestMinio.endpoint, bucket = BUCKET, prefix = "wrong-secret",
-                accessKeyId = TestMinio.USER, secretAccessKey = "not-the-secret",
+                endpoint = TestS3.endpoint, bucket = BUCKET, prefix = "wrong-secret",
+                accessKeyId = TestS3.USER, secretAccessKey = "not-the-secret",
             ),
         )
-        TestMinio.put(BUCKET, "wrong-secret/call_0.json", "there all along".toByteArray())
+        TestS3.put(BUCKET, "wrong-secret/call_0.json", "there all along".toByteArray())
         for ((id, uri) in listOf(
             unreachable to "s3://$BUCKET/unreachable/call_0.json",
             wrongSecret to "s3://$BUCKET/wrong-secret/call_0.json",
@@ -1265,10 +1265,10 @@ class BodyStoreRoutesTest {
     @Test
     fun `a client cached for a store is rebuilt when the store changes`() {
         val id = store(orgId, s3Input(unique("cache"), prefix = "cache-bodies"))
-        TestMinio.put(BUCKET, "cache-bodies/call_0.json", "first".toByteArray())
+        TestS3.put(BUCKET, "cache-bodies/call_0.bin", "first".toByteArray())
         assertEquals(
             BodyStorageClient.BodyContent.Inline("first", "application/octet-stream"),
-            readBody(insertStep("s3://$BUCKET/cache-bodies/call_0.json", id)),
+            readBody(insertStep("s3://$BUCKET/cache-bodies/call_0.bin", id)),
         )
 
         // Repoint the credentials at something the store will not accept. The
@@ -1277,14 +1277,14 @@ class BodyStoreRoutesTest {
         BodyStoreService.update(
             orgId, id,
             BodyStoreInput(
-                name = unique("cache"), kind = "s3", mode = "in_place", endpoint = TestMinio.endpoint,
-                bucket = BUCKET, prefix = "cache-bodies", accessKeyId = TestMinio.USER,
+                name = unique("cache"), kind = "s3", mode = "in_place", endpoint = TestS3.endpoint,
+                bucket = BUCKET, prefix = "cache-bodies", accessKeyId = TestS3.USER,
                 secretAccessKey = "not-the-secret",
             ),
         )
 
         val e = assertThrows(ApiException::class.java) {
-            readBody(insertStep("s3://$BUCKET/cache-bodies/call_0.json", id))
+            readBody(insertStep("s3://$BUCKET/cache-bodies/call_0.bin", id))
         }
         assertEquals(HttpStatusCode.ServiceUnavailable, e.status)
     }

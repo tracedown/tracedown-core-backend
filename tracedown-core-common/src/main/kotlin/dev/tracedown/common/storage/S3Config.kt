@@ -3,8 +3,8 @@ package dev.tracedown.common.storage
 /**
  * Configuration for connecting to an S3-compatible object store.
  *
- * Works with any S3-compatible service: Cloudflare R2, MinIO, Backblaze B2,
- * DigitalOcean Spaces, etc.
+ * Works with any S3-compatible service: Cloudflare R2, SeaweedFS, Garage,
+ * Ceph RGW, Backblaze B2, DigitalOcean Spaces, etc.
  */
 data class S3Config(
     /** Endpoint URL, e.g. ``https://<account>.r2.cloudflarestorage.com`` */
@@ -14,9 +14,11 @@ data class S3Config(
     /** Secret access key. */
     val secretKey: String,
     /**
-     * Signing region. R2 wants `auto`; AWS S3 wants the bucket's real region;
-     * MinIO ignores it. Without one the client would look the region up per
-     * bucket, which some stores answer slowly or not at all.
+     * Signing region. R2 only accepts `auto`; AWS S3 wants the bucket's real
+     * region; a self-hosted store signs for whatever it was configured with (and
+     * several ignore it). Blank falls back to `auto`, never to a lookup: a client
+     * left to discover the region asks the store per bucket, which some answer
+     * slowly and some not at all.
      */
     val region: String = "auto",
     /**

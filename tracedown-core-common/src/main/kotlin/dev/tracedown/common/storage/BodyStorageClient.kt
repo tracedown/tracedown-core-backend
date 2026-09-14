@@ -1,27 +1,40 @@
 package dev.tracedown.common.storage
 
-import io.minio.CopyObjectArgs
-import io.minio.GetObjectArgs
-import io.minio.GetPresignedObjectUrlArgs
-import io.minio.Http
-import io.minio.ListObjectsArgs
-import io.minio.MinioClient
-import io.minio.PutObjectArgs
-import io.minio.StatObjectArgs
-import io.minio.errors.ErrorResponseException
-import io.minio.RemoveObjectArgs
-import io.minio.RemoveObjectsArgs
-import io.minio.messages.DeleteRequest
-import io.minio.SourceObject
 import org.slf4j.LoggerFactory
-import java.io.ByteArrayInputStream
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
+import software.amazon.awssdk.awscore.exception.AwsServiceException
+import software.amazon.awssdk.awscore.retry.AwsRetryStrategy
+import software.amazon.awssdk.core.checksums.RequestChecksumCalculation
+import software.amazon.awssdk.core.checksums.ResponseChecksumValidation
+import software.amazon.awssdk.core.exception.SdkClientException
+import software.amazon.awssdk.core.sync.RequestBody
+import software.amazon.awssdk.http.SdkHttpClient
+import software.amazon.awssdk.http.apache.ApacheHttpClient
+import software.amazon.awssdk.regions.Region
+import software.amazon.awssdk.services.s3.S3Client
+import software.amazon.awssdk.services.s3.S3Configuration
+import software.amazon.awssdk.services.s3.model.CopyObjectRequest
+import software.amazon.awssdk.services.s3.model.Delete
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest
+import software.amazon.awssdk.services.s3.model.GetObjectRequest
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier
+import software.amazon.awssdk.services.s3.model.PutObjectRequest
+import software.amazon.awssdk.services.s3.model.S3Exception
+import software.amazon.awssdk.services.s3.presigner.S3Presigner
+import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest
 import java.io.IOException
 import java.io.InputStream
+import java.net.URI
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.time.Duration
 
 /**
  * Raised when a storage URI points outside the configured backend root/bucket —
@@ -109,7 +122,7 @@ data class BodyConfinement(
  * Client for interacting with stored response bodies via protocol-aware URIs.
  *
  * Supports ``file://`` (local filesystem) and ``s3://`` (any S3-compatible store:
- * Cloudflare R2, MinIO, Backblaze B2, etc.).
+ * Cloudflare R2, SeaweedFS, Garage, Ceph RGW, Backblaze B2, etc.).
  *
  * The S3 client is lazily initialized — no connection is made unless S3 URIs
  * are actually encountered.
@@ -120,27 +133,51 @@ data class BodyConfinement(
 open class BodyStorageClient(
     private val s3Config: S3Config? = null,
     private val confinement: BodyConfinement? = null,
-    private val httpClient: okhttp3.OkHttpClient? = null,
+    private val httpClient: SdkHttpClient? = null,
 ) {
 
     private val log = LoggerFactory.getLogger(BodyStorageClient::class.java)
 
-    private val s3Client: MinioClient? by lazy {
+    private val s3Client: S3Client? by lazy {
         s3Config?.let { cfg ->
-            val timeout = java.time.Duration.ofSeconds(cfg.timeoutSeconds.coerceAtLeast(1))
-            MinioClient.builder()
-                .endpoint(cfg.endpoint)
-                .credentials(cfg.accessKey, cfg.secretKey)
-                .region(cfg.region)
-                // MinIO's own default client waits five minutes per phase.
-                .httpClient(
-                    httpClient ?: okhttp3.OkHttpClient.Builder()
-                        .connectTimeout(timeout)
-                        .readTimeout(timeout)
-                        .writeTimeout(timeout)
-                        .callTimeout(timeout.multipliedBy(2))
-                        .build(),
-                )
+            val timeout = Duration.ofSeconds(cfg.timeoutSeconds.coerceAtLeast(1))
+            S3Client.builder()
+                .endpointOverride(URI(cfg.endpoint))
+                .credentialsProvider(credentials(cfg))
+                .region(signingRegion(cfg))
+                // Every store this platform talks to is addressed by bucket in
+                // the path: virtual-hosted style would need a wildcard DNS name
+                // the operator does not have (R2, SeaweedFS, Garage, Ceph RGW).
+                .forcePathStyle(true)
+                // R2 rejects the SDK's default streaming (trailer) checksums; the
+                // ones S3 genuinely requires — DeleteObjects — are still sent.
+                .requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED)
+                .responseChecksumValidation(ResponseChecksumValidation.WHEN_REQUIRED)
+                .httpClient(httpClient ?: defaultHttpClient(timeout))
+                .overrideConfiguration { override ->
+                    // One call, one attempt: the callers that record a failure
+                    // (retention, the deletion retry table) do the retrying, and
+                    // the configured timeout is a budget for the whole call.
+                    override.retryStrategy(AwsRetryStrategy.doNotRetry())
+                        .apiCallAttemptTimeout(timeout)
+                        .apiCallTimeout(timeout.multipliedBy(2))
+                }
+                .build()
+        }
+    }
+
+    /**
+     * Signs presigned GET URLs with the same endpoint, region, credentials and
+     * addressing style as [s3Client]. It signs, it never dials, so it needs no
+     * HTTP client and nothing for the guard to protect.
+     */
+    private val s3Presigner: S3Presigner? by lazy {
+        s3Config?.let { cfg ->
+            S3Presigner.builder()
+                .endpointOverride(URI(cfg.endpoint))
+                .credentialsProvider(credentials(cfg))
+                .region(signingRegion(cfg))
+                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
                 .build()
         }
     }
@@ -327,17 +364,24 @@ open class BodyStorageClient(
             is StorageUri.S3 -> {
                 confineS3(parsed.bucket, parsed.key)
                 val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
-                val stat = try {
-                    client.statObject(StatObjectArgs.builder().bucket(parsed.bucket).`object`(parsed.key).build())
-                } catch (e: ErrorResponseException) {
-                    if (e.errorResponse()?.code() in MISSING_CODES || e.response()?.code == 404) return StoredBody.Missing
+                val head = try {
+                    client.headObject(HeadObjectRequest.builder().bucket(parsed.bucket).key(parsed.key).build())
+                } catch (e: AwsServiceException) {
+                    if (isMissing(e)) return StoredBody.Missing
                     throw e
                 }
-                if (stat.size() > maxBytes) return StoredBody.TooLarge(stat.size())
-                client.getObject(GetObjectArgs.builder().bucket(parsed.bucket).`object`(parsed.key).build()).use { input ->
+                val size = head.contentLength() ?: 0L
+                if (size > maxBytes) return StoredBody.TooLarge(size)
+                val get = try {
+                    client.getObject(GetObjectRequest.builder().bucket(parsed.bucket).key(parsed.key).build())
+                } catch (e: AwsServiceException) {
+                    if (isMissing(e)) return StoredBody.Missing
+                    throw e
+                }
+                get.use { input ->
                     val bytes = input.readNBytes(capacity(maxBytes))
                     if (bytes.size > maxBytes) StoredBody.TooLarge(bytes.size.toLong())
-                    else StoredBody.Found(bytes, stat.contentType())
+                    else StoredBody.Found(bytes, head.contentType())
                 }
             }
         }
@@ -356,12 +400,12 @@ open class BodyStorageClient(
         if (client != null && bucket != null) {
             val prefix = conf.normalizedS3Prefix
             val fullKey = if (prefix.isEmpty()) cleanKey else "$prefix/$cleanKey"
-            val args = PutObjectArgs.builder()
+            val request = PutObjectRequest.builder()
                 .bucket(bucket)
-                .`object`(fullKey)
-                .stream(ByteArrayInputStream(bytes), bytes.size.toLong(), -1L)
-            if (!contentType.isNullOrBlank()) args.contentType(contentType)
-            client.putObject(args.build())
+                .key(fullKey)
+                .apply { if (!contentType.isNullOrBlank()) contentType(contentType) }
+                .build()
+            client.putObject(request, RequestBody.fromBytes(bytes))
             return "s3://$bucket/$fullKey"
         }
         val root = conf.normalizedRoot ?: throw StorageConfinementException("no filesystem root is confined")
@@ -412,10 +456,9 @@ open class BodyStorageClient(
             return try {
                 val client = s3Client ?: return "not_configured"
                 val prefix = conf.normalizedS3Prefix.let { if (it.isEmpty()) "" else "$it/" }
-                val listing = client.listObjects(
-                    ListObjectsArgs.builder().bucket(bucket).prefix(prefix).maxKeys(1).build(),
-                ).iterator()
-                if (listing.hasNext()) listing.next().get()
+                client.listObjectsV2(
+                    ListObjectsV2Request.builder().bucket(bucket).prefix(prefix).maxKeys(1).build(),
+                )
                 null
             } catch (e: Exception) {
                 failureReason(e)
@@ -462,12 +505,7 @@ open class BodyStorageClient(
         // purge jobs — they only catch exceptions — read as success and went on
         // to delete the row holding the object's only reference.
         try {
-            client.removeObject(
-                RemoveObjectArgs.builder()
-                    .bucket(bucket)
-                    .`object`(key)
-                    .build()
-            )
+            client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build())
         } catch (e: Exception) {
             throw StorageDeleteException("failed to delete s3://$bucket/$key: ${e.message}", e)
         }
@@ -480,18 +518,21 @@ open class BodyStorageClient(
         val failed = LinkedHashMap<String, String?>()
         for (chunk in entries.chunked(S3_DELETE_CHUNK)) {
             try {
-                // The result is lazy: iterating it is what sends the request.
-                // Only per-key errors come back; a deleted or already-missing
-                // key produces nothing.
-                val errors = client.removeObjects(
-                    RemoveObjectsArgs.builder()
+                // Quiet mode: only per-key errors come back, a deleted or
+                // already-missing key produces nothing.
+                val response = client.deleteObjects(
+                    DeleteObjectsRequest.builder()
                         .bucket(bucket)
-                        .objects(chunk.map { (key, _) -> DeleteRequest.Object(key) })
-                        .build()
+                        .delete(
+                            Delete.builder()
+                                .objects(chunk.map { (key, _) -> ObjectIdentifier.builder().key(key).build() })
+                                .quiet(true)
+                                .build(),
+                        )
+                        .build(),
                 )
-                for (result in errors) {
-                    val error = result.get()
-                    val uri = uriByKey[error.objectName()] ?: "s3://$bucket/${error.objectName()}"
+                for (error in response.errors()) {
+                    val uri = uriByKey[error.key()] ?: "s3://$bucket/${error.key()}"
                     failed[uri] = "${error.code()}: ${error.message()}"
                 }
             } catch (e: Exception) {
@@ -504,15 +545,13 @@ open class BodyStorageClient(
     }
 
     private fun presignS3(bucket: String, key: String): String {
-        val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
-        return client.getPresignedObjectUrl(
-            GetPresignedObjectUrlArgs.builder()
-                .method(Http.Method.GET)
-                .bucket(bucket)
-                .`object`(key)
-                .expiry(3600)
-                .build()
-        )
+        val presigner = s3Presigner ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+        return presigner.presignGetObject(
+            GetObjectPresignRequest.builder()
+                .signatureDuration(PRESIGN_EXPIRY)
+                .getObjectRequest(GetObjectRequest.builder().bucket(bucket).key(key).build())
+                .build(),
+        ).url().toExternalForm()
     }
 
     // --- Confinement -------------------------------------------------------
@@ -642,11 +681,12 @@ open class BodyStorageClient(
         val cleanDest = sanitizeKey(destKey)
         val destFullKey = if (prefix.isEmpty()) cleanDest else "$prefix/$cleanDest"
         client.copyObject(
-            CopyObjectArgs.builder()
-                .bucket(allowedBucket)
-                .`object`(destFullKey)
-                .source(SourceObject.builder().bucket(bucket).`object`(key).build())
-                .build()
+            CopyObjectRequest.builder()
+                .sourceBucket(bucket)
+                .sourceKey(key)
+                .destinationBucket(allowedBucket)
+                .destinationKey(destFullKey)
+                .build(),
         )
         deleteS3(bucket, key)
         return "s3://$allowedBucket/$destFullKey"
@@ -666,11 +706,45 @@ open class BodyStorageClient(
 private fun capacity(maxBytes: Long): Int =
     (maxBytes + 1).coerceAtLeast(1).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
+private fun credentials(cfg: S3Config): StaticCredentialsProvider =
+    StaticCredentialsProvider.create(AwsBasicCredentials.create(cfg.accessKey, cfg.secretKey))
+
+/**
+ * The region the request is signed for. Cloudflare R2 only accepts `auto`, which
+ * is also what a store that ignores the region (and there are several) is happy
+ * with; a store that does check — AWS S3 signs for the bucket's own region, and
+ * a self-hosted one may be pinned to a single region — needs the operator's
+ * value, so a blank one never silently becomes something else's default.
+ */
+private fun signingRegion(cfg: S3Config): Region =
+    Region.of(cfg.region.takeIf { it.isNotBlank() } ?: "auto")
+
+/**
+ * The HTTP client for the platform's own store — the one no body-store endpoint
+ * guard applies to. Only the timeouts differ from the SDK's defaults, which wait
+ * far longer than a retention tick can afford.
+ */
+private fun defaultHttpClient(timeout: Duration): SdkHttpClient =
+    ApacheHttpClient.builder()
+        .connectionTimeout(timeout)
+        .socketTimeout(timeout)
+        .connectionAcquisitionTimeout(timeout)
+        .connectionTimeToLive(Duration.ofMinutes(5))
+        .useIdleConnectionReaper(false)
+        .build()
+
+/** Whether a store's refusal means "there is nothing at this key". */
+private fun isMissing(e: AwsServiceException): Boolean =
+    e.awsErrorDetails()?.errorCode() in MISSING_CODES || e.statusCode() == 404
+
 /** What an imported body is stored as: never the type the agent reported. */
 internal const val OCTET_STREAM = "application/octet-stream"
 
 /** S3's ceiling for one DeleteObjects request. */
 private const val S3_DELETE_CHUNK = 1000
+
+/** How long a presigned download URL stays valid. */
+private val PRESIGN_EXPIRY: Duration = Duration.ofHours(1)
 
 /** S3 error codes that mean "there is nothing at this key". */
 private val MISSING_CODES = setOf("NoSuchKey", "NoSuchBucket", "NoSuchObject", "NotFound")
@@ -680,8 +754,8 @@ internal fun failureReason(e: Throwable): String {
     if (StoreEndpointGuard.isBlocked(e)) return "blocked_endpoint"
     var cause: Throwable? = e
     while (cause != null) {
-        if (cause is ErrorResponseException) {
-            return when (cause.errorResponse()?.code()) {
+        if (cause is S3Exception) {
+            return when (cause.awsErrorDetails()?.errorCode()) {
                 "NoSuchBucket" -> "bucket_not_found"
                 // A key the store does not know, or a signature it will not
                 // accept, is a wrong credential — something the person who typed
@@ -692,7 +766,12 @@ internal fun failureReason(e: Throwable): String {
                 else -> "unexpected_response"
             }
         }
+        // A transport failure — refused, unresolvable, timed out, or refused by
+        // the endpoint guard — never reached the store. The SDK wraps the
+        // underlying IOException, so the walk usually finds that first; a
+        // client-side failure carrying no cause still means "never answered".
         if (cause is IOException) return "unreachable"
+        if (cause is SdkClientException && cause.cause == null) return "unreachable"
         cause = cause.cause?.takeIf { it !== cause }
     }
     return "unexpected_response"

@@ -5,7 +5,7 @@ package dev.tracedown.common.storage
  *
  * Storage URIs are self-describing references to stored response bodies:
  * - ``file:///data/bodies/call_0.json`` — local filesystem
- * - ``s3://bucket-name/prefix/call_0.json`` — S3-compatible object store (R2, MinIO, etc.)
+ * - ``s3://bucket-name/prefix/call_0.json`` — S3-compatible object store (R2, SeaweedFS, etc.)
  */
 sealed class StorageUri {
 

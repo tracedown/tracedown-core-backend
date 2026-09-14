@@ -1,13 +1,17 @@
 package dev.tracedown.common.storage
 
 import dev.tracedown.common.net.SsrfGuard
-import okhttp3.Dns
-import okhttp3.Interceptor
-import okhttp3.OkHttpClient
-import okhttp3.Response
-import java.io.IOException
+import org.apache.http.HttpHost
+import org.apache.http.conn.DnsResolver
+import org.apache.http.conn.socket.ConnectionSocketFactory
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory
+import org.apache.http.protocol.HttpContext
+import software.amazon.awssdk.http.SdkHttpClient
+import software.amazon.awssdk.http.apache.ApacheHttpClient
+import software.amazon.awssdk.http.apache.ProxyConfiguration
 import java.net.InetAddress
-import java.net.Proxy
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URI
 import java.net.UnknownHostException
 import java.time.Duration
@@ -29,13 +33,18 @@ class StoreEndpointBlockedException(reason: String) : UnknownHostException(reaso
  *   something different in every network).
  * - [GuardedDns], at connect time: every address a hostname resolves to is
  *   checked, so a name that resolved to something public when it was saved and
- *   to `10.0.0.5` now is refused (DNS rebinding).
- * - [ConnectedAddressCheck], on the socket itself: the address actually
- *   connected to is checked once more — this also covers an IP-literal host,
- *   which OkHttp connects to without asking [Dns].
+ *   to `10.0.0.5` now is refused (DNS rebinding). The connection manager asks
+ *   it for every host, IP literals included, so nothing reaches a socket
+ *   without passing through here.
+ * - [GuardedSocketFactory], on the socket itself: the address actually being
+ *   connected to is checked once more, immediately before the connect. This is
+ *   the TLS socket factory, so it covers every endpoint the guard actually
+ *   protects — without `allowPrivate` [validate] admits `https` and nothing
+ *   else, and with it nothing is blocked in the first place.
  *
- * Redirects are never followed and no proxy is used ([httpClient]), so the
- * checked address is the only one the request goes to.
+ * Redirects are never followed (the SDK's Apache client calls
+ * `disableRedirectHandling`) and no proxy is used ([httpClient]), so the checked
+ * address is the only one the request goes to.
  *
  * **Private endpoints.** A self-hoster whose object store sits on the same
  * private network as the platform sets `BODY_STORE_PRIVATE_ENDPOINTS=true` on
@@ -73,7 +82,7 @@ object StoreEndpointGuard {
             if (SsrfGuard.isBlockedAddress(literal)) return "private_address"
             return null
         }
-        // A bare `minio` resolves through whatever search domain the container
+        // A bare `storage` resolves through whatever search domain the container
         // runtime hands out — a different machine in every network, and inside
         // a compose stack always an internal one.
         if (!host.trimEnd('.').contains('.')) return "single_label_host"
@@ -109,8 +118,8 @@ object StoreEndpointGuard {
     class GuardedDns(
         private val allowPrivate: Boolean,
         private val resolver: (String) -> List<InetAddress> = { InetAddress.getAllByName(it).toList() },
-    ) : Dns {
-        override fun lookup(hostname: String): List<InetAddress> {
+    ) : DnsResolver {
+        fun lookup(hostname: String): List<InetAddress> {
             if (!allowPrivate && SsrfGuard.isInternalHostname(hostname)) {
                 throw StoreEndpointBlockedException("internal host $hostname")
             }
@@ -123,17 +132,36 @@ object StoreEndpointGuard {
             }
             return addresses
         }
+
+        override fun resolve(host: String): Array<InetAddress> = lookup(host).toTypedArray()
     }
 
-    /** Network interceptor: checks the address the socket is actually connected to. */
-    class ConnectedAddressCheck(private val allowPrivate: Boolean) : Interceptor {
-        override fun intercept(chain: Interceptor.Chain): Response {
-            val connection = chain.connection() ?: throw IOException("no connection")
-            val address = connection.route().socketAddress.address
+    /**
+     * The TLS socket factory, checking the address the socket is about to be
+     * connected to. The connection manager has already resolved the host through
+     * [GuardedDns]; this sees the very address that is handed to `connect`, so a
+     * route computed some other way is still refused.
+     */
+    class GuardedSocketFactory(
+        private val allowPrivate: Boolean,
+        private val delegate: ConnectionSocketFactory = SSLConnectionSocketFactory.getSystemSocketFactory(),
+    ) : ConnectionSocketFactory {
+
+        override fun createSocket(context: HttpContext?): Socket = delegate.createSocket(context)
+
+        override fun connectSocket(
+            connectTimeout: Int,
+            sock: Socket?,
+            host: HttpHost,
+            remoteAddress: InetSocketAddress,
+            localAddress: InetSocketAddress?,
+            context: HttpContext?,
+        ): Socket {
+            val address = remoteAddress.address
             if (address == null || !addressAllowed(address, allowPrivate)) {
                 throw StoreEndpointBlockedException("connection to a blocked address refused")
             }
-            return chain.proceed(chain.request())
+            return delegate.connectSocket(connectTimeout, sock, host, remoteAddress, localAddress, context)
         }
     }
 
@@ -142,20 +170,33 @@ object StoreEndpointGuard {
         timeoutSeconds: Long,
         allowPrivate: Boolean,
         resolver: (String) -> List<InetAddress> = { InetAddress.getAllByName(it).toList() },
-    ): OkHttpClient {
+    ): SdkHttpClient {
         val timeout = Duration.ofSeconds(timeoutSeconds.coerceAtLeast(1))
-        return OkHttpClient.Builder()
-            .dns(GuardedDns(allowPrivate, resolver))
-            .addNetworkInterceptor(ConnectedAddressCheck(allowPrivate))
-            .followRedirects(false)
-            .followSslRedirects(false)
-            .proxy(Proxy.NO_PROXY)
-            .connectTimeout(timeout)
-            .readTimeout(timeout)
-            .writeTimeout(timeout)
-            .callTimeout(timeout.multipliedBy(2))
+        return ApacheHttpClient.builder()
+            .dnsResolver(GuardedDns(allowPrivate, resolver))
+            .socketFactory(GuardedSocketFactory(allowPrivate))
+            .connectionTimeout(timeout)
+            .socketTimeout(timeout)
+            .connectionAcquisitionTimeout(timeout)
+            // Roughly what the pool this replaces kept an idle connection for.
+            .connectionTimeToLive(POOL_TTL)
+            // The reaper is a process-wide registry holding a strong reference to
+            // every connection manager ever handed to it. A client here can be
+            // built per store — and, for an agent's own corner of one, per result
+            // — so registering them would grow without bound. Connections are
+            // instead revalidated when they are leased.
+            .useIdleConnectionReaper(false)
+            .proxyConfiguration(
+                ProxyConfiguration.builder()
+                    .useSystemPropertyValues(false)
+                    .useEnvironmentVariableValues(false)
+                    .build(),
+            )
             .build()
     }
+
+    /** How long a pooled connection may be reused before it is dropped. */
+    private val POOL_TTL: Duration = Duration.ofMinutes(5)
 
     /** True when [t] or anything in its cause chain is a guard refusal. */
     fun isBlocked(t: Throwable): Boolean {

@@ -1,6 +1,10 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.serialization)
+    // For `api`: the S3 SDK's types appear in this module's own public
+    // signatures (`BodyStorageClient`'s HTTP client, `StoreEndpointGuard`), so
+    // they have to stay on the compile classpath of whoever consumes them.
+    `java-library`
 }
 
 dependencies {
@@ -29,7 +33,8 @@ dependencies {
     implementation(libs.simple.java.mail)
     implementation(libs.simple.java.mail.batch)
     implementation(libs.okhttp)
-    implementation(libs.minio)
+    api(libs.awssdk.s3)
+    api(libs.awssdk.apache.client)
 
     implementation(libs.ktor.server.core)
     implementation(libs.java.jwt)

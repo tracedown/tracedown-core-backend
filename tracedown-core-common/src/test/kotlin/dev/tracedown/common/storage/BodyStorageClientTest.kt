@@ -227,10 +227,10 @@ class BodyStorageClientTest {
     @Test
     fun `s3 delete gives up on a store that accepts and never answers`() {
         // A socket that completes the TCP handshake and then says nothing is
-        // what a stalled store looks like. MinIO's default client waits five
-        // minutes per phase for it; the configured timeout has to win instead,
-        // because retention deletes bodies one after another and a single hung
-        // call parked the whole job with nothing in the log.
+        // what a stalled store looks like. The SDK's stock client waits far
+        // longer than a retention tick for it; the configured timeout has to
+        // win instead, because retention deletes bodies one after another and
+        // a single hung call parked the whole job with nothing in the log.
         val server = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
         val accepted = mutableListOf<java.net.Socket>()
         val acceptor = Thread {
@@ -288,6 +288,54 @@ class BodyStorageClientTest {
             assertTrue(failed.getValue("s3://bodies/a/1.json")!!.contains("s3://bodies/a/1.json"))
         }
     }
+
+    @Test
+    fun `every store refusal keeps its own reason code`() {
+        // What the settings page shows the person who typed the credentials in,
+        // so each code has to survive the store's own vocabulary. Stores differ:
+        // S3, R2, SeaweedFS and most others refuse a mistyped secret with
+        // `SignatureDoesNotMatch`, a few answer `AccessDenied` instead.
+        val codes = mapOf(
+            "NoSuchBucket" to "bucket_not_found",
+            "SignatureDoesNotMatch" to "invalid_credentials",
+            "InvalidAccessKeyId" to "invalid_credentials",
+            "InvalidToken" to "invalid_credentials",
+            "AccessDenied" to "access_denied",
+            "SomethingNew" to "unexpected_response",
+        )
+        for ((code, expected) in codes) {
+            assertEquals(expected, failureReason(s3Error(code)), code)
+            // Wrapped, as the delete path wraps it, the reason still comes out.
+            assertEquals(expected, failureReason(StorageDeleteException("failed", s3Error(code))), code)
+        }
+
+        // A refusal by the endpoint guard is never mistaken for the store
+        // answering, and a transport failure is never mistaken for an answer.
+        assertEquals("blocked_endpoint", failureReason(StoreEndpointBlockedException("nope")))
+        assertEquals(
+            "blocked_endpoint",
+            failureReason(
+                software.amazon.awssdk.core.exception.SdkClientException.builder()
+                    .cause(StoreEndpointBlockedException("nope")).build(),
+            ),
+        )
+        assertEquals("unreachable", failureReason(java.net.ConnectException("refused")))
+        assertEquals(
+            "unreachable",
+            failureReason(software.amazon.awssdk.core.exception.SdkClientException.builder().message("no route").build()),
+        )
+    }
+
+    private fun s3Error(code: String): software.amazon.awssdk.services.s3.model.S3Exception =
+        software.amazon.awssdk.services.s3.model.S3Exception.builder()
+            .awsErrorDetails(
+                software.amazon.awssdk.awscore.exception.AwsErrorDetails.builder()
+                    .errorCode(code)
+                    .serviceName("S3")
+                    .build(),
+            )
+            .message(code)
+            .build() as software.amazon.awssdk.services.s3.model.S3Exception
 
     /** A loopback S3 that answers every DeleteObjects request with [status]. */
     private class FakeS3(private val server: com.sun.net.httpserver.HttpServer) : AutoCloseable {

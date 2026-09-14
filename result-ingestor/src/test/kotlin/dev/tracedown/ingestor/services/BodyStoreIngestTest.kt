@@ -16,7 +16,7 @@ import dev.tracedown.common.storage.BodyStoreCrypto
 import dev.tracedown.common.storage.BodyStoreInput
 import dev.tracedown.common.storage.BodyStoreRegistry
 import dev.tracedown.common.storage.BodyStoreService
-import dev.tracedown.ingestor.TestMinio
+import dev.tracedown.ingestor.TestS3
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import org.flywaydb.core.Flyway
@@ -117,8 +117,8 @@ class BodyStoreIngestTest {
             BodyRelocator(BodyStorageClient(confinement = BodyConfinement(filesystemRoot = defaultRoot))),
         )
 
-        TestMinio.bucket(IMPORT_BUCKET)
-        TestMinio.bucket(IN_PLACE_BUCKET)
+        TestS3.bucket(IMPORT_BUCKET)
+        TestS3.bucket(IN_PLACE_BUCKET)
 
         transaction {
             val userId = UUID.randomUUID()
@@ -192,8 +192,8 @@ class BodyStoreIngestTest {
     }
 
     private fun s3Store(name: String, mode: String, bucket: String, prefix: String?) = BodyStoreInput(
-        name = name, kind = "s3", mode = mode, endpoint = TestMinio.endpoint, bucket = bucket, prefix = prefix,
-        accessKeyId = TestMinio.USER, secretAccessKey = TestMinio.PASSWORD,
+        name = name, kind = "s3", mode = mode, endpoint = TestS3.endpoint, bucket = bucket, prefix = prefix,
+        accessKeyId = TestS3.USER, secretAccessKey = TestS3.PASSWORD,
     )
 
     private fun agent(slug: String, store: UUID?): Long = ProbeAgents.insert {
@@ -292,7 +292,7 @@ class BodyStoreIngestTest {
     @Test
     fun `an import store's body is moved into the default store`() {
         val key = agentKey(IMPORT_PREFIX, "import-agent", "call_0.json")
-        TestMinio.put(IMPORT_BUCKET, key, "imported".toByteArray(), "application/json")
+        TestS3.put(IMPORT_BUCKET, key, "imported".toByteArray(), "application/json")
 
         val resultId = persistRun(importAgent, "s3://$IMPORT_BUCKET/$key")
 
@@ -302,7 +302,7 @@ class BodyStoreIngestTest {
         assertNull(step[ProbeSteps.bodyStoreId], "the platform owns an imported body")
         assertNull(step[ProbeSteps.bodyNotStoredReason])
         assertEquals("imported", Files.readString(expected))
-        assertFalse(TestMinio.exists(IMPORT_BUCKET, key), "the source is removed once the row has committed")
+        assertFalse(TestS3.exists(IMPORT_BUCKET, key), "the source is removed once the row has committed")
     }
 
     @Test
@@ -315,31 +315,31 @@ class BodyStoreIngestTest {
 
     @Test
     fun `an import store never lends its client to a location outside it`() {
-        TestMinio.put(IN_PLACE_BUCKET, "$IN_PLACE_PREFIX/not-the-import-store.json", "x".toByteArray())
+        TestS3.put(IN_PLACE_BUCKET, "$IN_PLACE_PREFIX/not-the-import-store.json", "x".toByteArray())
 
         val step = stepOf(persistRun(importAgent, "s3://$IN_PLACE_BUCKET/$IN_PLACE_PREFIX/not-the-import-store.json"))
 
         assertNull(step[ProbeSteps.responseBodyStorageUrl])
         assertEquals(BodyNotStoredReason.STORAGE_UNAVAILABLE, step[ProbeSteps.bodyNotStoredReason])
-        assertTrue(TestMinio.exists(IN_PLACE_BUCKET, "$IN_PLACE_PREFIX/not-the-import-store.json"), "untouched")
+        assertTrue(TestS3.exists(IN_PLACE_BUCKET, "$IN_PLACE_PREFIX/not-the-import-store.json"), "untouched")
     }
 
     @Test
     fun `an import store never lends its client to another agent's sub-prefix`() {
         val someoneElse = agentKey(IMPORT_PREFIX, "another-agent", "call_0.json")
-        TestMinio.put(IMPORT_BUCKET, someoneElse, "not yours".toByteArray())
+        TestS3.put(IMPORT_BUCKET, someoneElse, "not yours".toByteArray())
 
         val step = stepOf(persistRun(importAgent, "s3://$IMPORT_BUCKET/$someoneElse"))
 
         assertNull(step[ProbeSteps.responseBodyStorageUrl])
         assertEquals(BodyNotStoredReason.STORAGE_UNAVAILABLE, step[ProbeSteps.bodyNotStoredReason])
-        assertTrue(TestMinio.exists(IMPORT_BUCKET, someoneElse), "the other agent's body is untouched")
+        assertTrue(TestS3.exists(IMPORT_BUCKET, someoneElse), "the other agent's body is untouched")
     }
 
     @Test
     fun `an import source is kept when the copy cannot be written`() {
         val key = agentKey(IMPORT_PREFIX, "import-agent", "unwritable.json")
-        TestMinio.put(IMPORT_BUCKET, key, "keep me".toByteArray())
+        TestS3.put(IMPORT_BUCKET, key, "keep me".toByteArray())
         // A relocator whose default store refuses every write: a root whose own
         // parent is a regular file, so creating a directory under it fails.
         val blocker = Files.createTempFile("not-a-directory", ".txt")
@@ -352,7 +352,7 @@ class BodyStoreIngestTest {
 
             assertNull(step[ProbeSteps.responseBodyStorageUrl])
             assertEquals(BodyNotStoredReason.STORAGE_UNAVAILABLE, step[ProbeSteps.bodyNotStoredReason])
-            assertTrue(TestMinio.exists(IMPORT_BUCKET, key), "a body that was not copied is never removed")
+            assertTrue(TestS3.exists(IMPORT_BUCKET, key), "a body that was not copied is never removed")
         } finally {
             ResultPersistenceService.init(
                 BodyRelocator(BodyStorageClient(confinement = BodyConfinement(filesystemRoot = defaultRoot))),
@@ -364,7 +364,7 @@ class BodyStoreIngestTest {
     @Test
     fun `only so many bodies are imported for one result`() {
         val keys = (0..20).map { agentKey(IMPORT_PREFIX, "import-agent", "burst_$it.json") }
-        keys.forEach { TestMinio.put(IMPORT_BUCKET, it, "b".toByteArray()) }
+        keys.forEach { TestS3.put(IMPORT_BUCKET, it, "b".toByteArray()) }
 
         val resultId = persistRun(importAgent, *keys.map { "s3://$IMPORT_BUCKET/$it" }.toTypedArray())
 
@@ -381,7 +381,7 @@ class BodyStoreIngestTest {
     @Test
     fun `an in_place body inside the agent's own prefix is kept verbatim with the store's id`() {
         val key = agentKey(IN_PLACE_PREFIX, "in-place-agent", "run-1/call_0.json")
-        TestMinio.put(IN_PLACE_BUCKET, key, "kept".toByteArray())
+        TestS3.put(IN_PLACE_BUCKET, key, "kept".toByteArray())
 
         val resultId = persistRun(inPlaceAgent, "s3://$IN_PLACE_BUCKET/$key")
 
@@ -389,7 +389,7 @@ class BodyStoreIngestTest {
         assertEquals("s3://$IN_PLACE_BUCKET/$key", step[ProbeSteps.responseBodyStorageUrl])
         assertEquals(inPlaceStore, step[ProbeSteps.bodyStoreId])
         assertNull(step[ProbeSteps.bodyNotStoredReason])
-        assertTrue(TestMinio.exists(IN_PLACE_BUCKET, key), "the body stays where it is")
+        assertTrue(TestS3.exists(IN_PLACE_BUCKET, key), "the body stays where it is")
         assertFalse(Files.exists(defaultRoot.resolve("$orgId/$serviceId/$resultId")), "nothing is copied")
     }
 
@@ -439,14 +439,14 @@ class BodyStoreIngestTest {
     @Test
     fun `a store of another organization is never used`() {
         val key = "foreign/foreign-agent/call_0.json"
-        TestMinio.put(IN_PLACE_BUCKET, key, "another org's".toByteArray())
+        TestS3.put(IN_PLACE_BUCKET, key, "another org's".toByteArray())
 
         val step = stepOf(persistRun(foreignAgent, "s3://$IN_PLACE_BUCKET/$key"))
 
         assertNull(step[ProbeSteps.responseBodyStorageUrl])
         assertNull(step[ProbeSteps.bodyStoreId])
         assertEquals(BodyNotStoredReason.STORE_ORG_MISMATCH, step[ProbeSteps.bodyNotStoredReason])
-        assertTrue(TestMinio.exists(IN_PLACE_BUCKET, key), "and nothing of theirs is touched")
+        assertTrue(TestS3.exists(IN_PLACE_BUCKET, key), "and nothing of theirs is touched")
     }
 
     @Test
@@ -457,7 +457,7 @@ class BodyStoreIngestTest {
         val slug = "doomed-agent"
         val agentId = transaction { agent(slug, doomed) }
         val key = agentKey("doomed", slug, "call_0.json")
-        TestMinio.put(IN_PLACE_BUCKET, key, "about to be forgotten".toByteArray())
+        TestS3.put(IN_PLACE_BUCKET, key, "about to be forgotten".toByteArray())
         // The row goes between the placement pass and the insert — the same race
         // a delete with forgetBodies runs against a result already in flight.
         transaction {
