@@ -1099,7 +1099,7 @@ class BodyStoreRoutesTest {
         assertEquals("in_place", bodyStore["mode"]!!.jsonPrimitive.content)
         // The agent writes under its own corner of the store, and that is what
         // the dashboard prints as PROBE_AGENT_S3_PREFIX.
-        assertEquals("enrol/$slug", bodyStore["prefix"]!!.jsonPrimitive.content)
+        assertEquals("enrol", bodyStore["prefix"]!!.jsonPrimitive.content)
         assertFalse(minted.toString().contains(TestMinio.PASSWORD), "a token response carries no credential")
 
         val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(3072, SecureRandom()) }.generateKeyPair()
@@ -1134,7 +1134,7 @@ class BodyStoreRoutesTest {
         val (_, minted) = call(HttpMethod.Post, "/api/v1/agents/bootstrap-token", """{"slug":"$slug","bodyStoreId":"$id"}""")
 
         val bodyStore = minted!!.jsonObject["bodyStore"]!!.jsonObject
-        assertEquals("$root/$slug", bodyStore["rootPath"]!!.jsonPrimitive.content)
+        assertEquals(root.toString(), bodyStore["rootPath"]!!.jsonPrimitive.content)
         assertEquals(JsonNull, bodyStore["prefix"] ?: JsonNull)
     }
 
@@ -1156,7 +1156,7 @@ class BodyStoreRoutesTest {
 
         assertEquals(HttpStatusCode.OK, status, "body: $minted")
         assertEquals(stamped, minted!!.jsonObject["bodyStore"]!!.jsonObject["id"]!!.jsonPrimitive.content)
-        assertEquals("stamped/$slug", minted.jsonObject["bodyStore"]!!.jsonObject["prefix"]!!.jsonPrimitive.content)
+        assertEquals("stamped", minted.jsonObject["bodyStore"]!!.jsonObject["prefix"]!!.jsonPrimitive.content)
     }
 
     // ── Reading a step body back ────────────────────────────────────────────

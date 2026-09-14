@@ -282,7 +282,7 @@ fun Route.agentAdminRoutes() {
                 token = token,
                 expiresAt = expiresAt.toString(),
                 schedulerUrl = AgentEnrolmentAddress.resolve(),
-                bodyStore = BodyStoreService.summary(orgId, savedStoreId, slug),
+                bodyStore = BodyStoreService.summary(orgId, savedStoreId),
             ),
         )
     }

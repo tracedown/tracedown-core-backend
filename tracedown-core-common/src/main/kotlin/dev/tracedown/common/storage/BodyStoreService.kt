@@ -179,10 +179,12 @@ object BodyStoreService {
         transaction { view(require(organizationId, id), agentCounts()) }
 
     /**
-     * The agent-facing description of [id] for the agent [slug], or null for the
-     * default store. The prefix / root carries the agent's own sub-location.
+     * The agent-facing description of [id], or null for the default store. The
+     * prefix / root are the store's own; the caller appends the agent's slug
+     * (`<prefix>/<slug>`, `<root>/<slug>`) when it prints the agent's settings,
+     * exactly as the dashboard does from the store list.
      */
-    fun summary(organizationId: UUID, id: UUID?, slug: String): BodyStoreSummary? {
+    fun summary(organizationId: UUID, id: UUID?): BodyStoreSummary? {
         if (id == null) return null
         val s = transaction {
             BodyStores.selectAll()
@@ -197,8 +199,8 @@ object BodyStoreService {
             endpoint = s.endpoint,
             region = s.region,
             bucket = s.bucket,
-            prefix = if (s.kind == BodyStore.KIND_S3) s.agentPrefix(slug) else null,
-            rootPath = s.rootPath?.let { "$it/$slug" },
+            prefix = s.prefix,
+            rootPath = s.rootPath,
         )
     }
 
