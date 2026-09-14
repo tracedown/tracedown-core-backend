@@ -118,6 +118,9 @@ services:
     volumes:
       - tracedown-artifacts:/artifacts:ro
       - tracedown-bodies:/data/bodies
+      # Roots for filesystem body stores (BODY_STORE_FILESYSTEM_BASES), shared
+      # with the ingestor. The gateway reads in_place bodies out of them.
+      - tracedown-stores:/data/stores
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:20714/ping"]
       interval: 5s
@@ -159,6 +162,9 @@ services:
       # Same bodies volume as the gateway and your agents — the ingestor
       # relocates agent-written bodies under this root as results land.
       - tracedown-bodies:/data/bodies
+      # The same store roots the gateway reads in_place bodies from, so the
+      # ingestor can import from a filesystem body store.
+      - tracedown-stores:/data/stores
 
   tracedown-dispatcher:
     <<: *service
@@ -198,6 +204,12 @@ services:
   tracedown-worker:
     <<: *service
     command: ["java", "-jar", "/artifacts/aggregate-worker.jar"]
+    volumes:
+      - tracedown-artifacts:/artifacts:ro
+      # Retention and purge delete bodies from platform storage, so the worker
+      # needs the same bodies volume. NOT the stores volume: a body in a body
+      # store belongs to whoever owns that store.
+      - tracedown-bodies:/data/bodies
     healthcheck:
       # Liveness only. /health additionally probes the pools and would take a
       # container out over a Redis blip it cannot fix by restarting.
@@ -228,3 +240,6 @@ volumes:
   tracedown-pgdata:
   tracedown-redis-a-data:
   tracedown-bodies:
+  # Roots for filesystem body stores. Create a directory under it per store;
+  # the mount itself is never a store root.
+  tracedown-stores:

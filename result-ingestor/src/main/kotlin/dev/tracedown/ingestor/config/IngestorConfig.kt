@@ -31,11 +31,19 @@ data class IngestorConfig(
     val popTimeoutSeconds: Long,
     val storage: StorageConfig,
     /**
-     * The platform key, needed to decrypt a body store's credentials when an
-     * agent imports from its own store. Null when not configured: such imports
-     * then fail and the body is recorded as unavailable.
+     * `BODY_STORE_AES_KEY` — the key a body store's credentials are encrypted
+     * with, needed when an agent imports from its own S3 store. Null when not
+     * configured: such imports then fail and the body is recorded as unavailable.
+     * It must match the gateway's. The platform key is deliberately not read
+     * here: nothing else in this service decrypts anything.
      */
-    val aesKey: String?,
+    val bodyStoreAesKey: String?,
+    /**
+     * `BODY_STORE_PRIVATE_ENDPOINTS` — allow a store endpoint over `http` or on
+     * a private / internal host. Must match the gateway's, or a store the
+     * gateway accepted cannot be read here.
+     */
+    val bodyStorePrivateEndpoints: Boolean,
     val deploymentEnvironment: String?,
 ) {
     companion object {
@@ -70,7 +78,9 @@ data class IngestorConfig(
                     s3Prefix = config.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
                     bodyStoreFilesystemBases = config.propertyOrNull("storage.stores.filesystemBases")?.getString(),
                 ),
-                aesKey = config.propertyOrNull("platform.aesKey")?.getString()?.takeIf { it.isNotBlank() },
+                bodyStoreAesKey = config.propertyOrNull("storage.stores.aesKey")?.getString()?.takeIf { it.isNotBlank() },
+                bodyStorePrivateEndpoints = config.propertyOrNull("storage.stores.privateEndpoints")
+                    ?.getString()?.trim()?.lowercase() == "true",
                 deploymentEnvironment = config.propertyOrNull("deployment.environment")?.getString(),
             )
         }

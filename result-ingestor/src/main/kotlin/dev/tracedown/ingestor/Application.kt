@@ -8,8 +8,9 @@ import dev.tracedown.common.health.redisCheck
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.storage.BodyConfinement
 import dev.tracedown.common.storage.BodyStorageClient
+import dev.tracedown.common.storage.BodyStoreCrypto
 import dev.tracedown.common.storage.BodyStoreRegistry
-import dev.tracedown.common.util.VariableCrypto
+import dev.tracedown.common.storage.BodyStoreService
 import dev.tracedown.ingestor.config.IngestorConfig
 import dev.tracedown.ingestor.consumers.ProbeResultConsumer
 import dev.tracedown.ingestor.services.BodyRelocator
@@ -20,9 +21,15 @@ import io.ktor.server.netty.EngineMain
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 
 private val log = LoggerFactory.getLogger("dev.tracedown.ingestor.Application")
+
+/** How often the cached body-store clients are swept for stores that no longer exist. */
+private val STORE_CACHE_SWEEP = kotlin.time.Duration.parse("10m")
 
 fun main(args: Array<String>) = EngineMain.main(args)
 
@@ -53,16 +60,17 @@ fun Application.module() {
         checks = emptyMap(),
         credentials = (
             config.storage.s3?.let { mapOf("STORAGE_S3_SECRET_KEY" to it.secretKey) } ?: emptyMap()
-            ) + (config.aesKey?.let { mapOf("PLATFORM_AES_KEY" to it) } ?: emptyMap()),
+            ) + (config.bodyStoreAesKey?.let { mapOf("BODY_STORE_AES_KEY" to it) } ?: emptyMap()),
     )
 
     // Body stores: an agent may write to a store of its own (import or
     // in_place). Importing reads that store with its credentials, which are
-    // encrypted with the platform key.
-    config.aesKey?.let { VariableCrypto.init(it) }
+    // encrypted with BODY_STORE_AES_KEY — the only key this service needs, and
+    // deliberately not the platform key, which unwraps everything else.
+    config.bodyStoreAesKey?.let { BodyStoreCrypto.init(it) }
     BodyStoreRegistry.configure(
-        deploymentEnvironment = config.deploymentEnvironment,
         filesystemBases = config.storage.bodyStoreFilesystemBases,
+        allowPrivateEndpoints = config.bodyStorePrivateEndpoints,
         timeoutSeconds = config.storage.s3?.timeoutSeconds ?: 30L,
     )
 
@@ -72,6 +80,10 @@ fun Application.module() {
         username = config.database.user,
         password = config.database.password,
     )
+
+    // Said once, loudly: with stores configured and no key, every import fails
+    // one body at a time and the reason only shows in the step rows.
+    BodyStoreService.warnIfSecretsUnreadable("result-ingestor")
 
     // Redis A
     val redisConn = RedisFactory.createConnection(config.redisAUrl)
@@ -105,6 +117,19 @@ fun Application.module() {
     val consumer = ProbeResultConsumer(consumerConn.sync(), config.popTimeoutSeconds)
     val consumerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     consumer.start(consumerScope)
+
+    // Body stores are created and deleted in the gateway's process; this one
+    // only ever learns of a change by reading the row again. A client cached for
+    // a store that has since been deleted is never *used* (the agent's join no
+    // longer finds it), but it would sit in the map for the life of the process
+    // holding an HTTP client and a decrypted credential. Sweep it out.
+    consumerScope.launch {
+        while (isActive) {
+            delay(STORE_CACHE_SWEEP)
+            runCatching { BodyStoreRegistry.evictDeleted() }
+                .onFailure { log.debug("body store cache sweep failed: {}", it.message) }
+        }
+    }
 
     // Both dependencies are required: this service exists to move rows from the
     // queue into the database. The check rides the non-consumer connection —

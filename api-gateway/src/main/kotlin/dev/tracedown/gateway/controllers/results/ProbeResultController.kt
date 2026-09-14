@@ -7,6 +7,11 @@ import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.storage.BodyStorageClient
 import dev.tracedown.common.storage.BodyStoreRegistry
+import dev.tracedown.common.storage.BodyStoreSecretException
+import dev.tracedown.common.storage.BodyStoreService
+import dev.tracedown.common.storage.BodyTooLargeException
+import dev.tracedown.common.storage.StorageConfinementException
+import dev.tracedown.common.storage.StoreEndpointGuard
 import dev.tracedown.gateway.util.ApiException
 import io.ktor.http.HttpStatusCode
 import org.slf4j.LoggerFactory
@@ -30,6 +35,13 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.time.Instant
 import org.jetbrains.exposed.v1.core.greater
 import dev.tracedown.gateway.data.results.ResultPageAt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.util.Base64
 import java.util.UUID
 
 /**
@@ -169,11 +181,18 @@ object ProbeResultController {
      * content for the filesystem). A body kept in an `in_place` body store
      * (`probe_steps.body_store_id`) is read through that store's confined client
      * and always served as **content**, never a URL — a store owner must not have
-     * to open their bucket's CORS to the dashboard. Capped at
-     * [BodyStoreRegistry.MAX_BODY_BYTES] (413 `body_too_large`); a missing object,
-     * a location the store refuses or an unreachable store is 410 `body_gone`.
+     * to open their bucket's CORS to the dashboard, and a presigned URL would
+     * hand the browser their credentials' reach. Content that is not valid UTF-8
+     * comes back base64 with `encoding = "base64"` rather than mangled into
+     * replacement characters.
+     *
+     * Capped at [BodyStoreRegistry.MAX_BODY_BYTES] (413 `body_too_large`).
+     * A missing object or a key the store refuses is 410 `body_gone` — the body
+     * is not coming back. A store that cannot be reached, whose credentials do
+     * not decrypt, or that fails any other way is 503 `body_store_unavailable`:
+     * the body is most likely still there and the call is worth repeating.
      */
-    fun getStepBody(orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID): BodyStorageClient.BodyContent {
+    suspend fun getStepBody(orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID): BodyStorageClient.BodyContent {
         val (storageUrl, bodyStoreId) = transaction {
             val ctx = ResourceResolver.resolveService(serviceId, orgId)
             val cached = requireCachedPermissions(orgId, userId)
@@ -205,25 +224,122 @@ object ProbeResultController {
         if (bodyStoreId != null) return readFromStore(bodyStoreId, storageUrl)
 
         val client = storageClient ?: return BodyStorageClient.BodyContent.NotFound
-        return client.readBody(storageUrl)
+        // The default filesystem store reads the file here too, so it gets the
+        // same treatment: off the request thread, behind the same gate, and
+        // base64 rather than mangled when the bytes are not text.
+        return offRequestThread {
+            try {
+                client.readBody(storageUrl)
+            } catch (e: BodyTooLargeException) {
+                throw ApiException(HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE)
+            }
+        }
     }
 
-    /** Reads a body kept in an in_place body store. Called outside any transaction. */
-    private fun readFromStore(storeId: UUID, uri: String): BodyStorageClient.BodyContent {
+    /**
+     * Reads a body kept in an in_place body store.
+     *
+     * Every failure is also recorded on the store row, so the dashboard can say
+     * "this store stopped answering at …" instead of leaving a person to click
+     * through bodies one at a time to find out.
+     */
+    private suspend fun readFromStore(storeId: UUID, uri: String): BodyStorageClient.BodyContent {
         val store = BodyStoreRegistry.load(storeId) ?: throw GoneException(ErrorCodes.BODY_GONE)
         val read = try {
-            BodyStoreRegistry.clientFor(store).readBytes(uri, BodyStoreRegistry.MAX_BODY_BYTES)
-        } catch (e: Exception) {
-            log.warn("stored body in store {} could not be read: {}", storeId, e.message)
+            offRequestThread { BodyStoreRegistry.clientFor(store).readBytes(uri, BodyStoreRegistry.MAX_BODY_BYTES) }
+        } catch (e: StorageConfinementException) {
+            // The recorded URL is not inside the store any more — the store was
+            // repointed under it, or the row predates a change. Nothing to fetch.
+            log.warn("stored body {} is outside body store {}", uri, storeId)
+            BodyStoreService.recordFailure(storeId, "outside_store")
             throw GoneException(ErrorCodes.BODY_GONE)
+        } catch (e: Exception) {
+            val reason = failureCodeOf(e)
+            log.warn("stored body in store {} could not be read ({}): {}", storeId, reason, e.message)
+            BodyStoreService.recordFailure(storeId, reason)
+            throw ApiException(HttpStatusCode.ServiceUnavailable, ErrorCodes.BODY_STORE_UNAVAILABLE)
         }
         return when (read) {
-            is BodyStorageClient.StoredBody.Found -> BodyStorageClient.BodyContent.Inline(
-                content = read.bytes.toString(Charsets.UTF_8),
-                contentType = read.contentType,
-            )
-            BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
-            is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE)
+            is BodyStorageClient.StoredBody.Found -> {
+                BodyStoreService.clearFailure(storeId)
+                inline(read.bytes, read.contentType)
+            }
+            BodyStorageClient.StoredBody.Missing -> {
+                BodyStoreService.clearFailure(storeId)
+                throw GoneException(ErrorCodes.BODY_GONE)
+            }
+            is BodyStorageClient.StoredBody.TooLarge -> {
+                BodyStoreService.clearFailure(storeId)
+                throw ApiException(HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE)
+            }
         }
     }
+
+    /**
+     * Bodies are text far more often than not, but nothing guarantees it — an
+     * image, a protobuf or a gzip response decoded as UTF-8 comes out as a wall
+     * of replacement characters, which is both useless and not what was stored.
+     * Text is sent as text; anything else is base64 and says so.
+     */
+    /**
+     * Content types the API will repeat back. The value comes from the agent's
+     * own store — the agent chose it when it uploaded the body — so it is not
+     * the platform's to hand on unexamined to a browser. Anything not on the
+     * list is reported as nothing at all, and the dashboard shows the bytes.
+     */
+    private val ECHOED_CONTENT_TYPES = setOf(
+        "application/json", "application/xml", "application/javascript", "application/x-ndjson",
+        "application/octet-stream", "application/pdf", "application/zip", "application/gzip",
+        "text/plain", "text/html", "text/css", "text/csv", "text/xml", "text/markdown",
+        "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp",
+    )
+
+    /** The reported type, or null when it is not one of [ECHOED_CONTENT_TYPES]. */
+    private fun safeContentType(reported: String?): String? {
+        val bare = reported?.substringBefore(';')?.trim()?.lowercase() ?: return null
+        return bare.takeIf { it in ECHOED_CONTENT_TYPES }
+    }
+
+    private fun inline(bytes: ByteArray, reportedType: String?): BodyStorageClient.BodyContent {
+        val contentType = safeContentType(reportedType)
+        val text = runCatching {
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString()
+        }.getOrNull()
+        return if (text != null) {
+            BodyStorageClient.BodyContent.Inline(text, contentType)
+        } else {
+            BodyStorageClient.BodyContent.Inline(
+                Base64.getEncoder().encodeToString(bytes),
+                contentType,
+                encoding = "base64",
+            )
+        }
+    }
+
+    /** A short, machine-readable code for the store's health row. */
+    private fun failureCodeOf(e: Throwable): String = when {
+        e is BodyStoreSecretException -> "secret_undecryptable"
+        StoreEndpointGuard.isBlocked(e) -> "blocked_endpoint"
+        else -> "unreachable"
+    }
+
+    /**
+     * Runs a blocking store read off the request thread, and never more than
+     * [CONCURRENT_BODY_READS] at once.
+     *
+     * A body is up to 32 MiB fetched over someone else's network. On the request
+     * thread that parks an event-loop thread for as long as the store takes; a
+     * handful of people opening large bodies at once would stop the API
+     * answering anything at all. The gate also bounds how much of the heap this
+     * can hold: 32 MiB times the permits, not times the number of open requests.
+     */
+    private suspend fun <T> offRequestThread(block: () -> T): T =
+        bodyReads.withPermit { withContext(Dispatchers.IO) { block() } }
+
+    private const val CONCURRENT_BODY_READS = 8
+    private val bodyReads = Semaphore(CONCURRENT_BODY_READS)
 }

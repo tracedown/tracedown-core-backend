@@ -137,13 +137,14 @@ open class VariableCryptoEngine(
         return String(cipher.doFinal(Base64.getDecoder().decode(encryptedBase64)), Charsets.UTF_8)
     }
 
-    // ── Platform-key AES-GCM (credentials that belong to no organization) ──
+    // ── Key-bound AES-GCM (credentials that belong to no organization) ──
 
     /**
-     * Encrypts [plaintext] AES-256-GCM under the platform key, binding it to
+     * Encrypts [plaintext] AES-256-GCM under this engine's key, binding it to
      * [context] as additional authenticated data (e.g. `body_store:<id>`), so a
      * ciphertext copied onto another row does not decrypt. Returns
-     * (ciphertextBase64, ivBase64).
+     * (ciphertextBase64, ivBase64). Body store credentials use it through
+     * `storage/BodyStoreCrypto`, on a key of their own.
      */
     fun encryptBound(plaintext: String, context: String): Pair<String, String> {
         val iv = ByteArray(GCM_IV_BYTES).also(random::nextBytes)
@@ -388,16 +389,6 @@ object VariableCrypto {
     fun decrypt(encryptedBase64: String, ivBase64: String): String =
         engine().decryptLegacy(encryptedBase64, ivBase64)
 
-    // ── Credentials that belong to no organization (platform key, AES-GCM) ──
-
     /** True once [init] has run — a service without the platform key configured cannot decrypt. */
     fun isInitialized(): Boolean = engine != null
-
-    /** See [VariableCryptoEngine.encryptBound]. Returns (ciphertextBase64, ivBase64). */
-    fun encryptBound(plaintext: String, context: String): Pair<String, String> =
-        engine().encryptBound(plaintext, context)
-
-    /** See [VariableCryptoEngine.decryptBound]. */
-    fun decryptBound(ciphertextBase64: String, ivBase64: String, context: String): String =
-        engine().decryptBound(ciphertextBase64, ivBase64, context)
 }

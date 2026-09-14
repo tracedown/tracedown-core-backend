@@ -84,6 +84,123 @@ class BodyStorageClientTest {
     }
 
     @Test
+    fun `a symlink under the root is refused, however it is reached`(@TempDir root: Path) {
+        val client = confinedTo(root)
+        val outside = Files.createTempDirectory("outside")
+        val secret = outside.resolve("application.conf").also { Files.writeString(it, "DATABASE_PASSWORD=hunter2") }
+        try {
+            // The classic swap: a directory under the root replaced by a link to
+            // somewhere else, so a path that *looks* confined resolves outside.
+            val linkedDir = root.resolve("run-1")
+            Files.createSymbolicLink(linkedDir, outside)
+            assertThrows(StorageConfinementException::class.java) {
+                client.readBody("file://${linkedDir.resolve("application.conf")}")
+            }
+            assertThrows(StorageConfinementException::class.java) {
+                client.readBytes("file://${linkedDir.resolve("application.conf")}", 1024)
+            }
+            assertThrows(StorageConfinementException::class.java) { client.delete("file://$linkedDir/application.conf") }
+
+            // And the final component as a link, which NOFOLLOW covers.
+            val linkedFile = root.resolve("call_0.json")
+            Files.createSymbolicLink(linkedFile, secret)
+            assertThrows(StorageConfinementException::class.java) { client.readBody("file://$linkedFile") }
+
+            assertEquals("DATABASE_PASSWORD=hunter2", Files.readString(secret), "nothing outside was read or removed")
+        } finally {
+            Files.deleteIfExists(secret)
+            Files.deleteIfExists(outside)
+        }
+    }
+
+    @Test
+    fun `a store root that is itself a symlink works`(@TempDir base: Path) {
+        // An operator's mount is very often a link. The root is resolved once,
+        // when the confinement is built; only what lies *under* it is refused.
+        val real = base.resolve("real-store").also { Files.createDirectories(it) }
+        val link = base.resolve("store-link")
+        Files.createSymbolicLink(link, real)
+        val client = confinedTo(link)
+        val body = real.resolve("run-1/call_0.json")
+        Files.createDirectories(body.parent)
+        Files.writeString(body, "hello")
+
+        assertTrue(client.contains("file://${link.resolve("run-1/call_0.json")}"))
+        assertEquals(
+            BodyStorageClient.BodyContent.Inline("hello"),
+            client.readBody("file://${real.resolve("run-1/call_0.json")}"),
+        )
+    }
+
+    @Test
+    fun `a filesystem read is capped without reading the whole file`(@TempDir root: Path) {
+        val client = confinedTo(root)
+        val big = root.resolve("big.bin")
+        java.io.RandomAccessFile(big.toFile(), "rw").use { it.setLength(5_000) }
+
+        val read = client.readBytes("file://$big", maxBytes = 1_000)
+
+        assertTrue(read is BodyStorageClient.StoredBody.TooLarge, "got $read")
+        assertEquals(5_000L, (read as BodyStorageClient.StoredBody.TooLarge).sizeBytes)
+    }
+
+    @Test
+    fun `readBody refuses an over-size body rather than buffering it`(@TempDir root: Path) {
+        val client = confinedTo(root)
+        val big = root.resolve("big.bin")
+        java.io.RandomAccessFile(big.toFile(), "rw").use { it.setLength(BodyStoreRegistry.MAX_BODY_BYTES + 1) }
+
+        assertThrows(BodyTooLargeException::class.java) { client.readBody("file://$big") }
+    }
+
+    @Test
+    fun `contains refuses keys that are not plain object keys`() {
+        val client = BodyStorageClient(confinement = BodyConfinement(s3Bucket = "bodies", s3KeyPrefix = "agents/eu"))
+        assertTrue(client.contains("s3://bodies/agents/eu/run-1/call_0.json"))
+        for (key in listOf(
+            // Dot and empty segments name one object to some stores and another
+            // to others, and each dresses up a location outside the prefix.
+            "agents/eu/../../secrets/key",
+            "agents/eu/./call_0.json",
+            "agents/eu//call_0.json",
+            "agents/eu/../eu-other/call_0.json",
+            "agents\\eu\\call_0.json",
+            // The neighbouring prefix that merely starts with the same letters.
+            "agents/eu-other/call_0.json",
+        )) {
+            assertFalse(client.contains("s3://bodies/$key"), key)
+        }
+    }
+
+    @Test
+    fun `a prefix boundary is a path boundary, not a string one`() {
+        val client = BodyStorageClient(confinement = BodyConfinement(s3Bucket = "bodies", s3KeyPrefix = "bodies"))
+        assertTrue(client.contains("s3://bodies/bodies/call_0.json"))
+        assertFalse(client.contains("s3://bodies/bodies-evil/call_0.json"))
+        assertFalse(client.contains("s3://bodies/bodiesevil"))
+    }
+
+    @Test
+    fun `an unconfined scheme keeps its old behaviour while the other stays confined`(@TempDir root: Path) {
+        // The aggregate-worker upgraded without STORAGE_S3_BUCKET: s3 deletions
+        // must keep working, file ones stay confined to the root it was given.
+        val client = BodyStorageClient(
+            confinement = BodyConfinement(filesystemRoot = root, unconfinedSchemes = setOf("s3")),
+        )
+        assertTrue(client.contains("s3://any-bucket/any/key"))
+        assertFalse(client.contains("file:///etc/passwd"))
+    }
+
+    @Test
+    fun `neither the store config nor the input prints its secret`() {
+        val config = S3Config("https://s3.example.com", "AKIAEXAMPLE", "super-secret-key")
+        assertFalse(config.toString().contains("super-secret-key"), config.toString())
+        val input = BodyStoreInput(name = "eu", kind = "s3", secretAccessKey = "super-secret-key")
+        assertFalse(input.toString().contains("super-secret-key"), input.toString())
+        assertTrue(input.toString().contains("eu"))
+    }
+
+    @Test
     fun `s3 confinement rejects a foreign bucket`() {
         val client = BodyStorageClient(
             s3Config = S3Config("https://x", "k", "s"),

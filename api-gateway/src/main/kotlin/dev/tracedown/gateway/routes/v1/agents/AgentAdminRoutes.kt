@@ -241,7 +241,7 @@ fun Route.agentAdminRoutes() {
             val taken = ProbeAgents.selectAll().where { ProbeAgents.slug eq slug }.empty().not()
             if (taken) throw ConflictException(ErrorCodes.AGENT_SLUG_TAKEN)
             BodyStoreService.checkTokenAssignment(
-                slug, bodyStoreId, InterceptorContext(orgId = orgId, userId = principal.userId),
+                orgId, slug, bodyStoreId, InterceptorContext(orgId = orgId, userId = principal.userId),
             )
             // The signing CA is created lazily on the very first bootstrap.
             CaService.ensureCaRoot()
@@ -267,6 +267,14 @@ fun Route.agentAdminRoutes() {
             }
             AuditService.log(orgId, principal.userId, "create.agent_bootstrap_token", "agent", slug, entityDisplayName = slug)
         } }
+        // Read back rather than echoed: a host hook may have stamped a store of
+        // its own on the token, and what the dashboard prints has to be the
+        // store the agent will actually enrol on.
+        val savedStoreId = transaction {
+            AgentBootstrapTokens.selectAll()
+                .where { AgentBootstrapTokens.id eq tokenId }
+                .firstOrNull()?.get(AgentBootstrapTokens.bodyStoreId)
+        }
 
         call.respond(
             BootstrapTokenResponse(
@@ -274,7 +282,7 @@ fun Route.agentAdminRoutes() {
                 token = token,
                 expiresAt = expiresAt.toString(),
                 schedulerUrl = AgentEnrolmentAddress.resolve(),
-                bodyStore = BodyStoreService.summary(bodyStoreId),
+                bodyStore = BodyStoreService.summary(orgId, savedStoreId, slug),
             ),
         )
     }
@@ -367,9 +375,18 @@ fun Route.agentAdminRoutes() {
 
     /**
      * Moves an agent to a body store (`storeId`), or back to the default store
-     * (`storeId: null`). Bodies already stored stay where they are; only the
-     * agent's next results follow. Runs the `agent.bodyStore.assign` hook.
-     * An agent the caller cannot see answers 404, like every other slug route.
+     * (`storeId: null`). Bodies already stored stay where they are.
+     *
+     * This records the assignment and nothing else. **The running agent keeps
+     * writing wherever its own environment says** until it is redeployed with
+     * the new store's settings — the dashboard shows what those are. Until then
+     * its bodies land in the old place: one that lies inside the default store
+     * is still relocated as usual (so moves to and from the default store lose
+     * nothing), and one in the old store is recorded as `outsideAssignedStore`.
+     *
+     * Runs the `agent.bodyStore.assign` hook. An agent the caller cannot see
+     * answers 404, like every other slug route; an unknown slug answers 404
+     * `agent_not_found`.
      */
     put<AgentAdmin.BySlug.BodyStoreAssignment> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
@@ -382,8 +399,11 @@ fun Route.agentAdminRoutes() {
             transaction {
                 requireOrgWrite(orgId, principal.userId) { it.settings }
                 if (!AgentVisibility.canSee(orgId, principal.userId, slug)) throw NotFoundException()
-                BodyStoreService.assignAgent(slug, storeId, InterceptorContext(orgId = orgId, userId = principal.userId))
-                AuditService.log(orgId, principal.userId, "update.agent", "agent", slug, entityDisplayName = slug)
+                BodyStoreService.assignAgent(orgId, slug, storeId, InterceptorContext(orgId = orgId, userId = principal.userId))
+                AuditService.log(
+                    orgId, principal.userId, "update.agent", "agent", slug, entityDisplayName = slug,
+                    comment = "body store: ${storeId ?: "default"}",
+                )
             }
         }
         call.respond(mapOf("ok" to true))

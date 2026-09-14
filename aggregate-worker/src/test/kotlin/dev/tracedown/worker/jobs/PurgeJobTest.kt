@@ -1079,10 +1079,17 @@ class PurgeJobTest {
     }
 
     /** A filesystem in_place body store rooted at [root], and a step whose body it holds. */
-    private fun insertInPlaceStep(resultId: UUID, root: java.nio.file.Path, bodyUrl: String): UUID {
+    private fun insertInPlaceStep(
+        orgId: UUID,
+        resultId: UUID,
+        root: java.nio.file.Path,
+        bodyUrl: String,
+        stepNum: Short = 2,
+    ): UUID {
         val storeId = UUID.randomUUID()
         BodyStores.insert {
             it[id] = storeId
+            it[organizationId] = orgId
             it[name] = "in-place-$storeId"
             it[kind] = "filesystem"
             it[mode] = "in_place"
@@ -1093,7 +1100,7 @@ class PurgeJobTest {
         ProbeSteps.insert {
             it[id] = UUID.randomUUID()
             it[probeResultId] = resultId
-            it[stepNum] = 2
+            it[ProbeSteps.stepNum] = stepNum
             it[requestUrl] = "https://example.test/"
             it[responseBodyStorageUrl] = bodyUrl
             it[bodyStoreId] = storeId
@@ -1119,7 +1126,7 @@ class PurgeJobTest {
             svc = insertService(proj, purge = true)
             result = insertResult(svc, proj, ws, org)
             insertStep(result, "file://$defaultBody")
-            insertInPlaceStep(result, root, "file://$inPlaceBody")
+            insertInPlaceStep(org, result, root, "file://$inPlaceBody")
         }
 
         runPurge(BodyStorageClient(confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = root)))
@@ -1131,6 +1138,48 @@ class PurgeJobTest {
         }
         assertFalse(java.nio.file.Files.exists(defaultBody), "the default store's body is deleted")
         assertTrue(java.nio.file.Files.exists(inPlaceBody), "the in_place body is left to its store")
+    }
+
+    @Test
+    fun `purge leaves an in_place body in a store of its own and queues nothing for it`() {
+        // The realistic shape: the store is a directory of its own, nowhere near
+        // platform storage, and the worker is not mounted there at all. Both the
+        // body_store_id and the confinement say hands off — and the URI must not
+        // land in the deletion retry table, where it would be retried forever.
+        val platformRoot = java.nio.file.Files.createTempDirectory("purge-platform").toRealPath()
+        val storeRoot = java.nio.file.Files.createTempDirectory("purge-store").toRealPath()
+        val defaultBody = platformRoot.resolve("default.json").also { java.nio.file.Files.writeString(it, "{}") }
+        val inPlaceBody = storeRoot.resolve("eu/kept.json")
+        java.nio.file.Files.createDirectories(inPlaceBody.parent)
+        java.nio.file.Files.writeString(inPlaceBody, "store owner's")
+        lateinit var svc: UUID
+        lateinit var result: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            svc = insertService(proj, purge = true)
+            result = insertResult(svc, proj, ws, org)
+            insertStep(result, "file://$defaultBody")
+            insertInPlaceStep(org, result, storeRoot, "file://$inPlaceBody")
+        }
+
+        runPurge(
+            BodyStorageClient(confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = platformRoot)),
+        )
+
+        transaction {
+            assertEquals(0, count(Services, Services.id eq svc), "the purge completed")
+            assertEquals(0, count(ProbeSteps, ProbeSteps.probeResultId eq result), "both rows are gone")
+            assertEquals(
+                0, count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq "file://$inPlaceBody"),
+                "a store owner's body is never queued for retry",
+            )
+        }
+        assertFalse(java.nio.file.Files.exists(defaultBody), "the default store's body is deleted")
+        assertTrue(java.nio.file.Files.exists(inPlaceBody), "the in_place body is left to its store")
+        java.nio.file.Files.deleteIfExists(inPlaceBody)
     }
 
     @Test
@@ -1150,7 +1199,7 @@ class PurgeJobTest {
                 it[startedAt] = NOW.minus(40, ChronoUnit.DAYS)
             }
             insertStep(result, "file://$defaultBody")
-            insertInPlaceStep(result, root, "file://$inPlaceBody")
+            insertInPlaceStep(org, result, root, "file://$inPlaceBody")
         }
 
         runBlocking {

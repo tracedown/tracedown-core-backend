@@ -51,10 +51,14 @@ class BodyRelocator(private val storage: BodyStorageClient) {
     }
 
     /**
-     * Imports the body at [agentBodyPath] from the agent's own `import` body
+     * Copies the body at [agentBodyPath] from the agent's own `import` body
      * store — read through [source], which is confined to that store — into the
-     * canonical key in this relocator's (default) store, removing it from the
-     * source. Same contract as [relocate]: the server-derived URI, or null.
+     * canonical key in this relocator's (default) store. Same contract as
+     * [relocate]: the server-derived URI, or null.
+     *
+     * The source is deliberately left in place. It may only be removed once the
+     * row naming the copy has committed, and that is the caller's to sequence —
+     * see [removeImported] and [dropCopy].
      */
     fun importFrom(
         source: BodyStorageClient,
@@ -66,12 +70,48 @@ class BodyRelocator(private val storage: BodyStorageClient) {
     ): String? {
         val destKey = "$organizationId/$serviceId/$resultId/call_${callIndex}_response${extensionOf(agentBodyPath)}"
         return try {
-            storage.relocateFrom(source, agentBodyPath, destKey, BodyStoreRegistry.MAX_BODY_BYTES)
+            storage.copyFrom(source, agentBodyPath, destKey, BodyStoreRegistry.MAX_BODY_BYTES)
         } catch (e: Exception) {
             log.warn("body import failed for service {} result {}: {}", serviceId, resultId, e.message)
             null
         }
     }
+
+    /**
+     * Removes an imported body's source, after the copy is committed. A source
+     * that will not go is logged and left: the copy is what the platform serves,
+     * and the store's owner sees one object they can remove themselves. Never
+     * throws — the result is already persisted by the time this runs.
+     */
+    fun removeImported(source: BodyStorageClient, agentBodyPath: String) {
+        try {
+            source.delete(agentBodyPath)
+        } catch (e: Exception) {
+            log.warn("imported body {} but could not remove the source: {}", agentBodyPath, e.message)
+        }
+    }
+
+    /**
+     * Removes a copy this relocator made, after the transaction that would have
+     * named it failed. Without this the default store fills with bodies no row
+     * points at, which retention will never find. Never throws.
+     */
+    fun dropCopy(storedUri: String) {
+        try {
+            storage.delete(storedUri)
+        } catch (e: Exception) {
+            log.warn("could not remove the orphaned copy {}: {}", storedUri, e.message)
+        }
+    }
+
+    /**
+     * Whether [uri] already lies inside the default store. A body there is the
+     * platform's to relocate whatever store the agent is assigned — an agent
+     * moved to a store, or off one, keeps writing where its own configuration
+     * says until it is redeployed, and none of those bodies should be lost to
+     * the change.
+     */
+    fun ownsLocation(uri: String): Boolean = storage.contains(uri)
 
     /** Advisory extension (e.g. ".json") from the agent's filename, sanitized. */
     private fun extensionOf(path: String): String {

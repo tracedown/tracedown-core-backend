@@ -39,10 +39,18 @@ class Results(val serviceId: String) {
  * cross-origin redirect is sent with `Origin: null`, which no origin-scoped
  * bucket CORS policy can match — fetching the URL directly preserves the
  * page's origin, so the bucket policy can stay restricted to the dashboard.
- * [contentType] accompanies inlined content when its reader knows it.
+ * [contentType] accompanies inlined content when its reader knows it, and
+ * [encoding] is `base64` when the body is not valid UTF-8 text — bodies read
+ * from a body store are served as content whatever they hold, so a PNG or a
+ * gzip response arrives intact rather than as replacement characters.
  */
 @Serializable
-data class StepBodyResponse(val content: String? = null, val url: String? = null, val contentType: String? = null)
+data class StepBodyResponse(
+    val content: String? = null,
+    val url: String? = null,
+    val contentType: String? = null,
+    val encoding: String? = null,
+)
 
 /** Registers routes for querying probe results. */
 fun Route.resultRoutes() {
@@ -77,14 +85,29 @@ fun Route.resultRoutes() {
         call.respond(result)
     }
 
-    /** Returns the stored response body for a probe step. */
+    /**
+     * Returns the stored response body for a probe step.
+     *
+     * A body in the default S3 store answers with a presigned `url`; anything
+     * else answers with `content` (plus `contentType` when known, and
+     * `encoding: "base64"` when the bytes are not UTF-8 text). 204 when the step
+     * stored no body.
+     *
+     * Errors: `body_gone` (410) — the body is not at its recorded location any
+     * more: the object is missing, or the store refuses the key.
+     * `body_too_large` (413) — over the 32 MiB this endpoint serves inline.
+     * `body_store_unavailable` (503) — the body store did not answer, or its
+     * credentials could not be read; the body is probably still there and the
+     * call is worth repeating.
+     */
     get<Results.ById.StepBody> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val svcId = parseUuid(resource.parent.parent.serviceId, "service ID")
         val resultId = parseUuid(resource.parent.resultId, "result ID")
         val stepId = parseUuid(resource.stepId, "step ID")
         when (val body = ProbeResultController.getStepBody(orgId, svcId, resultId, stepId, principal.userId)) {
-            is BodyStorageClient.BodyContent.Inline -> call.respond(StepBodyResponse(content = body.content, contentType = body.contentType))
+            is BodyStorageClient.BodyContent.Inline ->
+                call.respond(StepBodyResponse(content = body.content, contentType = body.contentType, encoding = body.encoding))
             is BodyStorageClient.BodyContent.Redirect -> call.respond(StepBodyResponse(url = body.url))
             is BodyStorageClient.BodyContent.NotFound -> call.respond(HttpStatusCode.NoContent, "")
         }

@@ -4,11 +4,14 @@ import at.favre.lib.crypto.bcrypt.BCrypt
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.AgentBootstrapTokens
+import dev.tracedown.common.models.BodyStores
+import dev.tracedown.common.storage.BodyStore
 import dev.tracedown.gateway.controllers.agents.CaService
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.security.SecureRandom
 import java.time.Instant
@@ -23,8 +26,14 @@ import kotlin.system.exitProcess
  * to stdout.  The operator pastes it into the agent's
  * `PROBE_AGENT_BOOTSTRAP_TOKEN` env var.
  *
+ * `--body-store <id>` stamps the token with a body store, so the agent it
+ * enrols starts writing bodies there instead of into the default store; the
+ * storage settings to give the agent are printed with the token, already
+ * narrowed to the agent's own sub-location of the store. Without it the agent
+ * writes to the default store, as it always has.
+ *
  * Usage:
- *   java -jar api-gateway.jar --agent-bootstrap <slug> [--label <label>]
+ *   java -jar api-gateway.jar --agent-bootstrap <slug> [--label <label>] [--body-store <id>]
  */
 object AgentBootstrap {
 
@@ -45,11 +54,22 @@ object AgentBootstrap {
         val labelIdx = args.indexOf("--label")
         val label = if (labelIdx != -1) args.getOrNull(labelIdx + 1) ?: slug else slug
 
-        run(slug, label)
+        val storeIdx = args.indexOf("--body-store")
+        val bodyStoreId = if (storeIdx == -1) {
+            null
+        } else {
+            val raw = args.getOrNull(storeIdx + 1)
+            runCatching { UUID.fromString(raw) }.getOrNull() ?: run {
+                System.err.println("Usage: --body-store <store id> (as shown by the body store list)")
+                exitProcess(1)
+            }
+        }
+
+        run(slug, label, bodyStoreId)
         return true
     }
 
-    private fun run(slug: String, label: String) {
+    private fun run(slug: String, label: String, bodyStoreId: UUID?) {
         val dbUrl = System.getenv("DATABASE_URL")
             ?: "jdbc:postgresql://localhost:5432/tracedown"
         val dbUser = System.getenv("DATABASE_USER") ?: "tracedown"
@@ -64,6 +84,15 @@ object AgentBootstrap {
         try {
             val token = generateToken()
             val tokenHash = BCrypt.withDefaults().hashToString(12, token.toCharArray())
+
+            val store = bodyStoreId?.let { id ->
+                transaction { BodyStores.selectAll().where { BodyStores.id eq id }.firstOrNull() }
+                    ?.let(BodyStore::fromRow)
+                    ?: run {
+                        System.err.println("ERROR: no body store with id $id")
+                        exitProcess(1)
+                    }
+            }
 
             transaction {
                 // Ensure CA root exists (generated on first bootstrap).
@@ -85,6 +114,7 @@ object AgentBootstrap {
                     it[tokenLookup] = TokenHasher.sha256Hex(token)
                     it[expiresAt] = Instant.now().plus(TOKEN_TTL_HOURS, ChronoUnit.HOURS)
                     it[createdAt] = Instant.now()
+                    it[AgentBootstrapTokens.bodyStoreId] = bodyStoreId
                 }
             }
 
@@ -97,6 +127,24 @@ object AgentBootstrap {
             println("  Token: $token")
             println()
             println("Set this as PROBE_AGENT_BOOTSTRAP_TOKEN on the agent.")
+            if (store != null) {
+                println()
+                println("Body store: ${store.name} (${store.kind}, ${store.mode})")
+                if (store.kind == BodyStore.KIND_S3) {
+                    println("  PROBE_AGENT_STORAGE_BACKEND=s3")
+                    println("  PROBE_AGENT_S3_ENDPOINT=${store.endpoint}")
+                    store.region?.let { println("  PROBE_AGENT_S3_REGION=$it") }
+                    println("  PROBE_AGENT_S3_BUCKET=${store.bucket}")
+                    // The agent's own corner of the store: it writes only here,
+                    // and ingest accepts its bodies only from here.
+                    println("  PROBE_AGENT_S3_PREFIX=${store.agentPrefix(slug)}")
+                    println("  PROBE_AGENT_S3_ACCESS_KEY_ID=<a key with write access to that prefix>")
+                    println("  PROBE_AGENT_S3_SECRET_ACCESS_KEY=<its secret>")
+                } else {
+                    println("  PROBE_AGENT_STORAGE_BACKEND=filesystem")
+                    println("  PROBE_AGENT_STORAGE_DIR=${store.rootPath}/$slug")
+                }
+            }
             // The CLI runs before the application (and its seam) is wired, so it reads
             // the same variable the gateway config does, straight from the environment.
             val enrolAt = dev.tracedown.common.agents.AgentEnrolmentAddress

@@ -27,4 +27,8 @@ data class S3Config(
      * retention with nothing in the log.
      */
     val timeoutSeconds: Long = 30,
-)
+) {
+    /** Never prints the secret key — this type ends up in exception messages and debug logs. */
+    override fun toString(): String =
+        "S3Config(endpoint=$endpoint, accessKey=$accessKey, secretKey=***, region=$region, timeoutSeconds=$timeoutSeconds)"
+}

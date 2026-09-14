@@ -54,6 +54,8 @@ object ErrorCodes {
     const val BODY_GONE = "body_gone"
     /** A bootstrap token was requested for a slug an agent is already registered under. */
     const val AGENT_SLUG_TAKEN = "agent_slug_taken"
+    /** No agent is registered under the slug — distinct from a resource the caller cannot see. */
+    const val AGENT_NOT_FOUND = "agent_not_found"
     /**
      * A stored response body is larger than the API serves inline (413). Only
      * bodies read through a body store are capped this way; the default store
@@ -66,6 +68,16 @@ object ErrorCodes {
     /** A store still named by an agent, an outstanding bootstrap token or a stored body (409). */
     const val BODY_STORE_IN_USE = "body_store_in_use"
     const val BODY_STORE_NAME_TAKEN = "body_store_name_taken"
+    /**
+     * A store's location (kind, bucket, prefix, root) may not move while a stored
+     * body still lives in it — the recorded URLs only mean anything there (409).
+     */
+    const val BODY_STORE_LOCATION_LOCKED = "body_store_location_locked"
+    /**
+     * A store's own backend did not answer, or its credentials could not be
+     * decrypted — the body may well still be there, so this is not `body_gone` (503).
+     */
+    const val BODY_STORE_UNAVAILABLE = "body_store_unavailable"
     const val INVALID_STORE_KIND = "invalid_store_kind"
     const val INVALID_STORE_MODE = "invalid_store_mode"
     /** A field the store's kind needs is missing; `details.field` names it. */

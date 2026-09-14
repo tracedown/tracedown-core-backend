@@ -44,6 +44,8 @@ services:
     image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../api-gateway/build/install/api-gateway:/app
+      # Filesystem body stores live here, shared with the ingestor.
+      - tracedown-stores:/data/stores
     command: /app/bin/api-gateway
     ports:
       - "18080:8080"
@@ -55,6 +57,10 @@ services:
       REDIS_B_URL: redis://redis:6379
       REDIS_C_URL: redis://redis:6379
       PLATFORM_AES_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      BODY_STORE_AES_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
+      BODY_STORE_FILESYSTEM_BASES: /data/stores
+      # The suite's object store is a MinIO on this network, over http.
+      BODY_STORE_PRIVATE_ENDPOINTS: "true"
       SINGLE_ORG_MODE: "true"
       DEMO_USER_EMAIL: admin@tracedown.dev
       DEMO_USER_PASSWORD: "Down2trace!"
@@ -102,13 +108,18 @@ services:
     image: eclipse-temurin:21-jre-alpine
     volumes:
       - ../result-ingestor/build/install/result-ingestor:/app
+      # The same store directories the gateway reads in_place bodies from.
+      - tracedown-stores:/data/stores
     command: /app/bin/result-ingestor
     environment:
       DATABASE_URL: jdbc:postgresql://postgres:5432/tracedown
       DATABASE_USER: tracedown
       DATABASE_PASSWORD: tracedown
       REDIS_A_URL: redis://redis:6379
-      PLATFORM_AES_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      # Body store credentials only — deliberately not the platform key.
+      BODY_STORE_AES_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
+      BODY_STORE_FILESYSTEM_BASES: /data/stores
+      BODY_STORE_PRIVATE_ENDPOINTS: "true"
       PORT: 8082
     depends_on:
       gateway:
@@ -229,3 +240,9 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
+
+volumes:
+  # Shared by the gateway and the ingestor: where a filesystem body store's root
+  # lives (BODY_STORE_FILESYSTEM_BASES). The worker does not need it — it never
+  # deletes from a store.
+  tracedown-stores:

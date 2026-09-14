@@ -25,20 +25,30 @@ import java.util.UUID
 
 /**
  * @OpenAPITag Body stores
- * Where agents keep the response bodies they capture, when not in the default
- * (environment-configured) store. A store is `s3` (endpoint, region, bucket,
- * prefix, access key + secret) or `filesystem` (a root directory mounted into
- * the gateway, the ingestor and the worker at the same path, inside
+ * Where an organization's agents keep the response bodies they capture, when not
+ * in the default (environment-configured) store. A store is `s3` (endpoint,
+ * region, bucket, prefix, access key + secret) or `filesystem` (a root directory
+ * mounted into the gateway and the ingestor at the same path, inside
  * `BODY_STORE_FILESYSTEM_BASES`). Mode `import`: the agent writes to the store
  * and each body is copied into the default store at ingest. Mode `in_place`:
  * the body stays in the store and is read from it on demand; the platform never
  * deletes from it. The secret access key is write-only — responses carry
  * `hasSecret` instead. Same permission as agent management (org settings).
  *
+ * A store belongs to the organization it was created in. Another organization's
+ * store is not listed and naming its id is `body_store_not_found`, whatever the
+ * caller's permissions.
+ *
+ * Each agent writes under its own sub-location of a store (`<prefix>/<slug>`,
+ * `<root>/<slug>`), which is what the bootstrap token's `bodyStore` prints and
+ * the only place ingest accepts that agent's bodies from.
+ *
  * Errors: `body_store_not_found` (404), `body_store_in_use` (409, `details`
  * counts agents/tokens/bodies), `body_store_name_taken` (409),
- * `invalid_store_kind`, `invalid_store_mode`, `store_field_required`,
- * `field_invalid`, `field_too_long` (400, `details.field`).
+ * `body_store_location_locked` (409, the location may not move while a stored
+ * body lives in it), `invalid_store_kind`, `invalid_store_mode`,
+ * `store_field_required`, `field_invalid`, `field_too_long` (400,
+ * `details.field`, and `details.reason` on `field_invalid`).
  */
 @Resource("/api/v1/body-stores")
 class BodyStores {
@@ -48,7 +58,7 @@ class BodyStores {
 
     @Serializable
     @Resource("{id}")
-    class ById(val parent: BodyStores = BodyStores(), val id: String) {
+    class ById(val parent: BodyStores = BodyStores(), val id: String, val forgetBodies: Boolean = false) {
         /** Read-only probe with the store's credentials → `{ ok, error? }`. */
         @Serializable
         @Resource("test")
@@ -65,12 +75,12 @@ private fun storeIdOf(raw: String): UUID =
 
 /** Registers the body-store management routes. */
 fun Route.bodyStoreRoutes() {
-    /** Lists the body stores with the number of agents on each. */
+    /** Lists the organization's body stores with the number of agents on each. */
     get<BodyStores> {
         val (principal, orgId) = requireAuthWithOrg(call)
         val stores = transaction {
             requireOrgRead(orgId, principal.userId) { it.settings }
-            BodyStoreService.list()
+            BodyStoreService.list(orgId)
         }
         call.respond(stores)
     }
@@ -89,8 +99,12 @@ fun Route.bodyStoreRoutes() {
         val created = bodyStoreCall {
             transaction {
                 requireOrgWrite(orgId, principal.userId) { it.settings }
-                val store = BodyStoreService.create(body, InterceptorContext(orgId = orgId, userId = principal.userId))
-                AuditService.log(orgId, principal.userId, "create.body_store", "body_store", store.id, entityDisplayName = store.name)
+                val store = BodyStoreService.create(orgId, body, InterceptorContext(orgId = orgId, userId = principal.userId))
+                AuditService.log(
+                    orgId, principal.userId, "create.body_store", "body_store", store.id,
+                    entityDisplayName = store.name,
+                    comment = "${store.kind}/${store.mode}",
+                )
                 store
             }
         }
@@ -105,24 +119,48 @@ fun Route.bodyStoreRoutes() {
         val updated = bodyStoreCall {
             transaction {
                 requireOrgWrite(orgId, principal.userId) { it.settings }
-                val store = BodyStoreService.update(id, body, InterceptorContext(orgId = orgId, userId = principal.userId))
-                AuditService.log(orgId, principal.userId, "update.body_store", "body_store", store.id, entityDisplayName = store.name)
+                val ctx = InterceptorContext(orgId = orgId, userId = principal.userId)
+                val store = BodyStoreService.update(orgId, id, body, ctx)
+                // What moved, never a value: the audit trail of a store is about
+                // repointing, and one of its fields is a credential.
+                AuditService.log(
+                    orgId, principal.userId, "update.body_store", "body_store", store.id,
+                    entityDisplayName = store.name,
+                    comment = (ctx.extra["changed"] as? String)?.takeIf { it.isNotEmpty() }?.let { "changed: $it" },
+                )
                 store
             }
         }
         call.respond(updated)
     }
 
-    /** Deletes a store — 409 `body_store_in_use` while an agent, a token or a stored body names it. */
+    /**
+     * Deletes a store — 409 `body_store_in_use` while an agent, an outstanding
+     * token or a stored body names it.
+     *
+     * `?forgetBodies=true` releases those instead: its agents move back to the
+     * default store, its outstanding tokens lose their stamp, and every step
+     * whose body lives in the store forgets that body (reason `storeRemoved`).
+     * The objects themselves are never touched — they belong to whoever owns the
+     * store, and after this the platform simply no longer knows about them.
+     */
     delete<BodyStores.ById> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val id = storeIdOf(resource.id)
+        val forget = resource.forgetBodies
         bodyStoreCall {
             transaction {
                 requireOrgWrite(orgId, principal.userId) { it.settings }
-                val name = BodyStoreService.get(id).name
-                BodyStoreService.delete(id, InterceptorContext(orgId = orgId, userId = principal.userId))
-                AuditService.log(orgId, principal.userId, "delete.body_store", "body_store", id.toString(), entityDisplayName = name)
+                val name = BodyStoreService.get(orgId, id).name
+                val released = BodyStoreService.delete(orgId, id, forget, InterceptorContext(orgId = orgId, userId = principal.userId))
+                AuditService.log(
+                    orgId, principal.userId, "delete.body_store", "body_store", id.toString(),
+                    entityDisplayName = name,
+                    comment = if (!forget) null else {
+                        "forgot ${released.bodies} bodies, unassigned ${released.agents} agents, " +
+                            "${released.tokens} tokens"
+                    },
+                )
             }
         }
         call.respond(OkResponse(true))
@@ -133,6 +171,6 @@ fun Route.bodyStoreRoutes() {
         val (principal, orgId) = requireAuthWithOrg(call)
         val id = storeIdOf(resource.parent.id)
         transaction { requireOrgWrite(orgId, principal.userId) { it.settings } }
-        call.respond(bodyStoreCall { BodyStoreService.test(id) })
+        call.respond(bodyStoreCall { BodyStoreService.test(orgId, id) })
     }
 }

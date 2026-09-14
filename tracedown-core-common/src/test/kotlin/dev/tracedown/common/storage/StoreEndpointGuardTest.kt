@@ -21,17 +21,30 @@ class StoreEndpointGuardTest {
 
     @Test
     fun `a public https endpoint is accepted`() {
-        assertNull(StoreEndpointGuard.validate("https://s3.eu-central-1.amazonaws.com", allowLoopbackHttp = false))
-        assertNull(StoreEndpointGuard.validate("https://acct.r2.cloudflarestorage.com/", allowLoopbackHttp = false))
+        assertNull(StoreEndpointGuard.validate("https://s3.eu-central-1.amazonaws.com", allowPrivate = false))
+        assertNull(StoreEndpointGuard.validate("https://acct.r2.cloudflarestorage.com/", allowPrivate = false))
     }
 
     @Test
-    fun `private, link-local and CGNAT literals are refused`() {
+    fun `private, link-local, CGNAT and reserved literals are refused`() {
         for (endpoint in listOf(
             "https://10.0.0.5", "https://192.168.1.10:9000", "https://172.16.0.1",
             "https://169.254.169.254", "https://100.64.0.1", "https://[fd00::1]", "https://0.0.0.0",
+            // 168.63.129.16 answers instance metadata at one hosting provider,
+            // and is an ordinary public-looking address everywhere else.
+            "https://168.63.129.16",
+            // Benchmarking (198.18/15) and reserved (240/4) space.
+            "https://198.18.0.1", "https://198.19.255.255", "https://240.0.0.1", "https://255.255.255.255",
+            // Every IPv6 spelling that carries an IPv4 address inside it.
+            "https://[::ffff:169.254.169.254]", "https://[::10.0.0.5]",
+            "https://[64:ff9b::a00:5]", "https://[64:ff9b:1::a00:5]",
+            // 6to4 and Teredo, both carrying 10.0.0.5 (Teredo stores the
+            // client's address inverted: 10.0.0.5 -> f5ff:fffa).
+            "https://[2002:a00:5::1]", "https://[2001:0:4136:e378:8000:63bf:f5ff:fffa]",
+            // The discard-only prefix, 100::/64.
+            "https://[100::1]",
         )) {
-            assertEquals("private_address", StoreEndpointGuard.validate(endpoint, allowLoopbackHttp = true), endpoint)
+            assertEquals("private_address", StoreEndpointGuard.validate(endpoint, allowPrivate = false), endpoint)
         }
     }
 
@@ -43,18 +56,41 @@ class StoreEndpointGuardTest {
     }
 
     @Test
-    fun `plain http is refused except for a local endpoint outside production`() {
-        assertEquals("scheme_not_https", StoreEndpointGuard.validate("http://s3.example.com", allowLoopbackHttp = true))
-        assertNull(StoreEndpointGuard.validate("http://localhost:9000", allowLoopbackHttp = true))
-        assertNull(StoreEndpointGuard.validate("http://127.0.0.1:9000", allowLoopbackHttp = true))
-        assertEquals("private_address", StoreEndpointGuard.validate("http://localhost:9000", allowLoopbackHttp = false))
-        assertEquals("private_address", StoreEndpointGuard.validate("https://127.0.0.1", allowLoopbackHttp = false))
+    fun `a single-label host is refused`() {
+        // `minio` is whatever the container runtime's search domain says, which
+        // is a different machine in every network and inside a stack an internal
+        // one. A store endpoint has to name a host the same way everywhere.
+        assertEquals("single_label_host", StoreEndpointGuard.validate("https://minio", false))
+        assertEquals("single_label_host", StoreEndpointGuard.validate("https://storage.", false))
+        assertNull(StoreEndpointGuard.validate("https://minio.example.com", false))
+        // With private endpoints allowed, a bare service name is exactly what an
+        // operator means, and is accepted.
+        assertNull(StoreEndpointGuard.validate("http://minio", allowPrivate = true))
+    }
+
+    @Test
+    fun `plain http and private hosts are refused unless private endpoints are allowed`() {
+        for (endpoint in listOf(
+            "http://s3.example.com", "http://localhost:9000", "http://127.0.0.1:9000",
+            "http://minio:9000", "https://10.0.0.5:9000",
+        )) {
+            assertNotNull(StoreEndpointGuard.validate(endpoint, allowPrivate = false), endpoint)
+        }
+        for (endpoint in listOf(
+            "http://s3.example.com", "http://localhost:9000", "http://127.0.0.1:9000",
+            "http://minio:9000", "https://10.0.0.5:9000", "http://minio.railway.internal:9000",
+        )) {
+            assertNull(StoreEndpointGuard.validate(endpoint, allowPrivate = true), endpoint)
+        }
+        // The setting relaxes the network, never the URL shape.
+        assertEquals("scheme_not_https", StoreEndpointGuard.validate("ftp://minio", allowPrivate = true))
+        assertEquals("has_path", StoreEndpointGuard.validate("http://minio/bucket", allowPrivate = true))
     }
 
     @Test
     fun `credentials, paths and queries in the endpoint are refused`() {
         assertEquals("malformed_url", StoreEndpointGuard.validate("https://user:pw@s3.example.com", false))
-        assertEquals("malformed_url", StoreEndpointGuard.validate("https://s3.example.com/bucket", false))
+        assertEquals("has_path", StoreEndpointGuard.validate("https://s3.example.com/bucket", false))
         assertEquals("malformed_url", StoreEndpointGuard.validate("https://s3.example.com?x=1", false))
         assertEquals("no_host", StoreEndpointGuard.validate("https:///nohost", false))
     }
@@ -63,20 +99,28 @@ class StoreEndpointGuardTest {
     fun `a name that resolves to a private address is refused at connect time`() {
         val private = InetAddress.getByName("10.1.2.3")
         val public = InetAddress.getByName("93.184.216.34")
-        val rebinding = StoreEndpointGuard.GuardedDns(allowLoopbackHttp = false) { listOf(private) }
+        val rebinding = StoreEndpointGuard.GuardedDns(allowPrivate = false) { listOf(private) }
         assertThrows(StoreEndpointBlockedException::class.java) { rebinding.lookup("store.example.com") }
         // One private answer among public ones is still a way in.
-        val mixed = StoreEndpointGuard.GuardedDns(allowLoopbackHttp = false) { listOf(public, private) }
+        val mixed = StoreEndpointGuard.GuardedDns(allowPrivate = false) { listOf(public, private) }
         assertThrows(StoreEndpointBlockedException::class.java) { mixed.lookup("store.example.com") }
-        val clean = StoreEndpointGuard.GuardedDns(allowLoopbackHttp = false) { listOf(public) }
+        val clean = StoreEndpointGuard.GuardedDns(allowPrivate = false) { listOf(public) }
         assertEquals(listOf(public), clean.lookup("store.example.com"))
     }
 
     @Test
-    fun `the local exception does not cover a public name resolving to loopback`() {
-        val dns = StoreEndpointGuard.GuardedDns(allowLoopbackHttp = true) { listOf(InetAddress.getByName("127.0.0.1")) }
+    fun `without the setting no name reaches an internal host or loopback`() {
+        val dns = StoreEndpointGuard.GuardedDns(allowPrivate = false) { listOf(InetAddress.getByName("127.0.0.1")) }
         assertThrows(StoreEndpointBlockedException::class.java) { dns.lookup("evil.example.com") }
-        assertEquals(1, dns.lookup("localhost").size)
+        assertThrows(StoreEndpointBlockedException::class.java) { dns.lookup("minio.railway.internal") }
+    }
+
+    @Test
+    fun `with the setting private and internal answers are allowed`() {
+        val loopback = InetAddress.getByName("127.0.0.1")
+        val dns = StoreEndpointGuard.GuardedDns(allowPrivate = true) { listOf(loopback) }
+        assertEquals(listOf(loopback), dns.lookup("minio"))
+        assertEquals(listOf(loopback), dns.lookup("minio.railway.internal"))
     }
 
     @Test
@@ -98,10 +142,11 @@ class StoreEndpointGuardTest {
             val client = BodyStorageClient(
                 s3Config = S3Config("http://127.0.0.1:${origin.address.port}", "key", "secret", timeoutSeconds = 5),
                 confinement = BodyConfinement(s3Bucket = "bucket"),
-                httpClient = StoreEndpointGuard.httpClient(timeoutSeconds = 5, allowLoopbackHttp = true),
+                httpClient = StoreEndpointGuard.httpClient(timeoutSeconds = 5, allowPrivate = true),
             )
             val error = client.probe()
             assertNotNull(error, "a redirect is a failed probe, not a success")
+            assertEquals("unexpected_response", error, "a redirect answers, it is not a network failure")
             assertTrue(originHits.get() >= 1, "the store was asked")
             assertEquals(0, targetHits.get(), "the redirect target was never contacted")
         } finally {
@@ -111,7 +156,7 @@ class StoreEndpointGuardTest {
     }
 
     @Test
-    fun `a loopback literal is refused on the socket outside development`() {
+    fun `a loopback literal is refused on the socket without the private-endpoint setting`() {
         val hits = AtomicInteger()
         val origin = server { exchange ->
             hits.incrementAndGet()
@@ -122,7 +167,7 @@ class StoreEndpointGuardTest {
             val client = BodyStorageClient(
                 s3Config = S3Config("http://127.0.0.1:${origin.address.port}", "key", "secret", timeoutSeconds = 5),
                 confinement = BodyConfinement(s3Bucket = "bucket"),
-                httpClient = StoreEndpointGuard.httpClient(timeoutSeconds = 5, allowLoopbackHttp = false),
+                httpClient = StoreEndpointGuard.httpClient(timeoutSeconds = 5, allowPrivate = false),
             )
             assertEquals("blocked_endpoint", client.probe())
             assertEquals(0, hits.get(), "no request reached the blocked address")

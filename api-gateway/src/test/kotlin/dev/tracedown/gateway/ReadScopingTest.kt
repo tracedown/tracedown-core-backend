@@ -22,6 +22,7 @@ import dev.tracedown.gateway.controllers.results.ProbeResultController
 import dev.tracedown.gateway.controllers.silences.SilenceController
 import dev.tracedown.gateway.data.silences.CreateSilenceRequest
 import dev.tracedown.gateway.util.NotFoundException
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.v1.jdbc.Database
@@ -272,13 +273,15 @@ class ReadScopingTest {
         // naming org B's result and step. Authorization cannot refuse this —
         // the service argument is theirs — so the query must.
         assertThrows(NotFoundException::class.java) {
-            ProbeResultController.getStepBody(
-                orgId = orgA.id,
-                serviceId = orgA.serviceId,
-                resultId = orgB.resultId,
-                stepId = orgB.stepId,
-                userId = ownerA,
-            )
+            runBlocking {
+                ProbeResultController.getStepBody(
+                    orgId = orgA.id,
+                    serviceId = orgA.serviceId,
+                    resultId = orgB.resultId,
+                    stepId = orgB.stepId,
+                    userId = ownerA,
+                )
+            }
         }
     }
 
@@ -287,13 +290,15 @@ class ReadScopingTest {
         // Same org, but the step belongs to a different result than the one
         // named: the pair has to agree, not merely exist.
         assertThrows(NotFoundException::class.java) {
-            ProbeResultController.getStepBody(
-                orgId = orgA.id,
-                serviceId = orgA.serviceId,
-                resultId = orgA.resultId,
-                stepId = orgB.stepId,
-                userId = ownerA,
-            )
+            runBlocking {
+                ProbeResultController.getStepBody(
+                    orgId = orgA.id,
+                    serviceId = orgA.serviceId,
+                    resultId = orgA.resultId,
+                    stepId = orgB.stepId,
+                    userId = ownerA,
+                )
+            }
         }
     }
 
@@ -301,13 +306,15 @@ class ReadScopingTest {
     fun `your own step body still resolves`() {
         // The refusals above have to be the scoping, not a lookup that cannot
         // reach any body at all: this one hands back the bytes.
-        val body = ProbeResultController.getStepBody(
-            orgId = orgA.id,
-            serviceId = orgA.serviceId,
-            resultId = orgA.resultId,
-            stepId = orgA.stepId,
-            userId = ownerA,
-        )
+        val body = runBlocking {
+            ProbeResultController.getStepBody(
+                orgId = orgA.id,
+                serviceId = orgA.serviceId,
+                resultId = orgA.resultId,
+                stepId = orgA.stepId,
+                userId = ownerA,
+            )
+        }
         assertNotNull(body)
         assertEquals(BodyStorageClient.BodyContent.Inline(bodyOf("a")), body)
     }

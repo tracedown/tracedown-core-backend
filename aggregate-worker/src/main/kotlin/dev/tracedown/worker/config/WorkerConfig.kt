@@ -105,14 +105,25 @@ data class WorkerConfig(
                         timeoutSeconds = config.propertyOrNull("storage.s3.timeoutSeconds")?.getString()?.toLongOrNull() ?: 30L,
                     )
                 },
-                bodyConfinement = BodyConfinement(
-                    filesystemRoot = Path.of(
-                        config.propertyOrNull("storage.filesystemRoot")?.getString()?.takeIf { it.isNotBlank() }
-                            ?: "/data/bodies",
-                    ),
-                    s3Bucket = config.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() },
-                    s3KeyPrefix = config.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
-                ),
+                bodyConfinement = run {
+                    val root = config.propertyOrNull("storage.filesystemRoot")?.getString()?.takeIf { it.isNotBlank() }
+                    val bucket = config.propertyOrNull("storage.s3.bucket")?.getString()?.takeIf { it.isNotBlank() }
+                    // Deletions are confined to platform storage — but only to
+                    // what the operator actually named. A worker upgraded into
+                    // this release without STORAGE_S3_BUCKET or
+                    // STORAGE_FILESYSTEM_ROOT keeps deleting as it did, rather
+                    // than purging rows and orphaning every object behind them;
+                    // Application says so at startup.
+                    BodyConfinement(
+                        filesystemRoot = root?.let { Path.of(it) },
+                        s3Bucket = bucket,
+                        s3KeyPrefix = config.propertyOrNull("storage.s3.prefix")?.getString() ?: "",
+                        unconfinedSchemes = buildSet {
+                            if (root == null) add("file")
+                            if (bucket == null) add("s3")
+                        },
+                    )
+                },
             )
         }
     }

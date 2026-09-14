@@ -8,6 +8,7 @@ import com.zaxxer.hikari.HikariDataSource
 import dev.tracedown.gateway.cli.AgentBootstrap
 import dev.tracedown.gateway.cli.AgentRemove
 import dev.tracedown.gateway.cli.OrgBootstrap
+import dev.tracedown.gateway.cli.RewrapBodyStores
 import dev.tracedown.gateway.cli.RewrapOrgKeys
 import dev.tracedown.gateway.controllers.agents.CaService
 import dev.tracedown.common.config.DatabaseFactory
@@ -35,6 +36,17 @@ import java.util.concurrent.CountDownLatch
  * and last the scheduler with an embedded in-process Lace executor replacing
  * external probe agents. The frontend bundle, when baked in, is served from
  * the gateway's origin.
+ *
+ * **Body stores do not apply here.** Every service's routes are mounted as they
+ * are — the monolith gates nothing per feature — so Settings still shows the
+ * body-store screens, and the CLI still takes `--agent-bootstrap --body-store`
+ * and `--rewrap-body-stores`. But a body store is where an *agent* writes, and
+ * this edition has no agents: probes run in-process through
+ * [LocalLaceExecutionBackend], which writes bodies straight into
+ * STORAGE_FILESYSTEM_ROOT, and every result carries no `probeAgentId` to carry
+ * an assignment. A store created here is inert. (The frontend's `bodyStores`
+ * feature gate is the place to switch the screens off for a host that would
+ * rather not show them.)
  *
  * Requires DATABASE_URL / DATABASE_USER / DATABASE_PASSWORD and REDIS_A_URL.
  * REDIS_B_URL defaults to REDIS_A_URL. Per-service ports come from
@@ -68,6 +80,7 @@ fun main(args: Array<String>) {
     if (AgentRemove.handle(args)) return
     if (OrgBootstrap.handle(args)) return
     if (RewrapOrgKeys.handle(args)) return
+    if (RewrapBodyStores.handle(args)) return
 
     val dbUrl = requireEnv("DATABASE_URL")
     val dbUser = requireEnv("DATABASE_USER")

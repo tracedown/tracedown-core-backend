@@ -148,9 +148,19 @@ services:
       - "127.0.0.1:${GATEWAY_PORT:-20714}:20714"
     volumes:
       - tracedown-bodies:/data/bodies
+      # Filesystem body stores live here, shared with the ingestor. A store's
+      # root is a directory under this mount (never the mount itself).
+      - tracedown-stores:/data/stores
     environment:
       <<: [*db-env, *redis-env]
       PLATFORM_AES_KEY: ${PLATFORM_AES_KEY}
+      # A body store's credentials sit under a key of their own — the ingestor
+      # needs it too, and has no business holding the platform key.
+      BODY_STORE_AES_KEY: ${BODY_STORE_AES_KEY}
+      BODY_STORE_FILESYSTEM_BASES: /data/stores
+      # Allow a store on this stack's own network, over http. A deployment whose
+      # stores are public object storage should leave this unset.
+      BODY_STORE_PRIVATE_ENDPOINTS: "true"
       JWT_SECRET: ${JWT_SECRET}
       SINGLE_ORG_MODE: "true"
       DEMO_USER_EMAIL: admin@tracedown.dev
@@ -200,11 +210,16 @@ services:
       # Same bodies volume the gateway and agent mount — the ingestor
       # relocates agent-written bodies under this root as results land.
       - tracedown-bodies:/data/bodies
+      # The same store directories the gateway reads in_place bodies from.
+      - tracedown-stores:/data/stores
     environment:
       <<: *db-env
       REDIS_A_URL: ${REDIS_A_URL}
       # Decrypts a body store's credentials when an agent imports from it.
-      PLATFORM_AES_KEY: ${PLATFORM_AES_KEY}
+      # Only this — the platform key stays with the services that need it.
+      BODY_STORE_AES_KEY: ${BODY_STORE_AES_KEY}
+      BODY_STORE_FILESYSTEM_BASES: /data/stores
+      BODY_STORE_PRIVATE_ENDPOINTS: "true"
       PORT: 20820
     depends_on:
       tracedown-migrator:
@@ -280,8 +295,16 @@ services:
       target: worker
     container_name: tracedown-worker
     networks: [tracedown-net]
+    volumes:
+      # Retention and purge delete bodies from platform storage, so the worker
+      # needs the same bodies volume the ingestor writes into. It does NOT get
+      # the stores volume: a body in a body store is its owner's to keep.
+      - tracedown-bodies:/data/bodies
     environment:
       <<: [*db-env, *redis-env]
+      # Where platform storage is, so deletions are confined to it. Unset, the
+      # worker falls back to deleting any URI a row names and says so at startup.
+      STORAGE_FILESYSTEM_ROOT: /data/bodies
       RESULT_RETENTION_DAYS: "90"
       WORKER_INTERVAL_HOURLY_AGGREGATION: "300"
       WORKER_INTERVAL_DAILY_AGGREGATION: "600"
@@ -320,3 +343,7 @@ volumes:
   tracedown-pgdata:
   tracedown-redis-a-data:
   tracedown-bodies:
+  # Roots for filesystem body stores, mounted into the gateway (which reads
+  # in_place bodies) and the ingestor (which imports from them). Create a
+  # directory under it per store; the mount itself is never a store root.
+  tracedown-stores:

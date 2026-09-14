@@ -4,6 +4,7 @@ import dev.tracedown.common.alerts.AlertContext
 import dev.tracedown.common.alerts.SystemAlertRouting
 import dev.tracedown.common.alerts.SystemAlertService
 import dev.tracedown.common.logging.LogContext
+import dev.tracedown.common.models.BodyStores
 import dev.tracedown.common.models.Outbox
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
@@ -11,7 +12,12 @@ import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.storage.BodyStorageClient
 import dev.tracedown.common.storage.BodyStore
+import dev.tracedown.common.storage.AgentBodyStore
 import dev.tracedown.common.storage.BodyStoreRegistry
+import dev.tracedown.common.storage.BodyStoreSecretException
+import dev.tracedown.common.storage.BodyStoreService
+import dev.tracedown.common.storage.StorageConfinementException
+import dev.tracedown.common.storage.StoreEndpointBlockedException
 import kotlinx.serialization.json.*
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -143,20 +149,223 @@ object ResultPersistenceService {
         this.bodyRelocator = relocator
     }
 
-    /** Whether [agentPath] lies inside [store] — the confinement check, no I/O. */
-    private fun inPlaceContains(store: BodyStore, agentPath: String): Boolean = try {
-        BodyStorageClient(confinement = BodyStoreRegistry.confinementOf(store)).contains(agentPath)
+    /**
+     * Whether [agentPath] lies inside the part of [store] the agent [slug] writes
+     * to — the confinement check, no I/O.
+     */
+    private fun inPlaceContains(store: BodyStore, slug: String, agentPath: String): Boolean = try {
+        BodyStorageClient(confinement = BodyStoreRegistry.confinementOf(store, slug)).contains(agentPath)
     } catch (e: Exception) {
         log.warn("body store {} cannot confine bodies: {}", store.id, e.message)
         false
     }
 
-    /** A client confined to [store] to import from, or null when the store is unusable. */
-    private fun importSourceFor(store: BodyStore, serviceId: UUID, resultId: UUID): BodyStorageClient? = try {
-        BodyStoreRegistry.clientFor(store)
+    /**
+     * A client confined to the agent [slug]'s corner of [store] to import from,
+     * or null when the store is unusable.
+     */
+    private fun importSourceFor(store: BodyStore, slug: String, serviceId: UUID, resultId: UUID): BodyStorageClient? = try {
+        BodyStoreRegistry.clientFor(store, slug)
     } catch (e: Exception) {
+        BodyStoreService.recordFailure(store.id, failureCodeOf(e))
         log.warn("body store {} is unusable for service {} result {}: {}", store.id, serviceId, resultId, e.message)
         null
+    }
+
+    /** A short code for the store health row; the exception's own class when nothing better fits. */
+    private fun failureCodeOf(e: Throwable): String = when (e) {
+        is BodyStoreSecretException -> "secret_undecryptable"
+        is StorageConfinementException -> "root_not_permitted"
+        is StoreEndpointBlockedException -> "blocked_endpoint"
+        else -> "unreachable"
+    }
+
+    /**
+     * Stores whose organization did not match a result's, already warned about.
+     * The mismatch is a standing misconfiguration, not an event — one line per
+     * agent and organization is the whole of what an operator needs.
+     */
+    private val orgMismatchWarned = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * How many bodies one result may import, and how long the whole import may
+     * take. Ingestion is a single queue: a result whose store answers slowly must
+     * not hold the queue behind it, so past the budget the remaining bodies are
+     * recorded as unavailable — the run itself still lands, on time.
+     */
+    private const val MAX_IMPORTS_PER_RESULT = 16
+    private val IMPORT_BUDGET: Duration = Duration.ofSeconds(60)
+
+    /** Where each call's body ended up, decided before anything is written. */
+    private class BodyPlacement {
+        /** Call index → the URI to persist. */
+        val stored = HashMap<Int, String>()
+
+        /** Calls whose body could not be taken into storage at all. */
+        val unavailable = HashSet<Int>()
+
+        /** Calls whose body stays in the agent's store. */
+        val inPlace = HashSet<Int>()
+
+        /** Calls whose reported location was outside the agent's store. */
+        val outside = HashSet<Int>()
+
+        /** Calls dropped because the agent's store belongs to another organization. */
+        val orgMismatch = HashSet<Int>()
+
+        /** The in_place store the kept bodies live in. */
+        var inPlaceStoreId: UUID? = null
+
+        /** Imported sources to remove, once the result has committed. */
+        val importedSources = mutableListOf<Pair<BodyStorageClient, String>>()
+
+        /** Copies made into the default store, to remove if the result does not commit. */
+        val copies = mutableListOf<String>()
+    }
+
+    /**
+     * Decides, before anything is written, where each call's response body ends
+     * up. Nothing here touches the database beyond reading the agent's store.
+     *
+     * Where the agent wrote the body depends on the body store it is assigned
+     * (`probe_agents.body_store_id`):
+     * - **none** — the default store; the bytes are relocated to a server-derived,
+     *   tenant-scoped key, exactly as before body stores existed.
+     * - **import** — the agent's own store; the body is copied into the default
+     *   store through a client confined to the agent's corner of that store, and
+     *   recorded there like any relocated one. The source is removed only after
+     *   the result commits.
+     * - **in_place** — the body stays where it is. Its location is accepted only
+     *   when it lies inside the agent's own sub-prefix of the store, and is then
+     *   recorded verbatim with the store's id; anything else is
+     *   `outsideAssignedStore`, never trusted.
+     *
+     * Two rules cut across all three:
+     * - a body that already lies **inside the default store** is always relocated
+     *   as if no store were assigned. An agent keeps writing where its own
+     *   configuration says until it is redeployed, so every move to or from a
+     *   store has a window in which that is exactly what happens — and nothing
+     *   written in that window should be lost to it;
+     * - a store of **another organization** is never used. The agent's assignment
+     *   crossed an organization boundary; the body is dropped with
+     *   `storeOrgMismatch` rather than filed under the wrong owner.
+     */
+    private fun placeBodies(
+        calls: JsonArray?,
+        agentId: Long?,
+        organizationId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+    ): BodyPlacement {
+        val placement = BodyPlacement()
+        if (calls == null) return placement
+        val relocator = bodyRelocator
+        val reported = calls.withIndex().mapNotNull { (index, callElement) ->
+            val resp = callElement.jsonObject["response"] as? JsonObject ?: return@mapNotNull null
+            val agentPath = resp["bodyPath"]?.jsonPrimitive?.contentOrNull
+            if (agentPath.isNullOrBlank()) null else index to agentPath
+        }
+        if (reported.isEmpty()) return placement
+
+        val assigned = if (agentId != null) BodyStoreRegistry.storeOfAgent(agentId) else null
+        val store = assigned?.store?.takeIf { it.organizationId == organizationId }
+        if (assigned != null && store == null) {
+            warnOrgMismatch(assigned, organizationId)
+        }
+        if (store?.inPlace == true) placement.inPlaceStoreId = store.id
+
+        // Built at most once per result: the source side of an import.
+        val importSource by lazy {
+            store?.let { importSourceFor(it, assigned.slug, serviceId, resultId) }
+        }
+        val deadline = Instant.now().plus(IMPORT_BUDGET)
+        var imports = 0
+
+        for ((index, agentPath) in reported) {
+            val ownDefault = relocator?.ownsLocation(agentPath) == true
+            when {
+                assigned != null && store == null && !ownDefault -> placement.orgMismatch.add(index)
+
+                store == null || ownDefault -> {
+                    val relocated = relocator?.relocate(
+                        agentBodyPath = agentPath,
+                        organizationId = organizationId,
+                        serviceId = serviceId,
+                        resultId = resultId,
+                        callIndex = index,
+                    )
+                    if (relocated != null) placement.stored[index] = relocated else placement.unavailable.add(index)
+                }
+
+                store.inPlace -> {
+                    if (inPlaceContains(store, assigned.slug, agentPath)) {
+                        placement.stored[index] = agentPath
+                        placement.inPlace.add(index)
+                    } else {
+                        log.warn(
+                            "agent {} reported a body outside its own prefix in store {} for service {} result {}",
+                            assigned.slug, store.id, serviceId, resultId,
+                        )
+                        placement.outside.add(index)
+                    }
+                }
+
+                imports >= MAX_IMPORTS_PER_RESULT || Instant.now().isAfter(deadline) -> {
+                    log.warn(
+                        "import budget spent on result {} for service {} — body {} left in store {}",
+                        resultId, serviceId, index, store.id,
+                    )
+                    placement.unavailable.add(index)
+                }
+
+                else -> {
+                    imports++
+                    val source = importSource
+                    val imported = if (source == null) null else relocator?.importFrom(
+                        source = source,
+                        agentBodyPath = agentPath,
+                        organizationId = organizationId,
+                        serviceId = serviceId,
+                        resultId = resultId,
+                        callIndex = index,
+                    )
+                    if (imported != null && source != null) {
+                        placement.stored[index] = imported
+                        placement.copies.add(imported)
+                        placement.importedSources.add(source to agentPath)
+                        BodyStoreService.clearFailure(store.id)
+                    } else {
+                        if (source != null) BodyStoreService.recordFailure(store.id, "unreachable")
+                        placement.unavailable.add(index)
+                    }
+                }
+            }
+        }
+        return placement
+    }
+
+    /**
+     * The two irreversible halves of an import, in the only order that cannot
+     * lose a body: the source goes once the row naming the copy has committed,
+     * and the copy goes when it has not. Neither ever throws.
+     */
+    private fun settleImports(placement: BodyPlacement, committed: Boolean) {
+        val relocator = bodyRelocator ?: return
+        if (committed) {
+            for ((source, uri) in placement.importedSources) relocator.removeImported(source, uri)
+        } else {
+            for (uri in placement.copies) relocator.dropCopy(uri)
+        }
+    }
+
+    /** One WARN per agent and organization: a standing misconfiguration, not an event. */
+    private fun warnOrgMismatch(assigned: AgentBodyStore, organizationId: UUID) {
+        if (!orgMismatchWarned.add("${assigned.slug}:$organizationId")) return
+        log.warn(
+            "agent {} is assigned body store {}, which belongs to another organization than the results it runs — " +
+                "its bodies are not being stored. Assign a store of this organization, or none.",
+            assigned.slug, assigned.store.id,
+        )
     }
 
     /**
@@ -253,61 +462,14 @@ object ResultPersistenceService {
         //               accepted only if it lies inside that store, and is then
         //               recorded verbatim with the store's id; anything outside
         //               it is recorded as `outsideAssignedStore`, never trusted.
-        val relocatedBodies = HashMap<Int, String>()
-        val bodyRelocationFailed = HashSet<Int>()
-        val inPlaceBodies = HashSet<Int>()
-        val outsideAssignedStore = HashSet<Int>()
-        var inPlaceStoreId: UUID? = null
-        if (calls != null) {
-            val relocator = bodyRelocator
-            val reported = calls.withIndex().mapNotNull { (index, callElement) ->
-                val resp = callElement.jsonObject["response"] as? JsonObject ?: return@mapNotNull null
-                val agentPath = resp["bodyPath"]?.jsonPrimitive?.contentOrNull
-                if (agentPath.isNullOrBlank()) null else index to agentPath
-            }
-            val store = if (reported.isNotEmpty() && agentId != null) BodyStoreRegistry.storeOfAgent(agentId) else null
-            if (store?.inPlace == true) inPlaceStoreId = store.id
-            // Built at most once per result: the source side of an import.
-            val importSource by lazy { store?.let { importSourceFor(it, serviceId, resultId) } }
-            for ((index, agentPath) in reported) {
-                when {
-                    store == null -> {
-                        val relocated = relocator?.relocate(
-                            agentBodyPath = agentPath,
-                            organizationId = organizationId,
-                            serviceId = serviceId,
-                            resultId = resultId,
-                            callIndex = index,
-                        )
-                        if (relocated != null) relocatedBodies[index] = relocated else bodyRelocationFailed.add(index)
-                    }
-                    store.inPlace -> {
-                        if (inPlaceContains(store, agentPath)) {
-                            relocatedBodies[index] = agentPath
-                            inPlaceBodies.add(index)
-                        } else {
-                            log.warn(
-                                "agent {} reported a body outside its store {} for service {} result {}",
-                                agentId, store.id, serviceId, resultId,
-                            )
-                            outsideAssignedStore.add(index)
-                        }
-                    }
-                    else -> {
-                        val source = importSource
-                        val imported = if (source == null) null else relocator?.importFrom(
-                            source = source,
-                            agentBodyPath = agentPath,
-                            organizationId = organizationId,
-                            serviceId = serviceId,
-                            resultId = resultId,
-                            callIndex = index,
-                        )
-                        if (imported != null) relocatedBodies[index] = imported else bodyRelocationFailed.add(index)
-                    }
-                }
-            }
-        }
+        val placement = placeBodies(calls, agentId, organizationId, serviceId, resultId)
+        val relocatedBodies = placement.stored
+        val bodyRelocationFailed = placement.unavailable
+        val inPlaceBodies = placement.inPlace
+        val outsideAssignedStore = placement.outside
+        val storeOrgMismatch = placement.orgMismatch
+        var inPlaceStoreId = placement.inPlaceStoreId
+        var committed = false
 
         // The primary key is the backstop behind the redelivery check above: two
         // consumers handed the same message (a reclaim racing the consumer that
@@ -315,6 +477,23 @@ object ResultPersistenceService {
         // is the intended outcome, not an error — the row exists either way.
         try {
         transaction {
+            // 0. A body kept in a store may only be recorded while that store
+            // still exists. Locking the row holds a concurrent delete off until
+            // this result commits — the delete then sees the step and is refused
+            // with `body_store_in_use`, instead of this insert hitting the
+            // foreign key and sending a perfectly good result to the dead-letter
+            // list. A store that is already gone simply loses its bodies here.
+            inPlaceStoreId?.let { id ->
+                val alive = BodyStores.selectAll().where { BodyStores.id eq id }.forUpdate().limit(1).any()
+                if (!alive) {
+                    log.warn("body store {} was removed while result {} was being ingested", id, resultId)
+                    outsideAssignedStore.addAll(inPlaceBodies)
+                    inPlaceBodies.forEach { relocatedBodies.remove(it) }
+                    inPlaceBodies.clear()
+                    inPlaceStoreId = null
+                }
+            }
+
             // 1. Insert probe_results
             ProbeResults.insert {
                 it[id] = resultId
@@ -385,6 +564,7 @@ object ResultPersistenceService {
                             withheld = envelope["bodiesWithheld"]?.jsonPrimitive?.contentOrNull,
                             relocationFailed = index in bodyRelocationFailed,
                             outsideAssignedStore = index in outsideAssignedStore,
+                            storeOrgMismatch = index in storeOrgMismatch,
                         )
                         it[error] = call["error"]?.jsonPrimitive?.contentOrNull
                         it[createdAt] = startedAt
@@ -518,13 +698,19 @@ object ResultPersistenceService {
                 it[createdAt] = startedAt
             }
         }
+        committed = true
         } catch (e: Exception) {
             if (isDuplicateResult(e)) {
                 log.info("result {} for service {} was persisted concurrently — redelivery ignored", resultId, serviceId)
+                // The other delivery persisted its own copies; these are ours and
+                // nothing names them.
+                settleImports(placement, committed = false)
                 return PersistOutcome.ALREADY_PERSISTED
             }
+            settleImports(placement, committed = false)
             throw e
         }
+        settleImports(placement, committed = true)
 
         log.debug("persisted result {} for service {} status={}", resultId, serviceId, status)
 

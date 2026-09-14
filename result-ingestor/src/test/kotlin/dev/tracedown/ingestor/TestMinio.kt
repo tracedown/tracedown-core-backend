@@ -47,6 +47,10 @@ object TestMinio {
         )
     }
 
+    /** The object's bytes — for asserting that something was NOT touched. */
+    fun get(bucket: String, key: String): ByteArray =
+        client.getObject(io.minio.GetObjectArgs.builder().bucket(bucket).`object`(key).build()).use { it.readBytes() }
+
     fun exists(bucket: String, key: String): Boolean = try {
         client.statObject(StatObjectArgs.builder().bucket(bucket).`object`(key).build())
         true

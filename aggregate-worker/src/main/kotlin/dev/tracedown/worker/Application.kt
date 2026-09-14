@@ -61,7 +61,18 @@ fun Application.module() {
     // confined to platform storage: a stored URI outside it is skipped.
     val storageClient = BodyStorageClient(s3Config = config.s3Config, confinement = config.bodyConfinement)
     if (config.s3Config != null && config.bodyConfinement.s3Bucket == null) {
-        log.warn("storage.s3.endpoint is set but storage.s3.bucket is not — s3:// bodies will not be deleted; set STORAGE_S3_BUCKET")
+        log.warn(
+            "STORAGE_S3_ENDPOINT is set but STORAGE_S3_BUCKET is not — s3:// body deletions are running " +
+                "unconfined, exactly as before this release. Set STORAGE_S3_BUCKET (and STORAGE_S3_PREFIX) " +
+                "to the same values the result-ingestor uses, so retention and purge can only ever delete " +
+                "the platform's own bodies.",
+        )
+    }
+    if (config.bodyConfinement.filesystemRoot == null) {
+        log.warn(
+            "STORAGE_FILESYSTEM_ROOT is not set — file:// body deletions are running unconfined, exactly " +
+                "as before this release. Set it to the same value the result-ingestor uses.",
+        )
     }
 
     // Redis B (ephemeral cache) — lazy init for metrics percentile cache

@@ -15,6 +15,7 @@ import dev.tracedown.gateway.controllers.integrations.GrafanaIntegrationControll
 import dev.tracedown.gateway.cli.AgentBootstrap
 import dev.tracedown.gateway.cli.AgentRemove
 import dev.tracedown.gateway.cli.OrgBootstrap
+import dev.tracedown.gateway.cli.RewrapBodyStores
 import dev.tracedown.gateway.cli.RewrapOrgKeys
 import dev.tracedown.gateway.jobs.SecretReencryption
 import dev.tracedown.common.onboarding.OrgService
@@ -103,6 +104,7 @@ fun main(args: Array<String>) {
     if (AgentRemove.handle(args)) return
     if (OrgBootstrap.handle(args)) return
     if (RewrapOrgKeys.handle(args)) return
+    if (RewrapBodyStores.handle(args)) return
     EngineMain.main(args)
 }
 
@@ -263,10 +265,16 @@ fun Application.module() {
     // confined client per store; the default store above is described for the
     // dashboard (and so a store can never be created over it).
     dev.tracedown.common.storage.BodyStoreRegistry.configure(
-        deploymentEnvironment = storageConf.propertyOrNull("deployment.environment")?.getString(),
         filesystemBases = storageConf.propertyOrNull("storage.stores.filesystemBases")?.getString(),
+        allowPrivateEndpoints = storageConf.propertyOrNull("storage.stores.privateEndpoints")
+            ?.getString()?.trim()?.lowercase() == "true",
         timeoutSeconds = storageS3?.timeoutSeconds ?: 30L,
     )
+    // A store's credentials sit under their own key, not the platform one: the
+    // result-ingestor needs them too and has no business holding the key that
+    // unwraps TOTP secrets, the CA root and every org's data-encryption key.
+    storageConf.propertyOrNull("storage.stores.aesKey")?.getString()?.takeIf { it.isNotBlank() }
+        ?.let { dev.tracedown.common.storage.BodyStoreCrypto.init(it) }
     dev.tracedown.common.storage.BodyStoreService.configureDefault(
         if (storageS3 != null) {
             dev.tracedown.common.storage.DefaultBodyStore(
@@ -277,6 +285,9 @@ fun Application.module() {
             dev.tracedown.common.storage.DefaultBodyStore(kind = "filesystem", rootPath = storageRoot, filesystemRoot = storageRoot)
         },
     )
+    // Said once, loudly: with stores configured and no key, every read of a
+    // body in one fails and the reason only shows per request.
+    dev.tracedown.common.storage.BodyStoreService.warnIfSecretsUnreadable("api-gateway")
 
     // Provider, not an instance: constructing it must not force the lazy
     // connection and drag Redis into module init (see EmailPublisher).
