@@ -16,7 +16,7 @@ object TestMinio {
     const val USER = "minioadmin"
     const val PASSWORD = "minioadmin-secret"
 
-    val container: GenericContainer<*> = GenericContainer(DockerImageName.parse("minio/minio:RELEASE.2025-04-22T22-12-26Z"))
+    val container: GenericContainer<*> = GenericContainer(DockerImageName.parse("quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"))
         .withCommand("server", "/data")
         .withEnv("MINIO_ROOT_USER", USER)
         .withEnv("MINIO_ROOT_PASSWORD", PASSWORD)
