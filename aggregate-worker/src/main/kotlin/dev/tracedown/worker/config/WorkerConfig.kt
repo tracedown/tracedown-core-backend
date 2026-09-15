@@ -28,6 +28,17 @@ data class WorkerConfig(
     val redisBUrl: String,
     /** Global default retention for raw probe results in days. Zero or negative keeps forever. */
     val resultRetentionDays: Int,
+    /**
+     * Global default retention for stored response bodies in days, independent
+     * of [resultRetentionDays]. Zero or negative keeps bodies for as long as
+     * their results — a body is only reachable through its `probe_steps` row,
+     * so it can never outlive the result that owns it. With both positive the
+     * effective body lifetime is the smaller of the two.
+     *
+     * Bodies in an `in_place` body store (`probe_steps.body_store_id` set) are
+     * the store owner's and are outside both windows.
+     */
+    val bodyRetentionDays: Int,
     /** How long to keep hourly aggregates in days. Zero or negative keeps forever. */
     val hourlyAggregateRetentionDays: Int,
     /** How long to keep agent health-check history in days. Zero or negative keeps forever. */
@@ -70,6 +81,8 @@ data class WorkerConfig(
                 redisAUrl = config.property("redis.a.url").getString(),
                 redisBUrl = config.property("redis.b.url").getString(),
                 resultRetentionDays = config.propertyOrNull("worker.resultRetentionDays")
+                    ?.getString()?.toInt() ?: 90,
+                bodyRetentionDays = config.propertyOrNull("worker.bodyRetentionDays")
                     ?.getString()?.toInt() ?: 90,
                 hourlyAggregateRetentionDays = config.propertyOrNull("worker.hourlyAggregateRetentionDays")
                     ?.getString()?.toInt() ?: 365,

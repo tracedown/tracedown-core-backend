@@ -1,5 +1,6 @@
 package dev.tracedown.ingestor.services
 
+import dev.tracedown.common.models.BodyNotStoredReasons
 import dev.tracedown.common.storage.BodyStoreService
 
 /**
@@ -35,6 +36,13 @@ object BodyNotStoredReason {
 
     /** The store the body lived in was removed with its bodies (`forgetBodies`). */
     const val STORE_REMOVED = BodyStoreService.REASON_STORE_REMOVED
+
+    /**
+     * The body outlived the body-retention window while its result did not
+     * reach the result window — written by the aggregate-worker's retention
+     * body pass, never by ingestion.
+     */
+    const val BODY_EXPIRED = BodyNotStoredReasons.BODY_EXPIRED
 
     /**
      * [reported] is the executor's `bodyNotCapturedReason` (spec §9), [withheld]

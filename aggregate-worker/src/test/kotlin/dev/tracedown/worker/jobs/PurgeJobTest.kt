@@ -36,7 +36,9 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.v1.core.Table
+import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.isNotNull
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -191,6 +193,20 @@ class PurgeJobTest {
                 it[ProbeResults.projectId] = projectId
                 it[workspaceId] = wsId
                 it[organizationId] = orgId
+            }
+            return id
+        }
+
+        /** A default-store step with an explicit step number. */
+        private fun insertStepAt(resultId: UUID, bodyUrl: String?, stepNumber: Short): UUID {
+            val id = UUID.randomUUID()
+            ProbeSteps.insert {
+                it[ProbeSteps.id] = id
+                it[probeResultId] = resultId
+                it[stepNum] = stepNumber
+                it[requestUrl] = "https://example.test/"
+                it[responseBodyStorageUrl] = bodyUrl
+                it[createdAt] = NOW
             }
             return id
         }
@@ -1328,6 +1344,285 @@ class PurgeJobTest {
         transaction {
             assertEquals(0, count(PasswordResetTokens, PasswordResetTokens.id eq expired))
             assertEquals(1, count(PasswordResetTokens, PasswordResetTokens.id eq live))
+        }
+    }
+
+
+    // ── Retention body pass (the body window, separate from the result window) ──
+
+    /**
+     * An org, a result aged [resultAgeDays] days, and one default-store body on
+     * it. Returns the result id and the step id.
+     */
+    private fun agedResultWithBody(
+        resultAgeDays: Long,
+        bodyUrl: String,
+    ): Triple<UUID, UUID, UUID> {
+        lateinit var org: UUID
+        lateinit var result: UUID
+        lateinit var step: UUID
+        transaction {
+            val owner = insertUser()
+            org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            val svc = insertService(proj)
+            result = insertResult(svc, proj, ws, org)
+            ProbeResults.update({ ProbeResults.id eq result }) {
+                it[startedAt] = NOW.minus(resultAgeDays, ChronoUnit.DAYS)
+            }
+            step = insertStep(result, bodyUrl)
+        }
+        return Triple(org, result, step)
+    }
+
+    private fun stepRow(stepId: UUID) =
+        ProbeSteps.selectAll().where { ProbeSteps.id eq stepId }.single()
+
+    /** Installs [config] for the duration of [block], then puts the default back. */
+    private fun <T> withRetentionConfig(config: dev.tracedown.common.config.RetentionConfig, block: () -> T): T {
+        val previous = dev.tracedown.common.config.PlatformDefaults.retentionConfig
+        dev.tracedown.common.config.PlatformDefaults.retentionConfig = config
+        try {
+            return block()
+        } finally {
+            dev.tracedown.common.config.PlatformDefaults.retentionConfig = previous
+        }
+    }
+
+    @Test
+    fun `the body pass expires a body and records the reason while the result stays`() {
+        val storage = FakeStorage()
+        // 40 days old: past the 7-day body window, well inside the 365-day result window.
+        val (_, result, step) = agedResultWithBody(40, "s3://bodies/expired-by-body-window")
+
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 365,
+                storageClient = storage,
+                defaultBodyRetentionDays = 7,
+            ).execute()
+        }
+
+        assertTrue(storage.deleted.contains("s3://bodies/expired-by-body-window"), "the object is deleted")
+        transaction {
+            assertEquals(1, count(ProbeResults, ProbeResults.id eq result), "the result itself is kept")
+            val row = stepRow(step)
+            assertNull(row[ProbeSteps.responseBodyStorageUrl], "the body URL is cleared")
+            assertEquals("bodyExpired", row[ProbeSteps.bodyNotStoredReason])
+            assertEquals(
+                0, count(PendingBodyDeletions, PendingBodyDeletions.storageUrl eq "s3://bodies/expired-by-body-window"),
+                "a body that went nowhere near a failure is not queued",
+            )
+        }
+    }
+
+    @Test
+    fun `a body younger than the body window is kept`() {
+        val storage = FakeStorage()
+        val (_, _, step) = agedResultWithBody(3, "s3://bodies/still-young")
+
+        runBlocking {
+            RetentionJob(defaultRetentionDays = 365, storageClient = storage, defaultBodyRetentionDays = 7).execute()
+        }
+
+        assertTrue(storage.deleted.isEmpty(), "nothing is deleted")
+        transaction {
+            assertEquals("s3://bodies/still-young", stepRow(step)[ProbeSteps.responseBodyStorageUrl])
+            assertNull(stepRow(step)[ProbeSteps.bodyNotStoredReason])
+        }
+    }
+
+    @Test
+    fun `the body pass leaves an in_place body and its row alone`() {
+        val root = java.nio.file.Files.createTempDirectory("body-window-in-place").toRealPath()
+        val inPlaceBody = root.resolve("kept.json").also { java.nio.file.Files.writeString(it, "store owner's") }
+        val defaultBody = root.resolve("expired.json").also { java.nio.file.Files.writeString(it, "{}") }
+        lateinit var org: UUID
+        lateinit var result: UUID
+        lateinit var inPlaceStep: UUID
+        lateinit var defaultStep: UUID
+        transaction {
+            val owner = insertUser()
+            org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            val svc = insertService(proj)
+            result = insertResult(svc, proj, ws, org)
+            ProbeResults.update({ ProbeResults.id eq result }) {
+                it[startedAt] = NOW.minus(40, ChronoUnit.DAYS)
+            }
+            defaultStep = insertStep(result, "file://$defaultBody")
+            insertInPlaceStep(org, result, root, "file://$inPlaceBody")
+            inPlaceStep = ProbeSteps.selectAll()
+                .where { (ProbeSteps.probeResultId eq result) and ProbeSteps.bodyStoreId.isNotNull() }
+                .single()[ProbeSteps.id]
+        }
+
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 365,
+                storageClient = BodyStorageClient(
+                    confinement = dev.tracedown.common.storage.BodyConfinement(filesystemRoot = root),
+                ),
+                defaultBodyRetentionDays = 7,
+            ).execute()
+        }
+
+        transaction {
+            assertEquals(1, count(ProbeResults, ProbeResults.id eq result), "the result is kept")
+            assertNull(stepRow(defaultStep)[ProbeSteps.responseBodyStorageUrl], "the default-store body expires")
+            assertEquals(
+                "file://$inPlaceBody", stepRow(inPlaceStep)[ProbeSteps.responseBodyStorageUrl],
+                "the in_place body keeps its URL",
+            )
+            assertNull(stepRow(inPlaceStep)[ProbeSteps.bodyNotStoredReason])
+        }
+        assertFalse(java.nio.file.Files.exists(defaultBody), "the default store's body is deleted")
+        assertTrue(java.nio.file.Files.exists(inPlaceBody), "the in_place body is left to its store")
+    }
+
+    @Test
+    fun `the body window off expires nothing by age but the result pass still takes bodies with rows`() {
+        val storage = FakeStorage()
+        val (_, oldResult, oldStep) = agedResultWithBody(400, "s3://bodies/past-the-result-window")
+        val (_, youngResult, youngStep) = agedResultWithBody(40, "s3://bodies/inside-the-result-window")
+
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 90,
+                storageClient = storage,
+                defaultBodyRetentionDays = -1,
+            ).execute()
+        }
+
+        transaction {
+            assertEquals(0, count(ProbeResults, ProbeResults.id eq oldResult), "the result pass took the old result")
+            assertEquals(0, count(ProbeSteps, ProbeSteps.id eq oldStep), "and its step row")
+            assertEquals(1, count(ProbeResults, ProbeResults.id eq youngResult))
+            assertEquals(
+                "s3://bodies/inside-the-result-window", stepRow(youngStep)[ProbeSteps.responseBodyStorageUrl],
+                "with no body window, a body lives exactly as long as its result",
+            )
+        }
+        assertTrue(storage.deleted.contains("s3://bodies/past-the-result-window"))
+        assertFalse(storage.deleted.contains("s3://bodies/inside-the-result-window"))
+    }
+
+    @Test
+    fun `a per-org body window overrides the global one`() {
+        val storage = FakeStorage()
+        val (expiringOrg, _, expiringStep) = agedResultWithBody(40, "s3://bodies/org-window-7")
+        val (_, _, keptStep) = agedResultWithBody(40, "s3://bodies/global-window-365")
+
+        val config = object : dev.tracedown.common.config.RetentionConfig {
+            override fun resultRetentionDays(orgId: UUID) = -1
+            override fun bodyRetentionDays(orgId: UUID) = if (orgId == expiringOrg) 7 else -1
+        }
+
+        withRetentionConfig(config) {
+            runBlocking {
+                RetentionJob(
+                    defaultRetentionDays = 3650,
+                    storageClient = storage,
+                    defaultBodyRetentionDays = 365,
+                ).execute()
+            }
+        }
+
+        transaction {
+            assertNull(stepRow(expiringStep)[ProbeSteps.responseBodyStorageUrl], "the org's own 7-day window applies")
+            assertEquals("bodyExpired", stepRow(expiringStep)[ProbeSteps.bodyNotStoredReason])
+            assertEquals(
+                "s3://bodies/global-window-365", stepRow(keptStep)[ProbeSteps.responseBodyStorageUrl],
+                "an org with no override falls back to the global 365-day window",
+            )
+        }
+    }
+
+    @Test
+    fun `a body the storage client refuses keeps its URL and is queued for retry`() {
+        val (_, result, step) = agedResultWithBody(40, "s3://bodies/refused-by-storage")
+
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 365,
+                storageClient = FakeStorage(failWith = RuntimeException("bucket down")),
+                defaultBodyRetentionDays = 7,
+            ).execute()
+        }
+
+        transaction {
+            assertEquals(1, count(ProbeResults, ProbeResults.id eq result))
+            assertEquals(
+                "s3://bodies/refused-by-storage", stepRow(step)[ProbeSteps.responseBodyStorageUrl],
+                "the row is the only reference to a body still in the bucket — it is kept",
+            )
+            assertNull(stepRow(step)[ProbeSteps.bodyNotStoredReason], "nothing expired, so no reason is recorded")
+            val pending = PendingBodyDeletions.selectAll()
+                .where { PendingBodyDeletions.storageUrl eq "s3://bodies/refused-by-storage" }
+                .single()
+            assertEquals("bucket down", pending[PendingBodyDeletions.lastError])
+        }
+    }
+
+    @Test
+    fun `the body pass stops on the tick budget and resumes on the next tick`() {
+        val storage = FakeStorage()
+        lateinit var org: UUID
+        lateinit var result: UUID
+        transaction {
+            val owner = insertUser()
+            org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val proj = insertProject(ws)
+            val svc = insertService(proj)
+            result = insertResult(svc, proj, ws, org)
+            ProbeResults.update({ ProbeResults.id eq result }) {
+                it[startedAt] = NOW.minus(40, ChronoUnit.DAYS)
+            }
+            repeat(4) { i -> insertStepAt(result, "s3://bodies/budget-$i", (i + 1).toShort()) }
+        }
+
+        // One body per round, against a clock that advances 300 ms per reading:
+        // the one-second budget runs out a couple of rounds in, with bodies left.
+        var readings = 0L
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 365,
+                storageClient = storage,
+                defaultBodyRetentionDays = 7,
+                batchSize = 1,
+                tickBudget = java.time.Duration.ofSeconds(1),
+                clock = { NOW.plusMillis(readings++ * 300) },
+            ).execute()
+        }
+
+        transaction {
+            val remaining = ProbeSteps.selectAll()
+                .where { (ProbeSteps.probeResultId eq result) and ProbeSteps.responseBodyStorageUrl.isNotNull() }
+                .count()
+            assertTrue(remaining in 1..3, "the tick stopped early, leaving work behind (remaining=$remaining)")
+            assertEquals(1, count(ProbeResults, ProbeResults.id eq result), "the result pass never ran")
+        }
+
+        // The next tick, with a real budget, finishes the rest.
+        runBlocking {
+            RetentionJob(
+                defaultRetentionDays = 365,
+                storageClient = storage,
+                defaultBodyRetentionDays = 7,
+                batchSize = 1,
+            ).execute()
+        }
+        transaction {
+            assertEquals(
+                0,
+                ProbeSteps.selectAll()
+                    .where { (ProbeSteps.probeResultId eq result) and ProbeSteps.responseBodyStorageUrl.isNotNull() }
+                    .count(),
+                "the remainder is expired on the next tick",
+            )
         }
     }
 

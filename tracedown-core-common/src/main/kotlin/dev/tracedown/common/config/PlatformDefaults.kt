@@ -39,11 +39,33 @@ interface OrgConfig {
     }
 }
 
-/** Data retention configuration — controls how long probe results are kept. */
+/**
+ * Data retention configuration — how long probe results, and the response
+ * bodies hanging off them, are kept.
+ *
+ * The two windows are independent settings, but not independent lifetimes: a
+ * stored body is reachable only through its `probe_steps` row, so it can never
+ * outlive the result that owns it. With both windows positive the effective
+ * body lifetime is `min(body, result)`; with the body window off the body lives
+ * exactly as long as its result.
+ *
+ * Both accept -1 (or any value <= 0) to mean "use the global default", and a
+ * global default of <= 0 means "never expire by age".
+ */
 interface RetentionConfig {
 
     /** Returns the result retention period in days for an organization, or -1 to use the global default. */
     fun resultRetentionDays(orgId: UUID): Int
+
+    /**
+     * Returns the response-body retention period in days for an organization,
+     * or -1 to use the global default.
+     *
+     * A host that only distinguishes result windows need not override this: the
+     * default sends every organization to the global body window, which is what
+     * a deployment that has never configured one wants.
+     */
+    fun bodyRetentionDays(orgId: UUID): Int = -1
 
     /** Default: -1 (use global config value). */
     object Default : RetentionConfig {

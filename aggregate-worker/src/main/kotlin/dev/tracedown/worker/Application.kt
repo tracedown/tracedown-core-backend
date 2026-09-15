@@ -103,7 +103,14 @@ fun Application.module() {
             resultRetentionDays = config.resultRetentionDays,
         )
     )
-    jobScope.launchJob(RetentionJob(defaultRetentionDays = config.resultRetentionDays, storageClient = storageClient, intervalSeconds = intervals.retentionSeconds))
+    jobScope.launchJob(
+        RetentionJob(
+            defaultRetentionDays = config.resultRetentionDays,
+            storageClient = storageClient,
+            defaultBodyRetentionDays = config.bodyRetentionDays,
+            intervalSeconds = intervals.retentionSeconds,
+        )
+    )
     jobScope.launchJob(AggregateRetentionJob(hourlyRetentionDays = config.hourlyAggregateRetentionDays, intervalSeconds = intervals.retentionSeconds))
     jobScope.launchJob(PurgeJob(storageClient = storageClient, intervalSeconds = intervals.purgeSeconds))
     // Finishes the body deletions retention and purge could not complete. Without
@@ -138,8 +145,8 @@ fun Application.module() {
     )
 
     log.info(
-        "aggregate-worker started (resultRetentionDays={}, hourlyAggregateRetentionDays={})",
-        config.resultRetentionDays, config.hourlyAggregateRetentionDays
+        "aggregate-worker started (resultRetentionDays={}, bodyRetentionDays={}, hourlyAggregateRetentionDays={})",
+        config.resultRetentionDays, config.bodyRetentionDays, config.hourlyAggregateRetentionDays
     )
 
     // Shutdown hooks

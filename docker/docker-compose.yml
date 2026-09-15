@@ -306,6 +306,9 @@ services:
       # worker falls back to deleting any URI a row names and says so at startup.
       STORAGE_FILESYSTEM_ROOT: /data/bodies
       RESULT_RETENTION_DAYS: "90"
+      # Response bodies expire on a window of their own; -1 never expires one
+      # by age. A body never outlives its result either way.
+      BODY_RETENTION_DAYS: "90"
       WORKER_INTERVAL_HOURLY_AGGREGATION: "300"
       WORKER_INTERVAL_DAILY_AGGREGATION: "600"
       WORKER_INTERVAL_RETENTION: "3600"
