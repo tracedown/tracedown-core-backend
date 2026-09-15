@@ -1,0 +1,37 @@
+-- The index behind the retention body pass: "which of this organization's
+-- expired-by-body-window results still have a body the platform owns?"
+--
+-- Without it the planner has nothing better than a parallel sequential scan of
+-- probe_steps for every organization on every retention tick. Measured against
+-- 5M steps / 2.5M results on PostgreSQL 18, for an organization with nothing
+-- left to expire (the steady state, and the shape that runs every tick):
+--
+--   without: Parallel Seq Scan on probe_steps, 583 ms, 571k buffers
+--   with:    Index Scan using idx_probe_steps_expirable_body, 100 ms, 326k buffers
+--
+-- The predicate is what keeps it cheap: bodies are off by default and only a
+-- fraction of steps ever carry one, so the index covers ~2.5% of the table —
+-- 3.8 MB against a 562 MB table in the same measurement. body_store_id IS NULL
+-- is part of the predicate because a body in an in_place store belongs to the
+-- store owner and is never expired by the platform, so those rows should not
+-- be in the index at all.
+--
+-- It is alone in its own migration on purpose. probe_steps is the largest table
+-- in the schema, and a plain CREATE INDEX holds a SHARE lock on it for the whole
+-- scan, which blocks ingestion. An operator with a big enough table can build it
+-- by hand before deploying this release:
+--
+--   CREATE INDEX CONCURRENTLY idx_probe_steps_expirable_body
+--       ON probe_steps (probe_result_id)
+--       WHERE response_body_storage_url IS NOT NULL AND body_store_id IS NULL;
+--
+-- and IF NOT EXISTS then makes this migration a no-op.
+--
+-- Why the migration cannot simply say CONCURRENTLY itself: Flyway takes a
+-- PostgreSQL advisory lock inside a transaction and holds it across the whole
+-- migration run, and CREATE INDEX CONCURRENTLY waits for every transaction that
+-- can see the table to finish — including Flyway's own. It does not fail; it
+-- hangs forever. See V1789375635__index_probe_steps_body_store_id.
+CREATE INDEX IF NOT EXISTS idx_probe_steps_expirable_body
+    ON probe_steps (probe_result_id)
+    WHERE response_body_storage_url IS NOT NULL AND body_store_id IS NULL;
