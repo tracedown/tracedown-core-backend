@@ -151,7 +151,9 @@ class PurgeJob(
             while (rs.next()) uris.add(rs.getString(1))
         }
 
-        val failed = storageClient.deleteAll(uris).toList()
+        // Refusals are not the purge's problem: the rows naming them are going
+        // regardless, and the body belongs to someone else's store.
+        val failed = storageClient.deleteAll(uris).failed.toList()
         failed.forEach { (uri, error) -> log.error("Failed to delete stored response body {}: {}", uri, error) }
 
         // The rows naming these objects are about to go, so a failure here used

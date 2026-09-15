@@ -119,6 +119,25 @@ data class BodyConfinement(
 }
 
 /**
+ * What a bulk delete could not do.
+ *
+ * Two collections, because the two mean opposite things. [failed] is the
+ * store's answer — unreachable, rejected credentials, a bucket that is gone —
+ * and is retried later from `pending_body_deletions`. [refused] is this
+ * worker's own confinement fence: the URI names a body outside platform
+ * storage, so the object was never touched, no retry will ever change that, and
+ * a caller that treats it as "gone" strands the object with nothing left
+ * pointing at it. Everything not listed in either was deleted or was already
+ * absent.
+ */
+data class BodyDeleteOutcome(
+    /** URI to the store's error message, for bodies the store would not delete. */
+    val failed: Map<String, String?> = emptyMap(),
+    /** URI to the confinement reason, for bodies this client is not allowed to delete. */
+    val refused: Map<String, String> = emptyMap(),
+)
+
+/**
  * Client for interacting with stored response bodies via protocol-aware URIs.
  *
  * Supports ``file://`` (local filesystem) and ``s3://`` (any S3-compatible store:
@@ -201,8 +220,9 @@ open class BodyStorageClient(
     }
 
     /**
-     * Deletes many bodies and returns the ones that could not be deleted, URI to
-     * reason. A missing object is not a failure.
+     * Deletes many bodies and reports what did not go: [BodyDeleteOutcome.failed]
+     * for a store that would not delete, [BodyDeleteOutcome.refused] for a URI
+     * outside this client's confinement. A missing object is not a failure.
      *
      * S3 keys go in bulk — one `DeleteObjects` request per bucket per
      * [S3_DELETE_CHUNK] keys — instead of a round trip each: retention removes
@@ -214,13 +234,19 @@ open class BodyStorageClient(
      * Files are deleted one by one — that is a local call — through [delete], so
      * a client that overrides the single delete keeps its behaviour here.
      *
-     * A URI this client refuses on confinement is skipped, not failed: it names a
-     * body kept outside platform storage (for example in an agent's own body
-     * store), which is not the platform's to delete. Reporting it as failed would park it
-     * in the deletion retry table forever; it is logged at debug and left alone.
+     * A URI this client refuses on confinement is neither deleted nor failed: it
+     * names a body kept outside platform storage (for example in an agent's own
+     * body store), which is not the platform's to delete, and parking it in the
+     * deletion retry table would keep it there forever. It is reported
+     * separately instead, because the two mean opposite things to a caller: a
+     * failure is the store's fault and will be retried, a refusal is this
+     * worker's own fence and needs an operator. Callers that only delete rows
+     * they are dropping anyway (the purge) can ignore it; a caller that would
+     * clear the *reference* to the body on the strength of the delete must not.
      */
-    open fun deleteAll(uris: Collection<String>): Map<String, String?> {
+    open fun deleteAll(uris: Collection<String>): BodyDeleteOutcome {
         val failed = LinkedHashMap<String, String?>()
+        val refused = LinkedHashMap<String, String>()
         val skipped = mutableListOf<String>()
         // bucket → (key, uri)
         val s3ByBucket = LinkedHashMap<String, MutableList<Pair<String, String>>>()
@@ -239,6 +265,7 @@ open class BodyStorageClient(
                 // feed this already exclude those, so one arriving here means a
                 // row the platform thinks it owns points somewhere it does not.
                 skipped.add(uri)
+                refused[uri] = e.message ?: "outside platform storage"
                 log.warn("not deleting body outside platform storage {}: {}", uri, e.message)
             } catch (e: Exception) {
                 failed[uri] = e.message
@@ -256,7 +283,7 @@ open class BodyStorageClient(
                 for ((_, uri) in entries) failed[uri] = e.message
             }
         }
-        return failed
+        return BodyDeleteOutcome(failed = failed, refused = refused)
     }
 
     /**

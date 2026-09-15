@@ -269,7 +269,7 @@ class BodyStorageClientTest {
         }.use { server ->
             val client = BodyStorageClient(s3Config = S3Config("http://127.0.0.1:${server.port}", "k", "s"))
             val uris = (1..600).map { "s3://bodies/org/svc/res-$it/call_0_response.json" }
-            assertEquals(emptyMap<String, String?>(), client.deleteAll(uris))
+            assertEquals(emptyMap<String, String?>(), client.deleteAll(uris).failed)
             assertEquals(1, requests.get(), "a page of 600 keys is one request")
             assertEquals(600, keysSeen.get())
         }
@@ -283,7 +283,7 @@ class BodyStorageClientTest {
         fakeS3(status = 500) {}.use { server ->
             val client = BodyStorageClient(s3Config = S3Config("http://127.0.0.1:${server.port}", "k", "s", timeoutSeconds = 5))
             val uris = listOf("s3://bodies/a/1.json", "s3://bodies/a/2.json")
-            val failed = client.deleteAll(uris)
+            val failed = client.deleteAll(uris).failed
             assertEquals(uris.toSet(), failed.keys)
             assertTrue(failed.getValue("s3://bodies/a/1.json")!!.contains("s3://bodies/a/1.json"))
         }

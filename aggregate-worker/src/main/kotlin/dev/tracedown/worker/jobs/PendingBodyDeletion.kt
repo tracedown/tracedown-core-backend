@@ -1,13 +1,9 @@
 package dev.tracedown.worker.jobs
 
 import dev.tracedown.common.models.PendingBodyDeletions
-import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
-import org.jetbrains.exposed.v1.core.plus
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
-import org.jetbrains.exposed.v1.jdbc.insert
-import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.update
+import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.UUID
@@ -41,38 +37,46 @@ object PendingBodyDeletion {
      * Records [uris] as still needing deletion, with the failure message that
      * put them there. Re-recording a URI already listed bumps its attempt count
      * rather than duplicating it.
+     *
+     * One `INSERT … ON CONFLICT (storage_url) DO UPDATE` per URI, and no
+     * `catch` around it. The select-then-insert this replaces raced two workers
+     * (or one worker and the retry job) straight into a unique violation, and a
+     * unique violation inside a PostgreSQL transaction poisons the *whole*
+     * transaction: catching it here logged one line and then silently lost every
+     * other note in the same batch, which is exactly the reference-keeping this
+     * object exists for. The conflict is now the database's to resolve.
+     *
+     * A failure that reaches the caller is a doomed transaction either way. The
+     * retention passes therefore record in a transaction of their own, so the
+     * page they are working on survives; the purge records inside its unit's
+     * transaction, whose failure is already caught and retried on the next run.
      */
     fun record(uris: Collection<String>, error: String?) {
         if (uris.isEmpty()) return
-        val now = Instant.now()
-        for (uri in uris.distinct()) {
-            try {
-                val known = PendingBodyDeletions.selectAll()
-                    .where { PendingBodyDeletions.storageUrl eq uri }
-                    .limit(1)
-                    .any()
-                if (known) {
-                    PendingBodyDeletions.update({ PendingBodyDeletions.storageUrl eq uri }) {
-                        it[attempts] = attempts + 1
-                        it[lastError] = error
-                        it[lastAttemptAt] = now
-                    }
-                } else {
-                    PendingBodyDeletions.insert {
-                        it[id] = UUID.randomUUID()
-                        it[storageUrl] = uri
-                        it[attempts] = 1
-                        it[lastError] = error
-                        it[firstSeenAt] = now
-                        it[lastAttemptAt] = now
-                    }
-                }
-            } catch (e: Exception) {
-                // Never let bookkeeping break the deletion it is bookkeeping for.
-                log.error("Could not record pending deletion of {}: {}", uri, e.message)
+        val now = java.sql.Timestamp.from(Instant.now())
+        val conn = TransactionManager.current().connection.connection as java.sql.Connection
+        conn.prepareStatement(UPSERT_SQL).use { stmt ->
+            for (uri in uris.distinct()) {
+                stmt.setObject(1, UUID.randomUUID())
+                stmt.setString(2, uri)
+                stmt.setString(3, error)
+                stmt.setTimestamp(4, now)
+                stmt.setTimestamp(5, now)
+                stmt.addBatch()
             }
+            stmt.executeBatch()
         }
     }
+
+    private val UPSERT_SQL = """
+        INSERT INTO pending_body_deletions
+            (id, storage_url, attempts, last_error, first_seen_at, last_attempt_at)
+        VALUES (?, ?, 1, ?, ?, ?)
+        ON CONFLICT (storage_url) DO UPDATE SET
+            attempts = pending_body_deletions.attempts + 1,
+            last_error = EXCLUDED.last_error,
+            last_attempt_at = EXCLUDED.last_attempt_at
+    """.trimIndent()
 
     /** Drops [uris] from the pending list — their objects are confirmed gone. */
     fun clear(uris: Collection<String>) {

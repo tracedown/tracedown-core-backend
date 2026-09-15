@@ -34,10 +34,15 @@ object UsageController {
         this.globalRetentionHours = if (resultRetentionDays > 0) resultRetentionDays * 24 else MAX_WINDOW_HOURS
     }
 
-    /** The retention cap for [orgId]: its own period where the platform sets one, else the global. */
+    /**
+     * The retention cap for [orgId]: its own period where the platform sets one,
+     * else the global. A `null` from the seam means the organization has no
+     * period of its own; a negative one means its results never expire by age,
+     * and the window is then capped only by [MAX_WINDOW_HOURS].
+     */
     private fun retentionHours(orgId: UUID): Int {
-        val days = PlatformDefaults.retentionConfig.resultRetentionDays(orgId)
-        return if (days > 0) days * 24 else globalRetentionHours
+        val days = PlatformDefaults.retentionConfig.resultRetentionDays(orgId) ?: return globalRetentionHours
+        return if (days > 0) days * 24 else MAX_WINDOW_HOURS
     }
 
     fun forService(orgId: UUID, serviceId: UUID, requestedHours: Int): UsageResponse = usage("svc", serviceId, requestedHours, orgId)

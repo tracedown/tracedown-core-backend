@@ -49,28 +49,43 @@ interface OrgConfig {
  * body lifetime is `min(body, result)`; with the body window off the body lives
  * exactly as long as its result.
  *
- * Both accept -1 (or any value <= 0) to mean "use the global default", and a
- * global default of <= 0 means "never expire by age".
+ * **How a value reads.** A retention value is a number of days:
+ *
+ *  - `> 0` — expire after that many days.
+ *  - `< 0` — never expire by age.
+ *  - `0` — not a value. It is refused where it is entered (the worker fails to
+ *    start on `RESULT_RETENTION_DAYS=0` or `BODY_RETENTION_DAYS=0`), because
+ *    "expire immediately" and "keep forever" are both plausible readings of it
+ *    and one of them silently deletes everything.
+ *  - `null` — no opinion for this organization: the global config value stands.
+ *    `null` is an answer this seam gives, never a value an operator enters.
+ *
+ * A host that sets windows per organization (a plan, a contract) returns the
+ * organization's own value and `null` only when nothing answers for it. The
+ * job then resolves `organization value ?: global value`.
  */
 interface RetentionConfig {
 
-    /** Returns the result retention period in days for an organization, or -1 to use the global default. */
-    fun resultRetentionDays(orgId: UUID): Int
+    /**
+     * The result retention period in days for an organization, or `null` to use
+     * the global config value. Negative means the organization's results never
+     * expire by age.
+     */
+    fun resultRetentionDays(orgId: UUID): Int? = null
 
     /**
-     * Returns the response-body retention period in days for an organization,
-     * or -1 to use the global default.
+     * The response-body retention period in days for an organization, or `null`
+     * to use the global config value. Negative means the organization's bodies
+     * never expire by age — they still go when their result does.
      *
      * A host that only distinguishes result windows need not override this: the
      * default sends every organization to the global body window, which is what
      * a deployment that has never configured one wants.
      */
-    fun bodyRetentionDays(orgId: UUID): Int = -1
+    fun bodyRetentionDays(orgId: UUID): Int? = null
 
-    /** Default: -1 (use global config value). */
-    object Default : RetentionConfig {
-        override fun resultRetentionDays(orgId: UUID): Int = -1
-    }
+    /** Default: no per-organization opinion — both windows come from config. */
+    object Default : RetentionConfig
 }
 
 /** External delivery configuration — controls which delivery channels are available. */

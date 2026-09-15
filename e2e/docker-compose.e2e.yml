@@ -136,7 +136,9 @@ services:
       DATABASE_PASSWORD: tracedown
       REDIS_A_URL: redis://redis:6379
       RESULT_RETENTION_DAYS: "90"
-      BODY_RETENTION_DAYS: "90"
+      # Unset: response bodies follow their results. Set a number of days to
+      # give them a window of their own.
+      # BODY_RETENTION_DAYS: "30"
       WORKER_INTERVAL_HOURLY_AGGREGATION: "5"
       WORKER_INTERVAL_DAILY_AGGREGATION: "10"
       WORKER_INTERVAL_RETENTION: "10"

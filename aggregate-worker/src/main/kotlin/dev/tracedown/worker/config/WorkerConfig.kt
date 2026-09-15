@@ -26,14 +26,20 @@ data class WorkerConfig(
     val database: DatabaseConfig,
     val redisAUrl: String,
     val redisBUrl: String,
-    /** Global default retention for raw probe results in days. Zero or negative keeps forever. */
+    /**
+     * Global default retention for raw probe results in days. Negative never
+     * expires a result by age; zero is refused at startup.
+     */
     val resultRetentionDays: Int,
     /**
      * Global default retention for stored response bodies in days, independent
-     * of [resultRetentionDays]. Zero or negative keeps bodies for as long as
-     * their results — a body is only reachable through its `probe_steps` row,
-     * so it can never outlive the result that owns it. With both positive the
-     * effective body lifetime is the smaller of the two.
+     * of [resultRetentionDays]. Defaults to -1: unset, bodies simply follow
+     * their results the way they did before the two windows were split, and the
+     * body pass does not run at all.
+     *
+     * A body is only reachable through its `probe_steps` row, so it can never
+     * outlive the result that owns it. With both windows positive the effective
+     * body lifetime is the smaller of the two. Zero is refused at startup.
      *
      * Bodies in an `in_place` body store (`probe_steps.body_store_id` set) are
      * the store owner's and are outside both windows.
@@ -69,9 +75,40 @@ data class WorkerConfig(
     val bodyConfinement: BodyConfinement,
 ) {
     companion object {
+
+        /**
+         * Reads a retention window, refusing the one value that has no honest
+         * reading.
+         *
+         * A window is a number of days (`> 0`), or negative for "never expire by
+         * age". Zero is neither: it reads as "expire immediately" to the cutoff
+         * arithmetic and as "keep forever" to most operators who type it, and
+         * one of those deletes every result the platform holds. Rather than pick,
+         * the worker refuses to start and says which variable to fix — a startup
+         * failure is visible, a silently emptied database is not.
+         */
+        private fun retentionDays(
+            config: io.ktor.server.config.ApplicationConfig,
+            path: String,
+            variable: String,
+            default: Int,
+        ): Int {
+            val raw = config.propertyOrNull(path)?.getString()?.trim()?.takeIf { it.isNotEmpty() } ?: return default
+            val days = raw.toIntOrNull()
+                ?: throw IllegalArgumentException("$variable must be a whole number of days, not \"$raw\"")
+            if (days == 0) {
+                throw IllegalArgumentException(
+                    "$variable must not be 0 — use -1 to never expire by age, or a positive number of days",
+                )
+            }
+            return days
+        }
+
         /** Loads configuration from the Ktor application environment. */
-        fun load(env: ApplicationEnvironment): WorkerConfig {
-            val config = env.config
+        fun load(env: ApplicationEnvironment): WorkerConfig = load(env.config)
+
+        /** Loads configuration from a resolved config tree. */
+        fun load(config: io.ktor.server.config.ApplicationConfig): WorkerConfig {
             return WorkerConfig(
                 database = DatabaseConfig(
                     url = config.property("database.url").getString(),
@@ -80,10 +117,8 @@ data class WorkerConfig(
                 ),
                 redisAUrl = config.property("redis.a.url").getString(),
                 redisBUrl = config.property("redis.b.url").getString(),
-                resultRetentionDays = config.propertyOrNull("worker.resultRetentionDays")
-                    ?.getString()?.toInt() ?: 90,
-                bodyRetentionDays = config.propertyOrNull("worker.bodyRetentionDays")
-                    ?.getString()?.toInt() ?: 90,
+                resultRetentionDays = retentionDays(config, "worker.resultRetentionDays", "RESULT_RETENTION_DAYS", 90),
+                bodyRetentionDays = retentionDays(config, "worker.bodyRetentionDays", "BODY_RETENTION_DAYS", -1),
                 hourlyAggregateRetentionDays = config.propertyOrNull("worker.hourlyAggregateRetentionDays")
                     ?.getString()?.toInt() ?: 365,
                 agentHealthRetentionDays = config.propertyOrNull("worker.agentHealthRetentionDays")
