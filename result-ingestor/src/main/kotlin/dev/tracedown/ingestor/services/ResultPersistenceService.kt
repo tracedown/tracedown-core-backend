@@ -721,28 +721,13 @@ object ResultPersistenceService {
         // the same, so a host could reroute it too if it chose.
         if (status == "skipped") {
             val reason = rawResult["reason"]?.jsonPrimitive?.contentOrNull ?: "unknown"
-            // A tick the unverified-domain policy withheld (§18.4) is that
-            // policy working, not a fault: the skipped row says why, and a
-            // capacity banner would send the org the wrong way.
-            if (reason.startsWith("unverified_")) return PersistOutcome.PERSISTED
+            // A tick the platform withheld on purpose is that policy working,
+            // not a fault: the skipped row says why, and a banner would send the
+            // org somewhere there is nothing to fix. SkippedProbeAlert owns
+            // which reasons those are, and which alert the rest deserve.
+            val alertType = SkippedProbeAlert.alertType(reason) ?: return PersistOutcome.PERSISTED
             val data = buildJsonObject {
                 put("reason", reason)
-            }
-            // Not every skip is a capacity problem. A tick that found no
-            // executor to run on is a fleet-health problem, and telling the org
-            // to "reduce probe frequency" would send them the wrong way.
-            val alertType = when (reason) {
-                "no_eligible_agent" -> SystemAlertService.NO_ELIGIBLE_AGENT
-                // Agents were there and none of them took the run. Neither a
-                // capacity problem nor an empty fleet — telling the org to
-                // reduce probe frequency or check allowlists would send them
-                // past the actual fault.
-                "agent_unreachable", "agent_rejected" -> SystemAlertService.AGENT_DISPATCH_FAILED
-                // The scheduler itself faulted (its database was unreachable,
-                // its trigger was dropped). Nothing about the fleet or the
-                // org's own settings would explain it.
-                "dispatch_error", "trigger_misfired" -> SystemAlertService.SCHEDULER_ERROR
-                else -> SystemAlertService.DISPATCH_CAPACITY
             }
             val handled = SystemAlertRouting.handled(
                 AlertContext(

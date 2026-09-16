@@ -147,6 +147,18 @@ object ProbeTargetPolicy {
         }
 
     /**
+     * The lowercase host of one already-substituted target URL, or null when
+     * there is no host any check here can be made about: a URL this policy
+     * cannot parse, or a host still assembled at runtime (`$o.endpoint`), which
+     * is the case [REASON_DYNAMIC_HOST] already covers where it matters.
+     */
+    fun hostOf(url: String): String? {
+        val host = parseOrigin(url)?.host ?: return null
+        if (host.contains('$')) return null
+        return host.lowercase()
+    }
+
+    /**
      * Judges one target without touching DNS.
      *
      * This is the write-time half: it catches the literal cases (an IP, an

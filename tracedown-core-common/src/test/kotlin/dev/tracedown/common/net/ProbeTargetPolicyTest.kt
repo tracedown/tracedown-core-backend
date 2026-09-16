@@ -246,6 +246,17 @@ class ProbeTargetPolicyTest {
     }
 
     @Test
+    fun `the host of a target is what a per-host check is made about`() {
+        assertEquals("api.example.com", ProbeTargetPolicy.hostOf("https://API.Example.com:8443/health?x=1"))
+        assertEquals("192.0.2.10", ProbeTargetPolicy.hostOf("http://192.0.2.10/"))
+        assertEquals("2001:db8::1", ProbeTargetPolicy.hostOf("https://[2001:db8::1]/health"))
+        // Nothing to make a check about: the host is assembled at runtime, or
+        // the URL names no host at all.
+        assertNull(ProbeTargetPolicy.hostOf("https://${'$'}o_endpoint/health"))
+        assertNull(ProbeTargetPolicy.hostOf("not a url"))
+    }
+
+    @Test
     fun `the startup description names the setting an operator would change`() {
         assertTrue(ProbeTargetPolicy.describe(allowPrivate, null).contains("PROBE_TARGET_POLICY"))
         assertTrue(ProbeTargetPolicy.describe(publicOnly, "auto").contains("PROBE_TARGET_POLICY"))

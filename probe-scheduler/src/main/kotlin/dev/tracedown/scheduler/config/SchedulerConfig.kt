@@ -55,6 +55,16 @@ data class SchedulerConfig(
          * See dev.tracedown.common.net.ProbeTargetPolicy.
          */
         val targetPolicy: String = dev.tracedown.common.net.ProbeTargetPolicy.AUTO,
+        /**
+         * Whether a target that publishes the do-not-probe record is left
+         * alone. On by default: the record is how a host that never asked to be
+         * monitored from here says so, and honouring it is the polite default
+         * for a platform that dispatches traffic at third parties. An operator
+         * probing only their own infrastructure may turn it off — a verified
+         * domain is exempt from the check either way.
+         * See dev.tracedown.common.domain.TargetOptOut.
+         */
+        val honourTargetOptOut: Boolean = true,
     )
 
     companion object {
@@ -139,6 +149,8 @@ data class SchedulerConfig(
                     targetPolicy = config.propertyOrNull("probe.targetPolicy")
                         ?.getString()?.takeIf { it.isNotBlank() }
                         ?: dev.tracedown.common.net.ProbeTargetPolicy.AUTO,
+                    honourTargetOptOut = config.propertyOrNull("probe.honourTargetOptOut")
+                        ?.getString()?.toBooleanStrictOrNull() ?: true,
                 ),
             )
         }

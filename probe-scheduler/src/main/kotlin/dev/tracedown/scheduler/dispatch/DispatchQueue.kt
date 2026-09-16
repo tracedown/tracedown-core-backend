@@ -44,6 +44,14 @@ import java.util.concurrent.atomic.AtomicLong
 const val SKIP_UNVERIFIED_INCLUDES = "unverified_includes"
 const val SKIP_UNVERIFIED_MAX_CALLS = "unverified_max_calls"
 const val SKIP_UNVERIFIED_THROTTLE = "unverified_throttle"
+
+/**
+ * Skip reason for a tick withheld because the target publishes the
+ * do-not-probe record (see [dev.tracedown.common.domain.TargetOptOut]). Like
+ * the reasons above it is a policy outcome and not a fault: the ingestor
+ * raises no alert for it, and the history says who decided.
+ */
+const val SKIP_TARGET_OPTED_OUT = "target_opted_out"
 /** `body_not_stored_reason` for a body the §18.4 unverified-domain rule withheld. */
 const val BODIES_WITHHELD_UNVERIFIED = "unverifiedTarget"
 
@@ -88,6 +96,13 @@ class DispatchQueue(
      * from configuration.
      */
     private val targetPolicy: ProbeTargetPolicy.Mode = ProbeTargetPolicy.Mode.ALLOW_PRIVATE,
+    /**
+     * Consulted for whether a target asks not to be probed. Null turns the
+     * check off entirely — no lookup, no cache read — which is what the
+     * operator setting does and what a host constructing this queue without an
+     * opinion gets.
+     */
+    private val targetOptOut: TargetOptOutChecker? = null,
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -364,6 +379,42 @@ class DispatchQueue(
                 // service that may be perfectly healthy. The reason names the
                 // policy so the gap is explicable from the history alone.
                 recordSkipped(serviceId, target.reason ?: "target_blocked", Instant.now())
+                accounted.set(true)
+                return
+            }
+
+            // A target that publishes the do-not-probe record is left alone.
+            // The check is the operator of the *target* zone speaking, so it
+            // outranks the service's own settings — but not proof that this org
+            // operates the zone: a host covered by a verified domain is never
+            // asked, because there the org is the operator and a record in its
+            // own zone cannot be someone else refusing.
+            val optedOutHost = targetOptOut?.let { checker ->
+                val hosts = ProbeTargetPolicy.targetUrls(script)
+                    .map { ProbeTargetPolicy.substituteVars(it, resolvedVars) }
+                    // A host still assembled at runtime names no zone to ask;
+                    // ProbeTargetPolicy already refuses those where it matters.
+                    .mapNotNull { ProbeTargetPolicy.hostOf(it) }
+                    .distinct()
+                if (hosts.isEmpty()) {
+                    null
+                } else {
+                    // One transaction for the ownership question, then the
+                    // lookups outside it — a DNS round-trip must never be made
+                    // holding a database connection.
+                    val unowned = transaction { hosts.filterNot { DomainPolicy.verifiedCovers(it, ctx.orgId) } }
+                    unowned.firstOrNull { checker.optedOut(it) }
+                }
+            }
+            if (optedOutHost != null) {
+                log.info(
+                    "service {} targets {}, which publishes the do-not-probe record — skipping",
+                    serviceId, optedOutHost,
+                )
+                // A skipped row for the same reason the address policy writes
+                // one: nothing was learned about the target, and a synthetic
+                // failure would read as downtime for a service that is fine.
+                recordSkipped(serviceId, SKIP_TARGET_OPTED_OUT, Instant.now())
                 accounted.set(true)
                 return
             }

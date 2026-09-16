@@ -1,6 +1,7 @@
 package dev.tracedown.scheduler
 
 import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.domain.TargetOptOut
 import dev.tracedown.common.health.databaseCheck
 import dev.tracedown.common.health.installHealthEndpoints
 import dev.tracedown.common.health.redisCheck
@@ -17,6 +18,7 @@ import dev.tracedown.scheduler.dispatch.ProbeExecutionBackends
 import dev.tracedown.scheduler.dispatch.AgentSelector
 import dev.tracedown.scheduler.dispatch.DispatchQueue
 import dev.tracedown.scheduler.dispatch.QueuePolicyManager
+import dev.tracedown.scheduler.dispatch.TargetOptOutChecker
 import dev.tracedown.scheduler.results.ResultPublisher
 import dev.tracedown.scheduler.scheduling.HealthChallengeContext
 import dev.tracedown.scheduler.scheduling.HealthChallengeJob
@@ -139,6 +141,17 @@ fun Application.module() {
         dev.tracedown.common.net.ProbeTargetPolicy.describe(targetPolicyMode, config.probe.targetPolicy),
     )
 
+    // Targets that publish the do-not-probe record. Null when the operator has
+    // turned the check off, which is the whole of the off switch: no lookup and
+    // no cache read happen anywhere downstream.
+    val targetOptOut = if (config.probe.honourTargetOptOut) {
+        log.info("targets publishing a {} TXT record will not be probed", TargetOptOut.RECORD_PREFIX)
+        TargetOptOutChecker(redis)
+    } else {
+        log.info("target opt-out records are ignored (PROBE_HONOUR_TARGET_OPT_OUT=false)")
+        null
+    }
+
     // Dispatch queue — decouples Quartz triggers from agent HTTP dispatch
     val dispatchQueue = DispatchQueue(
         capacity = config.dispatchQueueSize,
@@ -150,6 +163,7 @@ fun Application.module() {
         probeConfig = config.probe,
         trustedDomainMode = config.trustedDomainMode,
         targetPolicy = targetPolicyMode,
+        targetOptOut = targetOptOut,
     )
     dispatchQueue.start(schedulerScope)
 

@@ -65,14 +65,7 @@ object DomainPolicy {
             return Evaluation(covered = false, callCount = urls.size, usesIncludes = usesIncludes, unverifiedHosts = unresolved)
         }
 
-        val domains = OrgDomains.selectAll()
-            .where {
-                (OrgDomains.organizationId eq orgId) and
-                    (OrgDomains.status eq "verified") and
-                    (OrgDomains.lapsed eq false) and
-                    (OrgDomains.deleted eq false)
-            }
-            .map { Triple(it[OrgDomains.domain], it[OrgDomains.wildcardEnabled], it[OrgDomains.exceptions] ?: emptyList()) }
+        val domains = verifiedDomains(orgId)
 
         val uncovered = hosts.filter { host -> domains.none { covers(host!!, it.first, it.second, it.third) } }
             .map { it!! }
@@ -84,6 +77,28 @@ object DomainPolicy {
             unverifiedHosts = uncovered,
         )
     }
+
+    /**
+     * Whether any domain the org has proven it owns covers [host] — the same
+     * rows and the same wildcard/exception semantics [evaluate] applies, so a
+     * host can never count as owned by one caller and unowned by another. A
+     * lapsed, unverified or deleted domain proves nothing and is not consulted.
+     *
+     * Must be called within a transaction.
+     */
+    fun verifiedCovers(host: String, orgId: UUID): Boolean =
+        verifiedDomains(orgId).any { covers(host.lowercase(), it.first, it.second, it.third) }
+
+    /** The org's proven domains: `domain`, `wildcardEnabled`, `exceptions`. */
+    private fun verifiedDomains(orgId: UUID): List<Triple<String, Boolean, List<String>>> =
+        OrgDomains.selectAll()
+            .where {
+                (OrgDomains.organizationId eq orgId) and
+                    (OrgDomains.status eq "verified") and
+                    (OrgDomains.lapsed eq false) and
+                    (OrgDomains.deleted eq false)
+            }
+            .map { Triple(it[OrgDomains.domain], it[OrgDomains.wildcardEnabled], it[OrgDomains.exceptions] ?: emptyList()) }
 
     /** Replaces `$ident` / `${ident}` with resolved variable values. */
     private fun substituteVars(url: String, vars: Map<String, String>): String {
