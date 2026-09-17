@@ -137,8 +137,7 @@ class PurgeJobTest {
             return id
         }
 
-        private fun insertOrg(ownerId: UUID, purge: Boolean = false): UUID {
-            val id = UUID.randomUUID()
+        private fun insertOrg(ownerId: UUID, purge: Boolean = false, id: UUID = UUID.randomUUID()): UUID {
             Organizations.insert {
                 it[Organizations.id] = id
                 it[name] = "org"
@@ -1386,13 +1385,14 @@ class PurgeJobTest {
     private fun agedResultWithBody(
         resultAgeDays: Long,
         bodyUrl: String,
+        orgId: UUID = UUID.randomUUID(),
     ): Triple<UUID, UUID, UUID> {
         lateinit var org: UUID
         lateinit var result: UUID
         lateinit var step: UUID
         transaction {
             val owner = insertUser()
-            org = insertOrg(owner)
+            org = insertOrg(owner, id = orgId)
             val ws = insertWorkspace(org)
             val proj = insertProject(ws)
             val svc = insertService(proj)
@@ -1893,10 +1893,20 @@ class PurgeJobTest {
         // the second org is never swept — the organizations at the end of the
         // list starve while the ones at the front are swept every hour.
         val storage = FakeStorage()
-        val (orgA, _, stepA) = agedResultWithBody(40, "s3://bodies/org-a")
-        val (orgB, _, stepB) = agedResultWithBody(40, "s3://bodies/org-b")
-        val first = if (orgA < orgB) stepA else stepB
-        val second = if (orgA < orgB) stepB else stepA
+        // The two ids straddle the sign bit of the most-significant 64 bits, so
+        // they are in *opposite* order under PostgreSQL's unsigned `uuid`
+        // comparison (which is what `ORDER BY organization_id` gives the job)
+        // and under `java.util.UUID.compareTo`. Reasoning about this list with
+        // Kotlin's `<` rotated the resume cursor to the wrong organization; see
+        // RetentionResumeOrderTest. Fixed rather than random so the case is
+        // covered on every run instead of every other one.
+        val (orgA, _, stepA) =
+            agedResultWithBody(40, "s3://bodies/org-a", UUID.fromString("7fffffff-0000-4000-8000-000000000000"))
+        val (orgB, _, stepB) =
+            agedResultWithBody(40, "s3://bodies/org-b", UUID.fromString("80000000-0000-4000-8000-000000000000"))
+        val aIsFirst = RetentionJob.ORG_ID_ORDER.compare(orgA, orgB) < 0
+        val first = if (aIsFirst) stepA else stepB
+        val second = if (aIsFirst) stepB else stepA
 
         // The clock advances 300 ms per reading and the budget is 400 ms, so
         // the first org's passes finish and the budget check in front of the
@@ -1915,7 +1925,7 @@ class PurgeJobTest {
 
         runBlocking { job.execute() }
         assertNull(bodyUrlOf(first), "the first org in id order is swept")
-        assertEquals("s3://bodies/${if (orgA < orgB) "org-b" else "org-a"}", bodyUrlOf(second), "the second is not")
+        assertEquals("s3://bodies/${if (aIsFirst) "org-b" else "org-a"}", bodyUrlOf(second), "the second is not")
 
         runBlocking { job.execute() }
         assertNull(bodyUrlOf(second), "the next tick starts where the last one stopped")

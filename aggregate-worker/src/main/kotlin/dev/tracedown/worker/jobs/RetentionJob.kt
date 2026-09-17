@@ -249,14 +249,7 @@ class RetentionJob(
     }
 
     /** The organization list rotated to start at [resumeFrom], or unchanged when there is none. */
-    private fun resumeOrder(orgIds: List<UUID>): List<UUID> {
-        val from = resumeFrom ?: return orgIds
-        // The list is ordered by id, so "where we stopped" is the first id at or
-        // after the cursor — the organization itself may have been deleted since.
-        val index = orgIds.indexOfFirst { it >= from }
-        if (index <= 0) return orgIds
-        return orgIds.subList(index, orgIds.size) + orgIds.subList(0, index)
-    }
+    private fun resumeOrder(orgIds: List<UUID>): List<UUID> = resumeOrder(orgIds, resumeFrom)
 
     /**
      * Expires one org's stored response bodies past [bodyCutoff], in batches,
@@ -536,6 +529,39 @@ class RetentionJob(
     companion object {
         /** Pages of failed deletions one tick tolerates for an org before giving up on it. */
         private const val MAX_FAILED_PAGES = 4
+
+        /**
+         * Organization ids in the order the database returns them.
+         *
+         * PostgreSQL compares `uuid` as sixteen **unsigned** bytes, while
+         * [java.util.UUID.compareTo] compares the most-significant 64 bits as a
+         * **signed** long. The two orders disagree for every pair whose top bit
+         * differs — about half of all pairs of random v4 ids, where Java puts
+         * `8…` *before* `7…` and PostgreSQL puts it after. The organization list
+         * this job walks comes straight out of an `ORDER BY organization_id`, so
+         * anything reasoning about a position inside it has to use the
+         * database's order; Kotlin's `<` silently means something else.
+         */
+        internal val ORG_ID_ORDER: Comparator<UUID> = Comparator { a, b ->
+            val high = java.lang.Long.compareUnsigned(a.mostSignificantBits, b.mostSignificantBits)
+            if (high != 0) high else java.lang.Long.compareUnsigned(a.leastSignificantBits, b.leastSignificantBits)
+        }
+
+        /**
+         * [orgIds] — in the database's order — rotated to start at [from], or
+         * unchanged when there is no cursor.
+         *
+         * "Where we stopped" is the first id at or after the cursor in that same
+         * order: the organization itself may have been deleted, or dropped out
+         * of the list because it has nothing left to expire, since the tick that
+         * named it.
+         */
+        internal fun resumeOrder(orgIds: List<UUID>, from: UUID?): List<UUID> {
+            if (from == null) return orgIds
+            val index = orgIds.indexOfFirst { ORG_ID_ORDER.compare(it, from) >= 0 }
+            if (index <= 0) return orgIds
+            return orgIds.subList(index, orgIds.size) + orgIds.subList(0, index)
+        }
 
         /**
          * Watermark key for an org's body pass. 54 characters at most, inside
