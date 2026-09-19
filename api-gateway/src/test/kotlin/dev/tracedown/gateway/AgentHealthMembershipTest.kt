@@ -2,8 +2,10 @@ package dev.tracedown.gateway
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import dev.tracedown.common.alerts.SystemAlertService.DEGRADED_RTT_MS
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.ProbeAgents
@@ -27,6 +29,13 @@ import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.Database
@@ -34,6 +43,7 @@ import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
@@ -166,6 +176,56 @@ class AgentHealthMembershipTest {
             membershipId
         }
 
+        /**
+         * An active agent plus a run of passing health rounds, [rounds] given
+         * most recent first — the order the degradation rule reads them in.
+         */
+        private fun newAgentWithRounds(agentSlug: String, rounds: List<Int>): Long {
+            val agentId = transaction(db) {
+                ProbeAgents.insert {
+                    it[slug] = agentSlug
+                    it[label] = agentSlug
+                    it[agentUri] = "https://$agentSlug.invalid"
+                    it[publicKey] = "-----BEGIN PUBLIC KEY-----"
+                    it[isActive] = true
+                    it[deleted] = false
+                    it[lastPing] = Instant.now()
+                    it[lastStatus] = "success"
+                    it[lastPingDelayMs] = 0
+                    it[lastPongDeltaMs] = rounds.first()
+                    it[createdAt] = Instant.now()
+                } get ProbeAgents.id
+            }
+            insertRounds(agentId, rounds, Instant.now().minusSeconds(3600))
+            return agentId
+        }
+
+        /** Newer rounds on top of an agent's history, again most recent first. */
+        private fun appendRounds(agentId: Long, rounds: List<Int>) =
+            insertRounds(agentId, rounds, Instant.now())
+
+        private fun insertRounds(agentId: Long, rounds: List<Int>, newest: Instant) = transaction(db) {
+            rounds.forEachIndexed { index, ms ->
+                val at = newest.minusSeconds(index.toLong())
+                AgentHealthChecks.insert {
+                    it[id] = UUID.randomUUID()
+                    it[probeAgentId] = agentId
+                    it[challengeId] = UUID.randomUUID().toString()
+                    it[challengedAt] = at
+                    it[respondedAt] = at
+                    it[roundTripMs] = ms
+                    it[result] = "pass"
+                    it[createdAt] = at
+                }
+            }
+        }
+
+        /** The roster entry for [agentSlug] out of a `/agents/health` body. */
+        private fun statusOf(body: String, agentSlug: String): JsonObject =
+            Json.parseToJsonElement(body).jsonObject["statuses"]!!.jsonArray
+                .map { it.jsonObject }
+                .first { it["agentSlug"]!!.jsonPrimitive.content == agentSlug }
+
         /** Returns the bearer token for a fresh active session scoped to [orgId]. */
         private fun newSession(userId: UUID, orgId: UUID?): String {
             val token = "tok-${UUID.randomUUID()}"
@@ -249,6 +309,58 @@ class AgentHealthMembershipTest {
         health(token) { status, body ->
             assertEquals(HttpStatusCode.Forbidden, status, body)
             assertTrue(ErrorCodes.NOT_ORG_MEMBER in body, "expected not_org_member: $body")
+        }
+    }
+
+    /**
+     * The roster carries the platform's own slowness verdict, not just the
+     * observation it was reached from.
+     *
+     * The dashboard used to re-decide this itself, on a fixed ceiling, and so
+     * called any agent far enough away to sit near that ceiling every round
+     * unhealthy — permanently, while the platform's baseline-aware rule had
+     * never convicted it of anything. It now shows what `DegradationRule`
+     * concluded, which is only useful if the roster says so.
+     */
+    @Test
+    fun `the roster carries the degradation verdict, not just the round trip`() {
+        val owner = newUser()
+        val orgId = newOrg(owner)
+        // Thirty rounds at 1.5 s and a 1.8 s one on top: every one of them is
+        // over the fixed floor, none of them is over this agent's own ceiling.
+        val agentId = newAgentWithRounds("agent-far-away", listOf(1800) + List(30) { 1500 })
+
+        health(newSession(owner, orgId)) { status, body ->
+            assertEquals(HttpStatusCode.OK, status, body)
+            val entry = statusOf(body, "agent-far-away")
+            assertEquals(1800, entry["lastResponseMs"]!!.jsonPrimitive.int)
+            assertFalse(entry["degraded"]!!.jsonPrimitive.boolean, "1.8 s is ordinary here: $body")
+            assertEquals(1500, entry["baselineMs"]!!.jsonPrimitive.int)
+            assertEquals(3000, entry["degradedThresholdMs"]!!.jsonPrimitive.int)
+        }
+
+        // Two rounds past twice the median is a condition, and the roster says so.
+        appendRounds(agentId, listOf(3400, 3200))
+        health(newSession(owner, orgId)) { status, body ->
+            assertEquals(HttpStatusCode.OK, status, body)
+            val entry = statusOf(body, "agent-far-away")
+            assertTrue(entry["degraded"]!!.jsonPrimitive.boolean, "two rounds over the ceiling: $body")
+            assertEquals(3000, entry["degradedThresholdMs"]!!.jsonPrimitive.int)
+        }
+    }
+
+    @Test
+    fun `an agent with too few rounds answers to the fixed floor alone`() {
+        val owner = newUser()
+        val orgId = newOrg(owner)
+        newAgentWithRounds("agent-new-here", listOf(1800, 1500))
+
+        health(newSession(owner, orgId)) { status, body ->
+            assertEquals(HttpStatusCode.OK, status, body)
+            val entry = statusOf(body, "agent-new-here")
+            assertTrue(entry["baselineMs"] is JsonNull, "no median from two rounds: $body")
+            assertEquals(DEGRADED_RTT_MS, entry["degradedThresholdMs"]!!.jsonPrimitive.int)
+            assertTrue(entry["degraded"]!!.jsonPrimitive.boolean, "both rounds are over the floor: $body")
         }
     }
 

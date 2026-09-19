@@ -6,6 +6,7 @@ import dev.tracedown.common.alerts.SystemAlertService
 import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.ProbeAgents
+import dev.tracedown.common.agents.DegradationRule
 import dev.tracedown.common.agents.FleetAudience
 import dev.tracedown.scheduler.crypto.AgentMtlsClientFactory
 import kotlinx.serialization.json.buildJsonObject
@@ -32,10 +33,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.core.isNotNull
 import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.jdbc.insert
-import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
@@ -76,7 +75,7 @@ class HealthChallengeJob : Job {
         private const val TOKEN_PROBE_TIMEOUT_MS = 3_000L
 
         /** The only result that counts as a healthy round. */
-        const val RESULT_PASS = "pass"
+        const val RESULT_PASS = DegradationRule.RESULT_PASS
 
         /**
          * The round observed nothing about the agent — the token endpoint (or
@@ -342,7 +341,11 @@ class HealthChallengeJob : Job {
         // or, while hysteresis is holding, whatever was there already.
         var status = "success"
         var convicted = false
-        var degraded = false
+        // What the degradation rule concluded about this round. Also published
+        // with the realtime event, because the dashboard replaces the agent's
+        // whole row from it — without the verdict the row would fall back to a
+        // fixed ceiling until the next poll and cry wolf over a distant agent.
+        var verdict = DegradationRule.UNKNOWN
 
         transaction {
             // The previous round that observed anything, read in the same
@@ -361,21 +364,13 @@ class HealthChallengeJob : Job {
 
             // Slowness is judged against this agent's own recent rounds, read
             // before this one is written so the sample never includes itself.
-            if (result == RESULT_PASS) {
-                val recentPassMs = AgentHealthChecks.select(AgentHealthChecks.roundTripMs)
-                    .where {
-                        (AgentHealthChecks.probeAgentId eq agentId) and
-                            (AgentHealthChecks.result eq RESULT_PASS) and
-                            (AgentHealthChecks.roundTripMs.isNotNull())
-                    }
-                    .orderBy(AgentHealthChecks.createdAt to SortOrder.DESC)
-                    .limit(DegradationRule.BASELINE_ROUNDS)
-                    .mapNotNull { it[AgentHealthChecks.roundTripMs] }
-                degraded = DegradationRule.isDegraded(
-                    roundTripMs = roundTripMs,
-                    priorRoundTripMs = recentPassMs.firstOrNull(),
-                    baselineMs = DegradationRule.baseline(recentPassMs),
-                )
+            // A round that did not pass is not judged at all — the agent keeps
+            // the verdict of its last passing round, the same one every reader
+            // of its health is served.
+            verdict = if (result == RESULT_PASS) {
+                DegradationRule.verdictForNewRound(agentId, roundTripMs)
+            } else {
+                DegradationRule.verdictFor(agentId)
             }
 
             AgentHealthChecks.insert {
@@ -425,6 +420,9 @@ class HealthChallengeJob : Job {
             put("status", status)
             put("lastCheck", respondedAt.toString())
             put("lastResponseMs", roundTripMs)
+            put("degraded", verdict.degraded)
+            put("baselineMs", verdict.baselineMs)
+            put("degradedThresholdMs", verdict.thresholdMs)
         }
         FleetAudience.publish(agentSlug, "health.updated", eventData)
 
@@ -441,7 +439,10 @@ class HealthChallengeJob : Job {
                 put("at", challengedAt.toString())
                 put("result", result)
             })
-        } else if (degraded) {
+        // Only a passing round can convict: on any other result [verdict] is the
+        // carried-over reading of the last passing one, which was alerted on
+        // already (or was not) when it happened.
+        } else if (result == RESULT_PASS && verdict.degraded) {
             raisePlatformAgentAlert(SystemAlertService.AGENT_DEGRADED, agentSlug, "warning", buildJsonObject {
                 put("agentSlug", agentSlug)
                 put("at", challengedAt.toString())

@@ -5,6 +5,7 @@ import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.models.AgentBootstrapTokens
 import dev.tracedown.common.models.AgentCertificates
 import dev.tracedown.common.models.ProbeAgents
+import dev.tracedown.common.agents.DegradationRule
 import dev.tracedown.common.agents.FleetAudience
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -148,6 +149,11 @@ object AgentRegistrationController {
                 put("status", "success")
                 put("lastCheck", now.toString())
                 put("lastResponseMs", 0)
+                // An agent that has never answered a health round has nothing
+                // to be slow against yet.
+                put("degraded", false)
+                put("baselineMs", null as Int?)
+                put("degradedThresholdMs", DegradationRule.thresholdMs(null))
             }
             FleetAudience.publish(slug, "health.updated", eventData)
 

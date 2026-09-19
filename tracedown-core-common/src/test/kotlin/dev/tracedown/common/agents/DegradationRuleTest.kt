@@ -1,4 +1,4 @@
-package dev.tracedown.scheduler.scheduling
+package dev.tracedown.common.agents
 
 import dev.tracedown.common.alerts.SystemAlertService.DEGRADED_RTT_MS
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -50,5 +50,55 @@ class DegradationRuleTest {
     fun `the baseline needs enough samples and is the median`() {
         assertNull(DegradationRule.baseline(listOf(40, 41, 39, 5000)))
         assertEquals(44, DegradationRule.baseline(listOf(40, 41, 45, 5000, 44)))
+    }
+
+    // --- verdict(): the same rule read back off a list of rounds, latest first.
+
+    @Test
+    fun `too few rounds to say leaves the fixed floor standing alone`() {
+        val verdict = DegradationRule.verdict(listOf(1800, 900, 900, 900))
+        assertNull(verdict.baselineMs, "three earlier rounds is under the minimum sample")
+        assertEquals(DEGRADED_RTT_MS, verdict.thresholdMs)
+        assertFalse(verdict.degraded, "the round before it is under the floor")
+
+        // And while the floor stands alone it is the whole rule, so an agent
+        // that has not yet earned a baseline is judged by it — both rounds over.
+        assertTrue(DegradationRule.verdict(listOf(1800, 1500, 1500)).degraded)
+    }
+
+    @Test
+    fun `an agent with no rounds at all is not judged`() {
+        assertEquals(DegradationRule.UNKNOWN, DegradationRule.verdict(emptyList()))
+    }
+
+    @Test
+    fun `a far agent running at its usual pace is not degraded`() {
+        val verdict = DegradationRule.verdict(listOf(1800) + List(30) { 1500 })
+        assertEquals(1500, verdict.baselineMs)
+        assertEquals(3000, verdict.thresholdMs)
+        assertFalse(verdict.degraded, "1.8 s is ordinary for an agent whose median is 1.5 s")
+    }
+
+    @Test
+    fun `one slow round on a far agent is weather, two is a condition`() {
+        val history = List(30) { 1500 }
+        assertFalse(DegradationRule.verdict(listOf(3200, 1500) + history).degraded, "the first slow round holds")
+        assertTrue(DegradationRule.verdict(listOf(3100, 3200) + history).degraded)
+    }
+
+    @Test
+    fun `the baseline excludes the round being judged`() {
+        // Six rounds, five of them 100 ms: taking the median over all six would
+        // let the 5 s round drag the sample it is measured against.
+        val verdict = DegradationRule.verdict(listOf(5000, 100, 100, 100, 100, 100))
+        assertEquals(100, verdict.baselineMs)
+    }
+
+    @Test
+    fun `only the rounds the baseline covers count towards it`() {
+        // A long tail of slow rounds beyond BASELINE_ROUNDS must not move the
+        // median the way it would if the whole list were used.
+        val rounds = listOf(1000) + List(DegradationRule.BASELINE_ROUNDS) { 100 } + List(200) { 9000 }
+        assertEquals(100, DegradationRule.verdict(rounds).baselineMs)
     }
 }

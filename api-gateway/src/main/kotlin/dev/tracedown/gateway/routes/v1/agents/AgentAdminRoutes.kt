@@ -2,6 +2,7 @@ package dev.tracedown.gateway.routes.v1.agents
 
 import at.favre.lib.crypto.bcrypt.BCrypt
 import dev.tracedown.common.agents.AgentVisibility
+import dev.tracedown.common.agents.DegradationRule
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.gateway.controllers.agents.CaService
@@ -65,6 +66,12 @@ data class AgentSummary(
     val createdAt: String,
     /** The body store the agent writes to; null = the default store. */
     val bodyStoreId: String?,
+    /** The platform's own slowness verdict on the agent's last passing round. */
+    val degraded: Boolean,
+    /** The agent's usual round trip; null until it has enough rounds to say. */
+    val baselineMs: Int?,
+    /** The round trip [degraded] is measured against — never below the fixed floor. */
+    val degradedThresholdMs: Int,
 )
 
 @Serializable
@@ -178,22 +185,27 @@ fun Route.agentAdminRoutes() {
                 .orderBy(ProbeAgents.slug)
                 .toList()
             val visible = AgentVisibility.visible(orgId, principal.userId, rows.map { it[ProbeAgents.slug] })
-            rows.filter { it[ProbeAgents.slug] in visible }
-                .map { row ->
-                    AgentSummary(
-                        slug = row[ProbeAgents.slug],
-                        label = row[ProbeAgents.label],
-                        agentUri = row[ProbeAgents.agentUri],
-                        isActive = row[ProbeAgents.isActive],
-                        lastStatus = row[ProbeAgents.lastStatus],
-                        lastPing = row[ProbeAgents.lastPing].toString(),
-                        lastPongDeltaMs = row[ProbeAgents.lastPongDeltaMs],
-                        encryptPayload = row[ProbeAgents.encryptPayload],
-                        supportsEncryptedPayload = row[ProbeAgents.supportsEncryptedPayload],
-                        createdAt = row[ProbeAgents.createdAt].toString(),
-                        bodyStoreId = row[ProbeAgents.bodyStoreId]?.toString(),
-                    )
-                }
+            val shown = rows.filter { it[ProbeAgents.slug] in visible }
+            val verdicts = DegradationRule.verdicts(shown.map { it[ProbeAgents.id] })
+            shown.map { row ->
+                val verdict = verdicts[row[ProbeAgents.id]] ?: DegradationRule.UNKNOWN
+                AgentSummary(
+                    slug = row[ProbeAgents.slug],
+                    label = row[ProbeAgents.label],
+                    agentUri = row[ProbeAgents.agentUri],
+                    isActive = row[ProbeAgents.isActive],
+                    lastStatus = row[ProbeAgents.lastStatus],
+                    lastPing = row[ProbeAgents.lastPing].toString(),
+                    lastPongDeltaMs = row[ProbeAgents.lastPongDeltaMs],
+                    encryptPayload = row[ProbeAgents.encryptPayload],
+                    supportsEncryptedPayload = row[ProbeAgents.supportsEncryptedPayload],
+                    createdAt = row[ProbeAgents.createdAt].toString(),
+                    bodyStoreId = row[ProbeAgents.bodyStoreId]?.toString(),
+                    degraded = verdict.degraded,
+                    baselineMs = verdict.baselineMs,
+                    degradedThresholdMs = verdict.thresholdMs,
+                )
+            }
         }
         call.respond(agents)
     }

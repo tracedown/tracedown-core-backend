@@ -18,6 +18,7 @@ import dev.tracedown.gateway.cli.OrgBootstrap
 import dev.tracedown.gateway.cli.RewrapBodyStores
 import dev.tracedown.gateway.cli.RewrapOrgKeys
 import dev.tracedown.gateway.jobs.SecretReencryption
+import dev.tracedown.common.agents.DegradationRule
 import dev.tracedown.common.onboarding.OrgService
 import dev.tracedown.gateway.controllers.services.ServiceController
 import dev.tracedown.gateway.controllers.workspaces.WorkspaceController
@@ -319,16 +320,22 @@ fun Application.module() {
     }
     BulkDispatcher.get("/agents/health") { _, _ ->
         val health = transaction {
-            val statuses = ProbeAgents.selectAll()
+            val rows = ProbeAgents.selectAll()
                 .where { ProbeAgents.isActive eq true }
-                .map { row ->
-                    AgentStatus(
-                        agentSlug = row[ProbeAgents.slug],
-                        status = row[ProbeAgents.lastStatus],
-                        lastCheck = row[ProbeAgents.lastPing].toString(),
-                        lastResponseMs = row[ProbeAgents.lastPongDeltaMs],
-                    )
-                }
+                .toList()
+            val verdicts = DegradationRule.verdicts(rows.map { it[ProbeAgents.id] })
+            val statuses = rows.map { row ->
+                val verdict = verdicts[row[ProbeAgents.id]] ?: DegradationRule.UNKNOWN
+                AgentStatus(
+                    agentSlug = row[ProbeAgents.slug],
+                    status = row[ProbeAgents.lastStatus],
+                    lastCheck = row[ProbeAgents.lastPing].toString(),
+                    lastResponseMs = row[ProbeAgents.lastPongDeltaMs],
+                    degraded = verdict.degraded,
+                    baselineMs = verdict.baselineMs,
+                    degradedThresholdMs = verdict.thresholdMs,
+                )
+            }
             AgentHealthResponse(statuses = statuses)
         }
         bulkJson.encodeToJsonElement(health)

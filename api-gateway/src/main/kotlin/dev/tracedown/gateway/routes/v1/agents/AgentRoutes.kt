@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.routes.v1.agents
 
 import dev.tracedown.common.agents.AgentVisibility
+import dev.tracedown.common.agents.DegradationRule
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.gateway.routes.v1
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
@@ -15,12 +16,25 @@ import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 
+/**
+ * One agent's liveness.
+ *
+ * [lastResponseMs] is an observation, not a verdict: what counts as slow
+ * depends on where the agent is, so the platform judges it against the agent's
+ * own recent rounds rather than one ceiling for the whole fleet. That judgement
+ * is [degraded], and [baselineMs] (the agent's usual round trip, null until
+ * there are enough rounds to say) and [degradedThresholdMs] are what it was
+ * reached from. See `DegradationRule`.
+ */
 @Serializable
 data class AgentStatus(
     val agentSlug: String,
     val status: String,
     val lastCheck: String?,
     val lastResponseMs: Int?,
+    val degraded: Boolean,
+    val baselineMs: Int?,
+    val degradedThresholdMs: Int,
 )
 
 @Serializable
@@ -76,15 +90,21 @@ fun Route.agentRoutes() {
                 .where { (ProbeAgents.isActive eq true) and (ProbeAgents.deleted eq false) }
                 .toList()
             val visible = AgentVisibility.visible(orgId, principal.userId, rows.map { it[ProbeAgents.slug] })
-            rows.filter { it[ProbeAgents.slug] in visible }
-                .map { row ->
-                    AgentStatus(
-                        agentSlug = row[ProbeAgents.slug],
-                        status = row[ProbeAgents.lastStatus],
-                        lastCheck = row[ProbeAgents.lastPing].toString(),
-                        lastResponseMs = row[ProbeAgents.lastPongDeltaMs],
-                    )
-                }
+            val shown = rows.filter { it[ProbeAgents.slug] in visible }
+            // One statement for the whole roster — this feed is polled.
+            val verdicts = DegradationRule.verdicts(shown.map { it[ProbeAgents.id] })
+            shown.map { row ->
+                val verdict = verdicts[row[ProbeAgents.id]] ?: DegradationRule.UNKNOWN
+                AgentStatus(
+                    agentSlug = row[ProbeAgents.slug],
+                    status = row[ProbeAgents.lastStatus],
+                    lastCheck = row[ProbeAgents.lastPing].toString(),
+                    lastResponseMs = row[ProbeAgents.lastPongDeltaMs],
+                    degraded = verdict.degraded,
+                    baselineMs = verdict.baselineMs,
+                    degradedThresholdMs = verdict.thresholdMs,
+                )
+            }
         }
 
         call.respond(AgentHealthResponse(statuses = statuses))
