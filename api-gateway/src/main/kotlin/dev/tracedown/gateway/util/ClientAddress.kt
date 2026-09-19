@@ -9,6 +9,9 @@ import io.ktor.util.AttributeKey
 /** Where the resolved address lives for the duration of one call. */
 private val ClientAddressKey = AttributeKey<String>("ClientAddress")
 
+/** The longest an address gets: an IPv6 literal with an embedded IPv4 tail. */
+private const val MAX_ADDRESS_LENGTH = 45
+
 /**
  * Resolves the caller's address once per request, so everything that needs it
  * — the rate-limit key, the address recorded on a session — reads the same
@@ -27,16 +30,22 @@ private val ClientAddressKey = AttributeKey<String>("ClientAddress")
 fun Application.installClientAddress(trustedProxies: Int) {
     install(createApplicationPlugin("ClientAddress") {
         onCall { call ->
+            // The literal peer — `origin.remoteHost` may reverse-resolve DNS,
+            // which stalls the event loop and yields a name the caller controls.
+            val peer = call.request.local.remoteAddress
+            val resolved = resolveClientIp(
+                xff = call.request.headers["X-Forwarded-For"],
+                directPeer = peer,
+                trustedProxies = trustedProxies,
+            )
+            // Every hop a correct configuration selects was written by a proxy,
+            // so it is an address. One longer than an address can be was written
+            // by the caller — which only reaches this position on a deployment
+            // claiming more proxies than it has. Fall back to the peer rather
+            // than carry it into a rate-limit key or a column it does not fit.
             call.attributes.put(
                 ClientAddressKey,
-                resolveClientIp(
-                    xff = call.request.headers["X-Forwarded-For"],
-                    // The literal peer — `origin.remoteHost` may reverse-resolve
-                    // DNS, which stalls the event loop and yields a name the
-                    // caller controls.
-                    directPeer = call.request.local.remoteAddress,
-                    trustedProxies = trustedProxies,
-                ),
+                if (resolved.length <= MAX_ADDRESS_LENGTH) resolved else peer,
             )
         }
     })

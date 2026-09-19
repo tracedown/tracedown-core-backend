@@ -340,6 +340,19 @@ class ClientAddressIntegrationTest {
     }
 
     @Test
+    fun `a hop too long to be an address is not the one recorded`() {
+        // Only a caller can put this in the chain, and only where the hop count
+        // claims more proxies than there are. It must not reach the column.
+        val (status, body) = post(
+            "/api/v1/auth/login",
+            """{"email":"$ADMIN_EMAIL","password":"$ADMIN_PASSWORD"}""",
+            forwarded = "${"9".repeat(60)}, $PROXY_ONE, $PROXY_TWO",
+        )
+        assertEquals(200, status, "Login response: $body")
+        assertEquals(LOOPBACK, addressOn(tokenFrom(body)))
+    }
+
+    @Test
     fun `with no proxies in front the peer is recorded and the header ignored`() {
         val (status, body) = post(
             "/api/v1/auth/login",
