@@ -22,6 +22,7 @@ import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.auth.resolveOrgPermissions
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.clientIp
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.parsePfsParams
@@ -107,7 +108,7 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
         val result = AuthController.login(
             request = body,
             sessionTtlMinutes = appConfig.jwt.ttlMinutes,
-            ipAddress = call.request.local.remoteAddress,
+            ipAddress = call.clientIp(),
             userAgent = call.request.headers["User-Agent"],
         )
         call.respond(result)
@@ -120,7 +121,7 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
             challenge = body.challenge,
             code = body.code,
             sessionTtlMinutes = appConfig.jwt.ttlMinutes,
-            ipAddress = call.request.local.remoteAddress,
+            ipAddress = call.clientIp(),
             userAgent = call.request.headers["User-Agent"],
         )
         call.respond(result)
@@ -155,7 +156,7 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
             confirmToken = body.confirmToken,
             code = body.code,
             sessionTtlMinutes = appConfig.jwt.ttlMinutes,
-            ipAddress = call.request.local.remoteAddress,
+            ipAddress = call.clientIp(),
             userAgent = call.request.headers["User-Agent"],
         )
         call.respond(result)
@@ -173,7 +174,7 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
             principal = principal,
             targetOrgId = targetOrgId,
             sessionTtlMinutes = appConfig.jwt.ttlMinutes,
-            ipAddress = call.request.local.remoteAddress,
+            ipAddress = call.clientIp(),
             userAgent = call.request.headers["User-Agent"],
         )
         call.respond(result)

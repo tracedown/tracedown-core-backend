@@ -60,6 +60,8 @@ import dev.tracedown.common.health.databaseCheck
 import dev.tracedown.common.health.readinessRoute
 import dev.tracedown.common.health.redisCheck
 import dev.tracedown.gateway.util.CorsSettings
+import dev.tracedown.gateway.util.clientIp
+import dev.tracedown.gateway.util.installClientAddress
 import dev.tracedown.gateway.util.ProxyChainObserver
 import dev.tracedown.gateway.util.RateLimitConfig
 import dev.tracedown.gateway.util.installRequestBodyLimit
@@ -483,6 +485,11 @@ fun Application.module() {
         onCall { dev.tracedown.common.logging.LogContext.clear() }
     })
 
+    // The caller's address, resolved once per request from the forwarded chain.
+    // Installed ahead of the rate limiter so the routes that record the address
+    // still get it on the paths the limiter skips, and when it is switched off.
+    installClientAddress(rateLimitConfig.trustedProxies)
+
     install(createApplicationPlugin("RateLimit") {
         onCall { call ->
             if (!rateLimitConfig.enabled) return@onCall
@@ -491,12 +498,9 @@ fun Application.module() {
 
             // Key on the real client IP, taken a trusted number of proxy hops
             // back from the TCP peer so a client-supplied XFF cannot spoof it.
+            // Same value the session row records — one resolution per call.
             val xff = call.request.headers["X-Forwarded-For"]
-            val ip = dev.tracedown.gateway.util.resolveClientIp(
-                xff = xff,
-                directPeer = call.request.local.remoteAddress,
-                trustedProxies = rateLimitConfig.trustedProxies,
-            )
+            val ip = call.clientIp()
             // Whether that key is the caller's or a proxy's is invisible from
             // any single request; this watches the shape across many of them.
             proxyChainObserver.observe(

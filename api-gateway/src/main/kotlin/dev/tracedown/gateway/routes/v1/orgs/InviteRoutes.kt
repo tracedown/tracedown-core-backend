@@ -9,6 +9,7 @@ import java.util.UUID
 import dev.tracedown.gateway.routes.v1
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
 import dev.tracedown.gateway.util.AppConfig
+import dev.tracedown.gateway.util.clientIp
 import dev.tracedown.gateway.util.parsePfsParams
 import dev.tracedown.gateway.util.parseUuid
 import dev.tracedown.gateway.util.tryReceive
@@ -87,7 +88,7 @@ fun Route.inviteRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
             displayName = body.displayName,
             authenticatedUserId = authenticatedUserId,
             appConfig = appConfig,
-            ipAddress = call.request.local.remoteAddress,
+            ipAddress = call.clientIp(),
             userAgent = call.request.headers["User-Agent"],
         )
         call.respond(result)
