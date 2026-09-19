@@ -232,7 +232,9 @@ class ClientAddressIntegrationTest {
         port: Int = proxiedPort,
     ): Pair<Int, JsonObject> {
         val builder = Request.Builder()
-            .url("http://localhost:$port$path")
+            // By address, not by name: `localhost` resolves to ::1 first on some
+            // hosts, and the peer the gateway then sees is not LOOPBACK.
+            .url("http://$LOOPBACK:$port$path")
             .post(body.toRequestBody(jsonType))
         forwarded?.let { builder.header("X-Forwarded-For", it) }
         bearer?.let { builder.header("Authorization", "Bearer $it") }
