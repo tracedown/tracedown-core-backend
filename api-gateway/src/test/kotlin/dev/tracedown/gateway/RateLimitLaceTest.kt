@@ -43,6 +43,12 @@ import java.net.ServerSocket
 class RateLimitLaceTest {
 
     companion object {
+        /** Window of both tiers under test. */
+        private const val WINDOW_SECONDS = 60L
+
+        /** A script is a handful of requests; this is far more than one takes. */
+        private const val WINDOW_HEADROOM_SECONDS = 15L
+
         @Container
         @JvmStatic
         val postgres = PostgreSQLContainer("postgres:18-alpine")
@@ -86,9 +92,9 @@ class RateLimitLaceTest {
                 // Enable rate limiting with low limits for testing
                 "rateLimit.enabled" to "true",
                 "rateLimit.general.maxRequests" to "5",
-                "rateLimit.general.windowSeconds" to "60",
+                "rateLimit.general.windowSeconds" to WINDOW_SECONDS.toString(),
                 "rateLimit.auth.maxRequests" to "3",
-                "rateLimit.auth.windowSeconds" to "60",
+                "rateLimit.auth.windowSeconds" to WINDOW_SECONDS.toString(),
             ))
             val mergedConfig = overrides.withFallback(ConfigFactory.load())
 
@@ -109,6 +115,17 @@ class RateLimitLaceTest {
         fun teardown() {
             server.stop(1000, 5000)
             redisClient.shutdown()
+        }
+
+        /**
+         * Sleeps into the next rate-limit window unless at least
+         * [WINDOW_HEADROOM_SECONDS] of the current one remain. Both tiers are
+         * configured with the same [WINDOW_SECONDS] above, so one clock serves both.
+         */
+        fun awaitWindowHeadroom() {
+            val intoWindow = (System.currentTimeMillis() / 1000) % WINDOW_SECONDS
+            val remaining = WINDOW_SECONDS - intoWindow
+            if (remaining < WINDOW_HEADROOM_SECONDS) Thread.sleep((remaining + 1) * 1000)
         }
 
         /** Flush all rate limit keys from Redis between tests. */
@@ -132,6 +149,12 @@ class RateLimitLaceTest {
 
         return scripts.map { script ->
             DynamicTest.dynamicTest(script.name) {
+                // The limiter counts in fixed windows keyed by `epoch / windowSeconds`,
+                // so a script that straddles a window boundary sees its counter
+                // reset and its final "must be 429" request answered 200. Start
+                // each script with the whole script's worth of window ahead of it.
+                awaitWindowHeadroom()
+
                 // Flush rate limit counters before each test for isolation
                 flushRateLimitKeys()
 
