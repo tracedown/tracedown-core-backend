@@ -2,7 +2,6 @@ package dev.tracedown.worker.jobs
 
 import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.Organizations
-import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeStepAggregates
 import dev.tracedown.common.models.ProbeSteps
@@ -81,8 +80,6 @@ class StepAggregationTest {
     /** A service of its own for the retention and purge cases. */
     private val lifecycleServiceId: UUID = UUID.randomUUID()
 
-    private var agentId: Long = 0
-
     @BeforeAll
     fun setup() {
         Flyway.configure()
@@ -127,21 +124,6 @@ class StepAggregationTest {
                     it[createdAt] = base
                 }
             }
-
-            // Every run is attributed to an agent, as a dispatched run is. The
-            // per-service rollup beside this one upserts on an index that
-            // includes the agent, and Postgres treats NULLs there as distinct.
-            agentId = ProbeAgents.insert {
-                it[slug] = "step-agg-agent"
-                it[label] = "Step Aggregation Agent"
-                it[agentUri] = "https://step-agg-agent.example.test:8443"
-                it[publicKey] = "x"
-                it[lastPing] = base
-                it[lastStatus] = "success"
-                it[lastPingDelayMs] = 0
-                it[lastPongDeltaMs] = 0
-                it[createdAt] = base
-            }[ProbeAgents.id]
 
             // Hour 10 of the first day: one run, four calls.
             val firstRun = result(serviceId, base.plus(10, ChronoUnit.HOURS), "success")
@@ -459,7 +441,12 @@ class StepAggregationTest {
         ProbeResults.insert {
             it[ProbeResults.id] = id
             it[serviceId] = service
-            it[probeAgentId] = agentId
+            // No agent: the endpoint rollup has no agent dimension, and this is
+            // also the shape a single-jar install produces, where probes run
+            // in-process and no run is attributed to one. The per-service
+            // rollup runs in the same transaction, so this fixture proves it
+            // survives such rows too.
+            it[probeAgentId] = null
             it[startedAt] = at
             it[ProbeResults.status] = status
             it[runDurationMs] = 10

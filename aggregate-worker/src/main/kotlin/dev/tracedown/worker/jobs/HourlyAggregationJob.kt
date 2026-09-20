@@ -18,7 +18,8 @@ private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.HourlyAggre
  * length is backfilled instead of leaving a permanent hole. See
  * [AggregationWindow] for the reasoning and the bounds.
  *
- * Produces per-agent rows and an all-agents rollup (probe_agent_id IS NULL).
+ * Produces a row per agent that ran the service and an all-agents rollup
+ * (probe_agent_id IS NULL) covering every run, agent or not.
  * Both are idempotent upserts — safe to re-run, to overlap, and to re-derive
  * a window whose raw rows retention has since removed (such a window updates
  * nothing rather than deleting the aggregate that is now the only record of it).
@@ -58,7 +59,8 @@ class HourlyAggregationJob(
         ioTransaction {
             val conn = this.connection.connection as java.sql.Connection
 
-            // Per-agent aggregation — ON CONFLICT works because probe_agent_id is NOT NULL
+            // Per-agent aggregation, over the runs that have an agent. Runs
+            // without one are not a region and are left to the rollup below.
             conn.prepareStatement(PER_AGENT_SQL).use { stmt ->
                 stmt.setTimestamp(1, tsStart)
                 stmt.setTimestamp(2, tsEnd)
@@ -148,6 +150,18 @@ class HourlyAggregationJob(
          */
         const val MAX_BUCKETS_PER_RUN = 24L
 
+        /**
+         * One row per agent that actually ran the service in the bucket.
+         *
+         * `probe_agent_id IS NOT NULL` is what makes the upsert an upsert. Not
+         * every finished run carries an agent — the single-jar edition executes
+         * probes in its own process and attributes them to no agent at all —
+         * and a NULL group is doubly wrong here: its conflict target can never
+         * match (Postgres treats NULLs in a unique index as distinct, so the
+         * row is inserted afresh every run) and the row it writes lands in the
+         * key space the all-agents rollup owns, where the partial unique index
+         * rejects it. Those runs are not a region; the rollup counts them.
+         */
         private val PER_AGENT_SQL = """
             INSERT INTO probe_aggregates (id, service_id, probe_agent_id, bucket_start, bucket_type,
                                           p50_ms, p95_ms, p99_ms, error_rate, uptime_pct, probe_count)
@@ -165,6 +179,7 @@ class HourlyAggregationJob(
                 COUNT(*)
             FROM probe_results
             WHERE started_at >= ? AND started_at < ? AND status != 'skipped'
+              AND probe_agent_id IS NOT NULL
             GROUP BY service_id, probe_agent_id, date_trunc('hour', started_at)
             ON CONFLICT (service_id, probe_agent_id, bucket_start, bucket_type)
             DO UPDATE SET

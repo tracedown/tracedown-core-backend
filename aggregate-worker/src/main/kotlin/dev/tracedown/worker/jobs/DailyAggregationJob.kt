@@ -16,8 +16,9 @@ private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.DailyAggreg
  * back to the watermark left by the previous run, so a gap longer than the
  * lookback is backfilled rather than lost. See [AggregationWindow].
  *
- * Produces per-agent rows and an all-agents rollup (probe_agent_id IS NULL),
- * both as idempotent upserts.
+ * Produces a row per agent that ran the service and an all-agents rollup
+ * (probe_agent_id IS NULL) covering every run, agent or not, both as
+ * idempotent upserts.
  */
 class DailyAggregationJob(
     override val intervalSeconds: Long = 3600L,
@@ -50,7 +51,8 @@ class DailyAggregationJob(
         ioTransaction {
             val conn = this.connection.connection as java.sql.Connection
 
-            // Per-agent aggregation
+            // Per-agent aggregation, over the runs that have an agent. Runs
+            // without one are not a region and are left to the rollup below.
             conn.prepareStatement(PER_AGENT_SQL).use { stmt ->
                 stmt.setTimestamp(1, tsStart)
                 stmt.setTimestamp(2, tsEnd)
@@ -96,6 +98,14 @@ class DailyAggregationJob(
         /** Widest window one run may build — two weeks of daily buckets. */
         const val MAX_BUCKETS_PER_RUN = 14L
 
+        /**
+         * One row per agent that actually ran the service in the bucket.
+         *
+         * `probe_agent_id IS NOT NULL` is what makes the upsert an upsert — see
+         * the same statement in [HourlyAggregationJob] for why a NULL group
+         * both fails to match its own earlier row and collides with the
+         * all-agents rollup's.
+         */
         private val PER_AGENT_SQL = """
             INSERT INTO probe_aggregates (id, service_id, probe_agent_id, bucket_start, bucket_type,
                                           p50_ms, p95_ms, p99_ms, error_rate, uptime_pct, probe_count)
@@ -113,6 +123,7 @@ class DailyAggregationJob(
                 COUNT(*)
             FROM probe_results
             WHERE started_at >= ? AND started_at < ? AND status != 'skipped'
+              AND probe_agent_id IS NOT NULL
             GROUP BY service_id, probe_agent_id, date_trunc('day', started_at)
             ON CONFLICT (service_id, probe_agent_id, bucket_start, bucket_type)
             DO UPDATE SET

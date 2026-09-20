@@ -379,6 +379,37 @@ class DashboardMetricsTest {
     }
 
     @Test
+    fun `a service whose runs carry no agent still has an overall trend and no regions`() {
+        // What a single-jar install looks like: probes run in-process, nothing
+        // is attributed to an agent, so the rollup rows are the only rows there
+        // are. The trend must still be served, and the per-region breakdown
+        // must come back empty rather than naming a region that does not exist.
+        val svcId = createService("Agentless Svc ${UUID.randomUUID().toString().take(8)}")
+        val recent = Instant.now().minusSeconds(1800)
+
+        transaction {
+            ProbeAggregates.insert {
+                it[id] = UUID.randomUUID(); it[serviceId] = svcId
+                it[probeAgentId] = null; it[bucketStart] = recent; it[bucketType] = "hourly"
+                it[p50Ms] = 120; it[p95Ms] = 240; it[p99Ms] = 360
+                it[errorRate] = 0.25f; it[uptimePct] = 0.75f; it[probeCount] = 4
+            }
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics?window=24h", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+
+        val overall = json["overall"]!!.jsonArray
+        assertEquals(1, overall.size, "the rollup bucket is served even with no agent behind it")
+        val bucket = overall.single().jsonObject
+        assertEquals(75.0, bucket["uptimePct"]!!.jsonPrimitive.content.toDouble(), 0.01)
+        assertEquals(240, bucket["p95Ms"]!!.jsonPrimitive.int)
+
+        assertTrue(json["regions"]!!.jsonArray.isEmpty(), "no agent ran it, so there is no region")
+    }
+
+    @Test
     fun `history returns current hour bucket with seeded data`() {
         seedRedisMetrics()
         try {
