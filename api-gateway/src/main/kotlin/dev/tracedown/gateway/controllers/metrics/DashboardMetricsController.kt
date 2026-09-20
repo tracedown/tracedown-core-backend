@@ -3,7 +3,13 @@ package dev.tracedown.gateway.controllers.metrics
 import dev.tracedown.common.models.ProbeAggregates
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
+import dev.tracedown.common.models.Services
+import dev.tracedown.common.util.EndpointKeySql
+import dev.tracedown.common.util.EndpointKeys
+import dev.tracedown.gateway.data.metrics.EndpointCodeCount
+import dev.tracedown.gateway.data.metrics.EndpointStat
 import dev.tracedown.gateway.data.metrics.HourlyBucket
+import dev.tracedown.gateway.data.metrics.PhaseTimings
 import dev.tracedown.gateway.data.metrics.RegionSeries
 import dev.tracedown.gateway.data.metrics.ServiceStatisticsDto
 import dev.tracedown.gateway.data.metrics.StatBucket
@@ -36,6 +42,7 @@ import org.jetbrains.exposed.v1.core.isNotNull
 import org.jetbrains.exposed.v1.core.isNull
 import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.time.Instant
 import java.time.ZoneId
@@ -79,13 +86,16 @@ object DashboardMetricsController {
     private val redis get() = redisProvider()
 
     /**
-     * Deep statistics for a service, straight from `probe_aggregates` (no Redis):
-     * the all-agents trend plus a per-region breakdown, over [window]. Short windows
-     * use hourly buckets, long windows daily. `uptime_pct`/`error_rate` are stored as
+     * Deep statistics for a service, straight from the aggregate tables (no
+     * Redis): the all-agents trend plus a per-region breakdown, and the same
+     * window broken down per endpoint, over [window]. Short windows use hourly
+     * buckets, long windows daily. `uptime_pct`/`error_rate` are stored as
      * 0..1 fractions and returned as 0..100 percentages.
      */
     fun getServiceStatistics(serviceId: UUID, window: String): ServiceStatisticsDto {
-        val (bucketType, since) = windowSpec(window)
+        val spec = windowSpec(window)
+        val bucketType = spec.bucketType
+        val since = spec.since
         return transaction {
             val overall = ProbeAggregates.selectAll()
                 .where {
@@ -117,17 +127,280 @@ object DashboardMetricsController {
                 }
                 .sortedBy { it.agentLabel }
 
-            ServiceStatisticsDto(window = window, bucketType = bucketType, overall = overall, regions = regions)
+            val ranked = endpointStats(serviceId, spec)
+
+            ServiceStatisticsDto(
+                window = window,
+                bucketType = bucketType,
+                overall = overall,
+                regions = regions,
+                endpoints = ranked.take(MAX_ENDPOINTS),
+                endpointsTruncated = ranked.size > MAX_ENDPOINTS,
+            )
         }
     }
 
-    /** Maps a window token to (bucket granularity, earliest bucket start to include). */
-    private fun windowSpec(window: String): Pair<String, Instant> = when (window) {
-        "7d" -> "hourly" to Instant.now().minus(7, ChronoUnit.DAYS)
-        "30d" -> "daily" to Instant.now().minus(30, ChronoUnit.DAYS)
-        "90d" -> "daily" to Instant.now().minus(90, ChronoUnit.DAYS)
-        else -> "hourly" to Instant.now().minus(24, ChronoUnit.HOURS)
+    /**
+     * How many endpoints a statistics response carries. A script is a probe,
+     * not a crawl: past a couple of dozen calls the chart it feeds stops being
+     * readable, and the rest are dropped with `endpointsTruncated` set rather
+     * than silently.
+     */
+    const val MAX_ENDPOINTS = 20
+
+    /** A window token resolved into the bounds every query in the read shares. */
+    private class StatsWindow(
+        /** "hourly" | "daily". */
+        val bucketType: String,
+        /** Earliest bucket start in the window. */
+        val since: Instant,
+        /** Earliest bucket start of the equal-length window immediately before. */
+        val previousSince: Instant,
+    )
+
+    /**
+     * Maps a window token to its bucket granularity and bounds. One `now` for
+     * the whole read, so the window and the one before it are exactly
+     * adjacent and exactly the same length.
+     */
+    private fun windowSpec(window: String): StatsWindow {
+        val now = Instant.now()
+        val (bucketType, length, unit) = when (window) {
+            "7d" -> Triple("hourly", 7L, ChronoUnit.DAYS)
+            "30d" -> Triple("daily", 30L, ChronoUnit.DAYS)
+            "90d" -> Triple("daily", 90L, ChronoUnit.DAYS)
+            else -> Triple("hourly", 24L, ChronoUnit.HOURS)
+        }
+        val since = now.minus(length, unit)
+        return StatsWindow(bucketType, since, since.minus(length, unit))
     }
+
+    // ── Per-endpoint statistics ─────────────────────────────────────────
+
+    /**
+     * How far back the example-URL lookup reads. It exists to put a real
+     * address next to a template, not to be exhaustive, so it is bounded by
+     * rows rather than by time: the most recent steps of the window, which is
+     * an index scan whether the window is a day or a quarter. An endpoint that
+     * has not been called in that many steps simply has no example.
+     */
+    private const val EXAMPLE_URL_STEP_SCAN = 2000
+
+    /** Running totals for one endpoint over one window. */
+    private class EndpointTotals {
+        var calls = 0L
+        var timed = 0L
+        var dnsMs = 0L
+        var connectMs = 0L
+        var tlsMs = 0L
+        var ttfbMs = 0L
+        var transferMs = 0L
+        var responseMs = 0L
+        var sizeBytes = 0L
+        var sized = 0L
+        val codes = linkedMapOf<Int, Long>()
+    }
+
+    /**
+     * The window broken down per endpoint, ordered but not yet capped.
+     *
+     * Three queries, none of them per endpoint: the window's aggregate rows,
+     * the preceding window's, and one bounded lookup for an example URL. The
+     * service's current script supplies the order where it can be parsed —
+     * a statistics table that lists endpoints in the order they are written is
+     * readable next to the script; one ordered by call count is not.
+     */
+    private fun endpointStats(serviceId: UUID, spec: StatsWindow): List<EndpointStat> {
+        val current = readEndpointTotals(serviceId, spec.bucketType, spec.since, null)
+        if (current.isEmpty()) return emptyList()
+
+        val previous = readEndpointTotals(serviceId, spec.bucketType, spec.previousSince, spec.since)
+        val examples = readExampleUrls(serviceId, spec.since)
+        val order = scriptEndpointOrder(serviceId)
+
+        return current
+            .map { (key, totals) ->
+                val (method, template) = EndpointKeys.split(key)
+                EndpointStat(
+                    key = key,
+                    method = method,
+                    template = template,
+                    exampleUrl = examples[key],
+                    calls = totals.calls,
+                    codes = totals.codes.entries
+                        // Ascending, but "no response" last: it is not a status
+                        // code, and sorting it in front of 200 would put the
+                        // least ordinary outcome where the eye starts.
+                        .sortedWith(compareBy({ if (it.key == 0) 1 else 0 }, { it.key }))
+                        .map { EndpointCodeCount(it.key, it.value) },
+                    phases = totals.toPhases(),
+                    previousPhases = previous[key]?.toPhases(),
+                    avgSizeBytes = if (totals.sized > 0) {
+                        Math.round(totals.sizeBytes.toDouble() / totals.sized)
+                    } else {
+                        null
+                    },
+                )
+            }
+            .sortedWith(
+                compareBy<EndpointStat> { order[it.key] ?: Int.MAX_VALUE }
+                    .thenByDescending { it.calls }
+                    .thenBy { it.key },
+            )
+    }
+
+    /** Averages over the calls that carried timings; null when none did. */
+    private fun EndpointTotals.toPhases(): PhaseTimings? {
+        if (timed <= 0) return null
+        fun avg(sum: Long): Int = Math.round(sum.toDouble() / timed).toInt()
+        return PhaseTimings(
+            dnsMs = avg(dnsMs),
+            connectMs = avg(connectMs),
+            tlsMs = avg(tlsMs),
+            ttfbMs = avg(ttfbMs),
+            transferMs = avg(transferMs),
+            responseMs = avg(responseMs),
+        )
+    }
+
+    /**
+     * Sums `probe_step_aggregates` over `[since, until)` (open-ended when
+     * [until] is null) into one entry per endpoint. Insertion-ordered, so an
+     * unparseable script still yields a stable list.
+     */
+    private fun readEndpointTotals(
+        serviceId: UUID,
+        bucketType: String,
+        since: Instant,
+        until: Instant?,
+    ): Map<String, EndpointTotals> {
+        val upperBound = if (until != null) "AND bucket_start < '${sqlTimestamp(until)}'" else ""
+        // service id is a UUID object and bucket_type comes from this file's
+        // own window table — neither is caller text.
+        val sql = """
+            SELECT endpoint_key,
+                   status_code,
+                   SUM(call_count)      AS calls,
+                   SUM(timed_count)     AS timed,
+                   SUM(sum_dns_ms)      AS dns_ms,
+                   SUM(sum_connect_ms)  AS connect_ms,
+                   SUM(sum_tls_ms)      AS tls_ms,
+                   SUM(sum_ttfb_ms)     AS ttfb_ms,
+                   SUM(sum_transfer_ms) AS transfer_ms,
+                   SUM(sum_response_ms) AS response_ms,
+                   SUM(sum_size_bytes)  AS size_bytes,
+                   SUM(sized_count)     AS sized
+            FROM probe_step_aggregates
+            WHERE service_id = '$serviceId'
+              AND bucket_type = '$bucketType'
+              AND bucket_start >= '${sqlTimestamp(since)}'
+              $upperBound
+            GROUP BY endpoint_key, status_code
+        """.trimIndent()
+
+        val out = linkedMapOf<String, EndpointTotals>()
+        TransactionManager.current().exec(sql) { rs ->
+            while (rs.next()) {
+                val totals = out.getOrPut(rs.getString("endpoint_key")) { EndpointTotals() }
+                val calls = rs.getLong("calls")
+                totals.calls += calls
+                totals.timed += rs.getLong("timed")
+                totals.dnsMs += rs.getLong("dns_ms")
+                totals.connectMs += rs.getLong("connect_ms")
+                totals.tlsMs += rs.getLong("tls_ms")
+                totals.ttfbMs += rs.getLong("ttfb_ms")
+                totals.transferMs += rs.getLong("transfer_ms")
+                totals.responseMs += rs.getLong("response_ms")
+                totals.sizeBytes += rs.getLong("size_bytes")
+                totals.sized += rs.getLong("sized")
+                val code = rs.getInt("status_code")
+                totals.codes[code] = (totals.codes[code] ?: 0L) + calls
+            }
+        }
+        return out
+    }
+
+    /**
+     * A resolved URL to show beside each endpoint's template, in one query —
+     * the most recent one each key was seen at, query and fragment stripped.
+     *
+     * `DISTINCT ON` over a bounded scan of the window's newest steps, so the
+     * cost does not grow with the length of the window. Steps that carry no
+     * key of their own are named the same way the aggregation names them, so
+     * their example lands under the same key their counts do.
+     */
+    private fun readExampleUrls(serviceId: UUID, since: Instant): Map<String, String> {
+        val sql = """
+            SELECT DISTINCT ON (k) k, url
+            FROM (
+                SELECT COALESCE(s.endpoint_key, ${EndpointKeySql.fallbackKey("s.request_url")}) AS k,
+                       ${EndpointKeySql.withoutQuery("s.request_url")} AS url,
+                       r.started_at AS seen_at
+                FROM probe_results r
+                JOIN probe_steps s ON s.probe_result_id = r.id
+                WHERE r.service_id = '$serviceId'
+                  AND r.started_at >= '${sqlTimestamp(since)}'
+                  AND r.status != 'skipped'
+                ORDER BY r.started_at DESC
+                LIMIT $EXAMPLE_URL_STEP_SCAN
+            ) t
+            ORDER BY k, seen_at DESC
+        """.trimIndent()
+
+        val out = mutableMapOf<String, String>()
+        TransactionManager.current().exec(sql) { rs ->
+            while (rs.next()) {
+                val url = rs.getString("url")
+                if (!url.isNullOrBlank()) out[rs.getString("k")] = url
+            }
+        }
+        return out
+    }
+
+    /**
+     * Where each endpoint of the service's **current** script first appears in
+     * it, by key. Empty when the service is gone or its script does not parse
+     * — the caller then falls back to ordering by call count.
+     *
+     * The key derivation is the same pure function the scheduler names a
+     * dispatched call with, so a key read here is the key stored there.
+     */
+    private fun scriptEndpointOrder(serviceId: UUID): Map<String, Int> {
+        val script = Services.selectAll()
+            .where { Services.id eq serviceId }
+            .limit(1)
+            .firstOrNull()
+            ?.get(Services.script)
+            ?: return emptyMap()
+        if (script.isBlank()) return emptyMap()
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val calls = dev.lacelang.validator.parse(script)["calls"] as? List<Map<String, Any?>>
+                ?: return emptyMap()
+            calls.map { EndpointKeys.key(it["method"] as? String, it["url"]) }
+                .distinct()
+                .withIndex()
+                .associate { (index, key) -> key to index }
+        } catch (e: Exception) {
+            // A service can hold a script that no longer parses; it still has
+            // history, and history is still worth showing.
+            historyLog.debug("service {} script does not parse — endpoints ordered by call count: {}", serviceId, e.message)
+            emptyMap()
+        }
+    }
+
+    /**
+     * An instant as the literal a `timestamp` column compares against.
+     *
+     * `bucket_start` and `started_at` are timestamps **without** a zone, and
+     * everything that writes them does so through JDBC — i.e. as the writing
+     * JVM's local wall clock. A bound has to be spelled in that same clock or
+     * it selects the wrong buckets everywhere but UTC.
+     */
+    private fun sqlTimestamp(instant: Instant): String = SQL_TIMESTAMP.format(instant)
+
+    private val SQL_TIMESTAMP: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault())
 
     private fun ResultRow.toStatBucket() = StatBucket(
         bucketStart = this[ProbeAggregates.bucketStart].toString(),

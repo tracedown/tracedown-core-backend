@@ -12,6 +12,9 @@ import io.lettuce.core.RedisClient
 import dev.tracedown.common.models.ProbeAggregates
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
+import dev.tracedown.common.models.ProbeStepAggregates
+import dev.tracedown.common.models.ProbeSteps
+import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Workspaces
 import dev.tracedown.gateway.util.HourBuckets
 import kotlinx.serialization.json.Json
@@ -23,6 +26,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.long
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.update
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import okhttp3.MediaType.Companion.toMediaType
@@ -173,6 +177,56 @@ class DashboardMetricsTest {
             redisClient.connect().use { conn ->
                 val keys = conn.sync().keys("metrics:agg:history:closed:*")
                 if (keys.isNotEmpty()) conn.sync().del(*keys.toTypedArray())
+            }
+        }
+
+        /**
+         * One endpoint bucket. [unit] scales the phase sums so an average is
+         * readable from the fixture: dns is 1x, connect 2x, tls 3x, ttfb 4x,
+         * transfer 5x and the response time 6x the unit, per timed call.
+         */
+        private fun seedEndpointBucket(
+            svcId: UUID,
+            bucketAt: Instant,
+            key: String,
+            code: Int,
+            calls: Int,
+            timed: Int,
+            unit: Long,
+            size: Long,
+            sized: Int,
+        ) {
+            ProbeStepAggregates.insert {
+                it[id] = UUID.randomUUID()
+                it[serviceId] = svcId
+                it[bucketStart] = bucketAt
+                it[bucketType] = "hourly"
+                it[endpointKey] = key
+                it[statusCode] = code.toShort()
+                it[callCount] = calls
+                it[timedCount] = timed
+                it[sumDnsMs] = unit * timed
+                it[sumConnectMs] = 2 * unit * timed
+                it[sumTlsMs] = 3 * unit * timed
+                it[sumTtfbMs] = 4 * unit * timed
+                it[sumTransferMs] = 5 * unit * timed
+                it[sumResponseMs] = 6 * unit * timed
+                it[sumSizeBytes] = size
+                it[sizedCount] = sized
+            }
+        }
+
+        /** One step of a run, carrying the endpoint key the scheduler named. */
+        private fun seedStep(resultId: UUID, num: Int, url: String, key: String) {
+            ProbeSteps.insert {
+                it[id] = UUID.randomUUID()
+                it[probeResultId] = resultId
+                it[stepNum] = num.toShort()
+                it[requestUrl] = url
+                it[endpointKey] = key
+                it[statusCode] = 200
+                it[responseTimeMs] = 10
+                it[createdAt] = Instant.now()
             }
         }
 
@@ -441,6 +495,147 @@ class DashboardMetricsTest {
 
         // Untouched: nothing recomputed it, nothing re-sealed it.
         assertEquals("7", hourHash(svcId, closedHour)["total"])
+    }
+
+
+    // ── Per-endpoint statistics ──
+
+    @Test
+    fun `statistics name every endpoint with its codes, its phases and the period before`() {
+        val svcId = createService("Endpoint Stats Svc")
+        // The order endpoints are listed in comes from the service's current
+        // script, so a table of them reads alongside the script itself.
+        transaction {
+            Services.update({ Services.id eq svcId }) {
+                it[script] = """
+                    get("${'$'}p.baseUrl/orders").expect(status: 200)
+                    post("${'$'}p.baseUrl/orders").expect(status: 201)
+                """.trimIndent()
+            }
+        }
+
+        val inWindow = Instant.now().minusSeconds(1800)
+        val inPreviousWindow = Instant.now().minusSeconds(25 * 3600L)
+        val getOrders = "GET {p.baseUrl}/orders"
+        val postOrders = "POST {p.baseUrl}/orders"
+        val projId = projectId
+        val wsId = workspaceId
+        val orgId = organizationId
+
+        transaction {
+            // The window itself: one endpoint answering three different ways.
+            seedEndpointBucket(svcId, inWindow, getOrders, 200, calls = 10, timed = 10, unit = 10, size = 5000, sized = 10)
+            seedEndpointBucket(svcId, inWindow, getOrders, 503, calls = 2, timed = 2, unit = 10, size = 0, sized = 0)
+            // A call that never got a response: counted, but timed by nothing.
+            seedEndpointBucket(svcId, inWindow, getOrders, 0, calls = 1, timed = 0, unit = 0, size = 0, sized = 0)
+            seedEndpointBucket(svcId, inWindow, postOrders, 201, calls = 5, timed = 5, unit = 10, size = 2500, sized = 5)
+            // The equal-length window immediately before, for one of the two.
+            seedEndpointBucket(svcId, inPreviousWindow, getOrders, 200, calls = 4, timed = 4, unit = 20, size = 0, sized = 0)
+
+            // One recent run, so each endpoint has a resolved URL to show.
+            // The ids are captured above: inside the insert lambda the table is
+            // the receiver, so the bare names would bind its columns.
+            val resultId = UUID.randomUUID()
+            ProbeResults.insert {
+                it[id] = resultId
+                it[ProbeResults.serviceId] = svcId
+                it[ProbeResults.projectId] = projId
+                it[ProbeResults.workspaceId] = wsId
+                it[ProbeResults.organizationId] = orgId
+                it[startedAt] = Instant.now().minusSeconds(1200)
+                it[status] = "success"
+                it[runDurationMs] = 10
+                it[rawResult] = JsonObject(emptyMap())
+            }
+            seedStep(resultId, 1, "https://api.example.com/orders?page=2", getOrders)
+            seedStep(resultId, 2, "https://api.example.com/orders", postOrders)
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics?window=24h", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+
+        assertEquals(false, json["endpointsTruncated"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals(
+            Json.parseToJsonElement(
+                """
+                [
+                  {
+                    "key": "GET {p.baseUrl}/orders",
+                    "method": "GET",
+                    "template": "{p.baseUrl}/orders",
+                    "exampleUrl": "https://api.example.com/orders",
+                    "calls": 13,
+                    "codes": [
+                      { "code": 200, "count": 10 },
+                      { "code": 503, "count": 2 },
+                      { "code": 0, "count": 1 }
+                    ],
+                    "phases": {
+                      "dnsMs": 10, "connectMs": 20, "tlsMs": 30,
+                      "ttfbMs": 40, "transferMs": 50, "responseMs": 60
+                    },
+                    "previousPhases": {
+                      "dnsMs": 20, "connectMs": 40, "tlsMs": 60,
+                      "ttfbMs": 80, "transferMs": 100, "responseMs": 120
+                    },
+                    "avgSizeBytes": 500
+                  },
+                  {
+                    "key": "POST {p.baseUrl}/orders",
+                    "method": "POST",
+                    "template": "{p.baseUrl}/orders",
+                    "exampleUrl": "https://api.example.com/orders",
+                    "calls": 5,
+                    "codes": [ { "code": 201, "count": 5 } ],
+                    "phases": {
+                      "dnsMs": 10, "connectMs": 20, "tlsMs": 30,
+                      "ttfbMs": 40, "transferMs": 50, "responseMs": 60
+                    },
+                    "previousPhases": null,
+                    "avgSizeBytes": 500
+                  }
+                ]
+                """.trimIndent(),
+            ),
+            json["endpoints"],
+        )
+    }
+
+    @Test
+    fun `a service with no endpoint history says so rather than omitting the field`() {
+        val svcId = createService("No Endpoint Stats Svc")
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics?window=24h", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+        assertEquals(0, json["endpoints"]!!.jsonArray.size)
+        assertEquals(false, json["endpointsTruncated"]!!.jsonPrimitive.content.toBoolean())
+    }
+
+    @Test
+    fun `past the cap the busiest endpoints are kept and the response says it truncated`() {
+        val svcId = createService("Many Endpoint Svc")
+        val inWindow = Instant.now().minusSeconds(1800)
+        transaction {
+            // No script to order by, so the busiest come first.
+            repeat(25) { i ->
+                seedEndpointBucket(
+                    svcId, inWindow, "GET https://api.example.com/e$i", 200,
+                    calls = i + 1, timed = i + 1, unit = 1, size = 0, sized = 0,
+                )
+            }
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics?window=24h", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+        val endpoints = json["endpoints"]!!.jsonArray
+
+        assertEquals(20, endpoints.size)
+        assertEquals(true, json["endpointsTruncated"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals("GET https://api.example.com/e24", endpoints[0].jsonObject["key"]!!.jsonPrimitive.content)
+        assertEquals(25, endpoints[0].jsonObject["calls"]!!.jsonPrimitive.long)
+        assertEquals("GET https://api.example.com/e5", endpoints.last().jsonObject["key"]!!.jsonPrimitive.content)
     }
 
 }

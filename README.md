@@ -54,6 +54,10 @@ transfer — and every assertion records what it actually saw, not just pass/fai
   with per-resource silences, personal quiet hours and maintenance windows.
 - **History and aggregation** — every run stored with its steps; hourly and
   daily rollups keep long windows cheap. Retention is yours to set.
+- **Per-endpoint statistics** — a script's calls are grouped by the URL
+  *template* it writes, not the address a run resolved, so response codes and
+  timing phases are reported per endpoint over any window. The variables in a
+  URL stay variables in the grouping: a key never carries a value.
 - **Access control** — organizations, workspaces, projects and services, with
   per-section permissions, groups, invites and TOTP two-factor.
 - **Metrics out** — a Prometheus scrape endpoint and Grafana integration.
