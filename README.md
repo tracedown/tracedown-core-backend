@@ -57,7 +57,10 @@ transfer — and every assertion records what it actually saw, not just pass/fai
 - **Per-endpoint statistics** — a script's calls are grouped by the URL
   *template* it writes, not the address a run resolved, so response codes and
   timing phases are reported per endpoint over any window. The variables in a
-  URL stay variables in the grouping: a key never carries a value.
+  URL stay variables in the grouping: a key never carries a value. The same
+  window is also served per endpoint **over time**, as a ranking of the
+  assertions that fail most often, and as a heatmap of failed runs by hour of
+  day and weekday.
 - **Access control** — organizations, workspaces, projects and services, with
   per-section permissions, groups, invites and TOTP two-factor.
 - **Metrics out** — a Prometheus scrape endpoint and Grafana integration.

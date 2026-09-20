@@ -18,6 +18,10 @@ import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Workspaces
 import dev.tracedown.gateway.util.HourBuckets
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -46,6 +50,7 @@ import org.testcontainers.postgresql.PostgreSQLContainer
 import java.net.ServerSocket
 import java.time.Instant
 import java.time.ZoneOffset
+import java.time.temporal.ChronoUnit
 import java.time.format.DateTimeFormatter
 import java.util.UUID
 
@@ -213,6 +218,55 @@ class DashboardMetricsTest {
                 it[sumResponseMs] = 6 * unit * timed
                 it[sumSizeBytes] = size
                 it[sizedCount] = sized
+            }
+        }
+
+        /** One finished run of [svcId], for tests that then hang steps off it. */
+        private fun seedResult(svcId: UUID, at: Instant, resultStatus: String): UUID {
+            val resultId = UUID.randomUUID()
+            val projId = projectId
+            val wsId = workspaceId
+            val orgId = organizationId
+            ProbeResults.insert {
+                it[id] = resultId
+                it[ProbeResults.serviceId] = svcId
+                it[ProbeResults.projectId] = projId
+                it[ProbeResults.workspaceId] = wsId
+                it[ProbeResults.organizationId] = orgId
+                it[startedAt] = at
+                it[status] = resultStatus
+                it[runDurationMs] = 10
+                it[rawResult] = JsonObject(emptyMap())
+            }
+            return resultId
+        }
+
+        /** One step carrying the ProbeResult `calls[].assertions` array verbatim, as the ingestor stores it. */
+        private fun seedStepWithAssertions(resultId: UUID, num: Int, url: String, key: String, assertions: String) {
+            ProbeSteps.insert {
+                it[id] = UUID.randomUUID()
+                it[probeResultId] = resultId
+                it[stepNum] = num.toShort()
+                it[requestUrl] = url
+                it[endpointKey] = key
+                it[statusCode] = 200
+                it[responseTimeMs] = 10
+                it[assertionResults] = Json.parseToJsonElement(assertions)
+                it[createdAt] = Instant.now()
+            }
+        }
+
+        /** One all-agents hourly rollup row — what the heatmap counts runs from. */
+        private fun seedHourlyAggregate(svcId: UUID, bucketAt: Instant, probeCount: Int, errorRate: Float) {
+            ProbeAggregates.insert {
+                it[id] = UUID.randomUUID()
+                it[serviceId] = svcId
+                it[probeAgentId] = null
+                it[bucketStart] = bucketAt
+                it[bucketType] = "hourly"
+                it[ProbeAggregates.probeCount] = probeCount
+                it[ProbeAggregates.errorRate] = errorRate
+                it[uptimePct] = 1f - errorRate
             }
         }
 
@@ -668,5 +722,368 @@ class DashboardMetricsTest {
         assertEquals(25, endpoints[0].jsonObject["calls"]!!.jsonPrimitive.long)
         assertEquals("GET https://api.example.com/e5", endpoints.last().jsonObject["key"]!!.jsonPrimitive.content)
     }
+
+    // ── Per-endpoint time series ──
+
+    @Test
+    fun `the endpoint series carries the same buckets as the service trend`() {
+        val svcId = createService("Series Svc")
+        val newest = Instant.now().truncatedTo(ChronoUnit.HOURS).minusSeconds(3600)
+        val older = newest.minusSeconds(3600)
+        val getOrders = "GET {p.baseUrl}/orders"
+        val postOrders = "POST {p.baseUrl}/orders"
+
+        transaction {
+            // Two codes in one bucket for one endpoint: the series sums them
+            // away, so its average must come out of the combined sums.
+            seedEndpointBucket(svcId, older, getOrders, 200, calls = 8, timed = 8, unit = 10, size = 4000, sized = 8)
+            seedEndpointBucket(svcId, older, getOrders, 503, calls = 2, timed = 2, unit = 10, size = 0, sized = 0)
+            seedEndpointBucket(svcId, newest, getOrders, 200, calls = 4, timed = 4, unit = 20, size = 4000, sized = 4)
+            // Present in the newest bucket only, and never timed or sized.
+            seedEndpointBucket(svcId, newest, postOrders, 0, calls = 3, timed = 0, unit = 0, size = 0, sized = 0)
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics/endpoint-series?window=24h", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+
+        assertEquals("24h", json["window"]!!.jsonPrimitive.content)
+        assertEquals("hourly", json["bucketType"]!!.jsonPrimitive.content)
+        assertEquals(false, json["endpointsTruncated"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals(
+            listOf(older.toString(), newest.toString()),
+            json["buckets"]!!.jsonArray.map { it.jsonPrimitive.content },
+        )
+
+        // The service-wide line is every endpoint of a bucket, and its average
+        // is taken from the combined sums — not from the two endpoints' own
+        // averages, which would weight three untimed calls like ten timed ones.
+        assertEquals(
+            Json.parseToJsonElement(
+                """
+                [
+                  {
+                    "bucketStart": "$older",
+                    "calls": 10,
+                    "phases": {
+                      "dnsMs": 10, "connectMs": 20, "tlsMs": 30,
+                      "ttfbMs": 40, "transferMs": 50, "responseMs": 60
+                    },
+                    "avgSizeBytes": 500
+                  },
+                  {
+                    "bucketStart": "$newest",
+                    "calls": 7,
+                    "phases": {
+                      "dnsMs": 20, "connectMs": 40, "tlsMs": 60,
+                      "ttfbMs": 80, "transferMs": 100, "responseMs": 120
+                    },
+                    "avgSizeBytes": 1000
+                  }
+                ]
+                """.trimIndent(),
+            ),
+            json["all"],
+        )
+
+        val endpoints = json["endpoints"]!!.jsonArray
+        assertEquals(listOf(getOrders, postOrders), endpoints.map { it.jsonObject["key"]!!.jsonPrimitive.content })
+        assertEquals("GET", endpoints[0].jsonObject["method"]!!.jsonPrimitive.content)
+        assertEquals("{p.baseUrl}/orders", endpoints[0].jsonObject["template"]!!.jsonPrimitive.content)
+
+        // Sparse: the endpoint that was only called in the newest bucket has
+        // one point, not an invented zero for the bucket before it.
+        val post = endpoints[1].jsonObject["points"]!!.jsonArray
+        assertEquals(1, post.size)
+        assertEquals(newest.toString(), post[0].jsonObject["bucketStart"]!!.jsonPrimitive.content)
+        assertEquals(3, post[0].jsonObject["calls"]!!.jsonPrimitive.long)
+        // Nothing to divide by is null, which is not the same as 0 ms.
+        assertEquals(JsonNull, post[0].jsonObject["phases"])
+        assertEquals(JsonNull, post[0].jsonObject["avgSizeBytes"])
+    }
+
+    @Test
+    fun `a service with no endpoint history returns an empty series rather than nothing`() {
+        val svcId = createService("No Series Svc")
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics/endpoint-series?window=7d", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+        assertEquals("hourly", json["bucketType"]!!.jsonPrimitive.content)
+        assertEquals(0, json["buckets"]!!.jsonArray.size)
+        assertEquals(0, json["all"]!!.jsonArray.size)
+        assertEquals(0, json["endpoints"]!!.jsonArray.size)
+
+        val (badCode, _) = get("/api/v1/services/$svcId/metrics/statistics/endpoint-series?window=nope", login())
+        assertEquals(400, badCode)
+    }
+
+    // ── Most-failing assertions ──
+
+    @Test
+    fun `assertions are ranked by failures under the identity the script declared`() {
+        val svcId = createService("Assertion Svc")
+        val key = "GET {p.baseUrl}/orders"
+
+        // Three runs: the status expectation holds every time, the body one
+        // fails twice, and an assert condition fails once. The observed values
+        // differ on every run and must not split a single assertion in three.
+        transaction {
+            for ((index, outcomes) in listOf(
+                listOf("passed", "failed", "passed"),
+                listOf("passed", "failed", "failed"),
+                listOf("passed", "passed", "passed"),
+            ).withIndex()) {
+                val resultId = seedResult(svcId, Instant.now().minusSeconds(600L * (index + 1)), "failure")
+                seedStepWithAssertions(
+                    resultId, 1, "https://api.example.com/orders", key,
+                    """
+                    [
+                      { "method": "expect", "scope": "status", "op": "eq", "expected": 200,
+                        "actual": 200, "outcome": "${outcomes[0]}" },
+                      { "method": "expect", "scope": "body.ok", "op": "eq", "expected": true,
+                        "actual": $index, "outcome": "${outcomes[1]}" },
+                      { "method": "assert", "kind": "expect", "index": 0,
+                        "expression": "${'$'}${'$'}a eq ${'$'}${'$'}b", "actualLhs": $index, "actualRhs": 7,
+                        "outcome": "${outcomes[2]}" }
+                    ]
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics/assertions?window=24h", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+
+        assertEquals("24h", json["window"]!!.jsonPrimitive.content)
+        assertEquals(false, json["truncated"]!!.jsonPrimitive.content.toBoolean())
+        // An assertion that never failed is not in a ranking of failures.
+        assertEquals(
+            Json.parseToJsonElement(
+                """
+                [
+                  {
+                    "endpointKey": "$key",
+                    "method": "GET",
+                    "template": "{p.baseUrl}/orders",
+                    "assertionMethod": "expect",
+                    "scope": "body.ok",
+                    "op": "eq",
+                    "expected": "true",
+                    "kind": null,
+                    "expression": null,
+                    "failures": 2,
+                    "evaluations": 3,
+                    "failureRatePct": 66.67,
+                    "lastFailedAt": ${'"'}${'"'}
+                  },
+                  {
+                    "endpointKey": "$key",
+                    "method": "GET",
+                    "template": "{p.baseUrl}/orders",
+                    "assertionMethod": "assert",
+                    "scope": null,
+                    "op": null,
+                    "expected": null,
+                    "kind": "expect",
+                    "expression": "${'$'}${'$'}a eq ${'$'}${'$'}b",
+                    "failures": 1,
+                    "evaluations": 3,
+                    "failureRatePct": 33.33,
+                    "lastFailedAt": ${'"'}${'"'}
+                  }
+                ]
+                """.trimIndent(),
+            ),
+            withoutLastFailedAt(json["assertions"]!!.jsonArray),
+        )
+
+        // The timestamp itself is the newest run that failed — the second one,
+        // which is 20 minutes old, not the third, which passed.
+        val newestFailure = json["assertions"]!!.jsonArray[0].jsonObject["lastFailedAt"]!!.jsonPrimitive.content
+        assertTrue(Instant.parse(newestFailure).isAfter(Instant.now().minusSeconds(1500)))
+    }
+
+    @Test
+    fun `a service that never failed an assertion ranks nothing`() {
+        val svcId = createService("No Assertion Svc")
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics/assertions?window=24h", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+        assertEquals(0, json["assertions"]!!.jsonArray.size)
+        assertEquals(false, json["truncated"]!!.jsonPrimitive.content.toBoolean())
+        // Nothing was read, so the window it reports is the one it was asked for.
+        assertTrue(Instant.parse(json["since"]!!.jsonPrimitive.content).isBefore(Instant.now().minusSeconds(23 * 3600)))
+    }
+
+    @Test
+    fun `a step whose assertions are missing or malformed does not fail the read`() {
+        val svcId = createService("Odd Assertion Svc")
+        transaction {
+            val resultId = seedResult(svcId, Instant.now().minusSeconds(300), "failure")
+            seedStep(resultId, 1, "https://api.example.com/x", "GET https://api.example.com/x")
+            seedStepWithAssertions(resultId, 2, "https://api.example.com/y", "GET https://api.example.com/y", "{}")
+            seedStepWithAssertions(
+                resultId, 3, "https://api.example.com/z", "GET https://api.example.com/z",
+                """[ { "method": "expect", "scope": "status", "op": "eq", "expected": 200, "outcome": "failed" } ]""",
+            )
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics/assertions?window=24h", login())
+        assertEquals(200, code)
+        val assertions = Json.parseToJsonElement(body).jsonObject["assertions"]!!.jsonArray
+        assertEquals(1, assertions.size)
+        assertEquals("GET https://api.example.com/z", assertions[0].jsonObject["endpointKey"]!!.jsonPrimitive.content)
+    }
+
+    // ── Failure heatmap ──
+
+    @Test
+    fun `the heatmap files each hour under its UTC weekday and hour`() {
+        val svcId = createService("Heatmap Svc")
+        val bucket = Instant.now().truncatedTo(ChronoUnit.HOURS).minus(2, ChronoUnit.DAYS)
+        val earlier = bucket.minus(1, ChronoUnit.DAYS)
+        val utc = bucket.atZone(ZoneOffset.UTC)
+        val earlierUtc = earlier.atZone(ZoneOffset.UTC)
+
+        transaction {
+            seedHourlyAggregate(svcId, bucket, probeCount = 40, errorRate = 0.25f)
+            seedHourlyAggregate(svcId, earlier, probeCount = 10, errorRate = 0f)
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics/failure-heatmap?days=30", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+
+        assertEquals(30, json["days"]!!.jsonPrimitive.int)
+        assertEquals("UTC", json["timezone"]!!.jsonPrimitive.content)
+        assertEquals(50, json["totalRuns"]!!.jsonPrimitive.long)
+        assertEquals(10, json["totalFailedRuns"]!!.jsonPrimitive.long)
+        // "Based on the last N days" is read off the data, not off the request.
+        assertEquals(earlier.toString(), json["coveredFrom"]!!.jsonPrimitive.content)
+        assertEquals(bucket.toString(), json["coveredTo"]!!.jsonPrimitive.content)
+
+        val cells = json["cells"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(2, cells.size)
+        val cell = cells.single {
+            it["weekday"]!!.jsonPrimitive.int == utc.dayOfWeek.value && it["hour"]!!.jsonPrimitive.int == utc.hour
+        }
+        assertEquals(40, cell["runs"]!!.jsonPrimitive.long)
+        assertEquals(10, cell["failedRuns"]!!.jsonPrimitive.long)
+        // An hour with runs and no failures is a cell, not an absence.
+        val quiet = cells.single {
+            it["weekday"]!!.jsonPrimitive.int == earlierUtc.dayOfWeek.value && it["hour"]!!.jsonPrimitive.int == earlierUtc.hour
+        }
+        assertEquals(10, quiet["runs"]!!.jsonPrimitive.long)
+        assertEquals(0, quiet["failedRuns"]!!.jsonPrimitive.long)
+    }
+
+    @Test
+    fun `a heatmap of no history is empty and says how far it looked`() {
+        val svcId = createService("No Heatmap Svc")
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics/failure-heatmap", login())
+        assertEquals(200, code)
+        val json = Json.parseToJsonElement(body).jsonObject
+        assertEquals(90, json["days"]!!.jsonPrimitive.int)
+        assertEquals(0, json["cells"]!!.jsonArray.size)
+        assertEquals(JsonNull, json["coveredFrom"])
+        assertEquals(JsonNull, json["coveredTo"])
+
+        assertEquals(400, get("/api/v1/services/$svcId/metrics/statistics/failure-heatmap?days=0", login()).first)
+        assertEquals(400, get("/api/v1/services/$svcId/metrics/statistics/failure-heatmap?days=366", login()).first)
+    }
+
+    // ── Legacy `*` endpoints folded into the method that names them ──
+
+    @Test
+    fun `a legacy endpoint row is folded into the one method that shares its template`() {
+        val svcId = createService("Fold Svc")
+        val bucket = Instant.now().truncatedTo(ChronoUnit.HOURS).minusSeconds(3600)
+        val url = "https://api.example.com/x"
+
+        transaction {
+            seedEndpointBucket(svcId, bucket, "GET $url", 200, calls = 6, timed = 6, unit = 10, size = 600, sized = 6)
+            // The same calls, from before the scheduler named them: method
+            // unknown, so the aggregation derived the key from the URL.
+            seedEndpointBucket(svcId, bucket, "* $url", 200, calls = 4, timed = 4, unit = 10, size = 400, sized = 4)
+            seedEndpointBucket(svcId, bucket, "* $url", 500, calls = 2, timed = 2, unit = 10, size = 0, sized = 0)
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics?window=24h", login())
+        assertEquals(200, code)
+        val endpoints = Json.parseToJsonElement(body).jsonObject["endpoints"]!!.jsonArray
+
+        // One endpoint, not two, and its totals are the sum of both halves.
+        assertEquals(1, endpoints.size)
+        val only = endpoints[0].jsonObject
+        assertEquals("GET $url", only["key"]!!.jsonPrimitive.content)
+        assertEquals(12, only["calls"]!!.jsonPrimitive.long)
+        assertEquals(100, only["avgSizeBytes"]!!.jsonPrimitive.long)
+        assertEquals(
+            Json.parseToJsonElement("""[ { "code": 200, "count": 10 }, { "code": 500, "count": 2 } ]"""),
+            only["codes"],
+        )
+
+        // And the series tells the same story, on the same key.
+        val (seriesCode, seriesBody) = get("/api/v1/services/$svcId/metrics/statistics/endpoint-series?window=24h", login())
+        assertEquals(200, seriesCode)
+        val series = Json.parseToJsonElement(seriesBody).jsonObject["endpoints"]!!.jsonArray
+        assertEquals(1, series.size)
+        assertEquals("GET $url", series[0].jsonObject["key"]!!.jsonPrimitive.content)
+        assertEquals(12, series[0].jsonObject["points"]!!.jsonArray[0].jsonObject["calls"]!!.jsonPrimitive.long)
+    }
+
+    @Test
+    fun `a legacy endpoint row two methods could claim is left standing`() {
+        val svcId = createService("Ambiguous Fold Svc")
+        val bucket = Instant.now().truncatedTo(ChronoUnit.HOURS).minusSeconds(3600)
+        val url = "https://api.example.com/x"
+
+        transaction {
+            seedEndpointBucket(svcId, bucket, "GET $url", 200, calls = 6, timed = 6, unit = 10, size = 0, sized = 0)
+            seedEndpointBucket(svcId, bucket, "DELETE $url", 204, calls = 5, timed = 5, unit = 10, size = 0, sized = 0)
+            seedEndpointBucket(svcId, bucket, "* $url", 200, calls = 4, timed = 4, unit = 10, size = 0, sized = 0)
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics?window=24h", login())
+        assertEquals(200, code)
+        val endpoints = Json.parseToJsonElement(body).jsonObject["endpoints"]!!.jsonArray
+
+        // Three rows: the legacy calls belong to one of the two methods and
+        // there is nothing left to say which, so they are not given to either.
+        assertEquals(
+            listOf("GET $url", "DELETE $url", "* $url"),
+            endpoints.map { it.jsonObject["key"]!!.jsonPrimitive.content },
+        )
+        assertEquals(4, endpoints[2].jsonObject["calls"]!!.jsonPrimitive.long)
+    }
+
+    @Test
+    fun `a legacy endpoint row nothing else names keeps its own name`() {
+        val svcId = createService("Lonely Fold Svc")
+        val bucket = Instant.now().truncatedTo(ChronoUnit.HOURS).minusSeconds(3600)
+
+        transaction {
+            seedEndpointBucket(svcId, bucket, "GET https://api.example.com/a", 200, calls = 3, timed = 3, unit = 10, size = 0, sized = 0)
+            seedEndpointBucket(svcId, bucket, "* https://api.example.com/b", 200, calls = 2, timed = 2, unit = 10, size = 0, sized = 0)
+        }
+
+        val (code, body) = get("/api/v1/services/$svcId/metrics/statistics?window=24h", login())
+        assertEquals(200, code)
+        val endpoints = Json.parseToJsonElement(body).jsonObject["endpoints"]!!.jsonArray
+        assertEquals(
+            listOf("GET https://api.example.com/a", "* https://api.example.com/b"),
+            endpoints.map { it.jsonObject["key"]!!.jsonPrimitive.content },
+        )
+    }
+
+    /** `lastFailedAt` is a wall clock the fixture cannot predict; blank it out. */
+    private fun withoutLastFailedAt(assertions: JsonArray): JsonElement = JsonArray(
+        assertions.map { entry ->
+            JsonObject(entry.jsonObject.mapValues { (name, value) ->
+                if (name == "lastFailedAt") JsonPrimitive("") else value
+            })
+        },
+    )
 
 }

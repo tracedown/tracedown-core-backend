@@ -6,14 +6,22 @@ import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.util.EndpointKeySql
 import dev.tracedown.common.util.EndpointKeys
+import dev.tracedown.gateway.data.metrics.AssertionFailureStat
+import dev.tracedown.gateway.data.metrics.AssertionFailuresDto
 import dev.tracedown.gateway.data.metrics.EndpointCodeCount
+import dev.tracedown.gateway.data.metrics.EndpointSeries
+import dev.tracedown.gateway.data.metrics.EndpointSeriesDto
+import dev.tracedown.gateway.data.metrics.EndpointSeriesPoint
 import dev.tracedown.gateway.data.metrics.EndpointStat
+import dev.tracedown.gateway.data.metrics.FailureHeatmapDto
+import dev.tracedown.gateway.data.metrics.HeatmapCell
 import dev.tracedown.gateway.data.metrics.HourlyBucket
 import dev.tracedown.gateway.data.metrics.PhaseTimings
 import dev.tracedown.gateway.data.metrics.RegionSeries
 import dev.tracedown.gateway.data.metrics.ServiceStatisticsDto
 import dev.tracedown.gateway.data.metrics.StatBucket
 import dev.tracedown.gateway.data.services.ProbePoint
+import dev.tracedown.gateway.util.EndpointFolding
 import dev.tracedown.gateway.util.HourBuckets
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.jsonArray
@@ -41,6 +49,7 @@ import org.jetbrains.exposed.v1.core.greaterEq
 import org.jetbrains.exposed.v1.core.isNotNull
 import org.jetbrains.exposed.v1.core.isNull
 import org.jetbrains.exposed.v1.core.neq
+import org.jetbrains.exposed.v1.core.statements.StatementType
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
@@ -148,10 +157,18 @@ object DashboardMetricsController {
      */
     const val MAX_ENDPOINTS = 20
 
+    /**
+     * How many assertions the failure ranking carries. The same reasoning as
+     * [MAX_ENDPOINTS]: a list this is meant to be read off, not exported.
+     */
+    const val MAX_ASSERTIONS = 20
+
     /** A window token resolved into the bounds every query in the read shares. */
     private class StatsWindow(
         /** "hourly" | "daily". */
         val bucketType: String,
+        /** The one `now` the whole read is taken against. */
+        val now: Instant,
         /** Earliest bucket start in the window. */
         val since: Instant,
         /** Earliest bucket start of the equal-length window immediately before. */
@@ -172,7 +189,7 @@ object DashboardMetricsController {
             else -> Triple("hourly", 24L, ChronoUnit.HOURS)
         }
         val since = now.minus(length, unit)
-        return StatsWindow(bucketType, since, since.minus(length, unit))
+        return StatsWindow(bucketType, now, since, since.minus(length, unit))
     }
 
     // ── Per-endpoint statistics ─────────────────────────────────────────
@@ -199,6 +216,27 @@ object DashboardMetricsController {
         var sizeBytes = 0L
         var sized = 0L
         val codes = linkedMapOf<Int, Long>()
+
+        /**
+         * Adds [other]'s raw counts into this one, for the legacy fold. Sums
+         * and denominators both, so the averages taken afterwards are over the
+         * combined population — merging two averages would weight a handful of
+         * legacy calls the same as a week of current ones.
+         */
+        fun absorb(other: EndpointTotals): EndpointTotals {
+            calls += other.calls
+            timed += other.timed
+            dnsMs += other.dnsMs
+            connectMs += other.connectMs
+            tlsMs += other.tlsMs
+            ttfbMs += other.ttfbMs
+            transferMs += other.transferMs
+            responseMs += other.responseMs
+            sizeBytes += other.sizeBytes
+            sized += other.sized
+            for ((code, count) in other.codes) codes[code] = (codes[code] ?: 0L) + count
+            return this
+        }
     }
 
     /**
@@ -211,11 +249,20 @@ object DashboardMetricsController {
      * readable next to the script; one ordered by call count is not.
      */
     private fun endpointStats(serviceId: UUID, spec: StatsWindow): List<EndpointStat> {
-        val current = readEndpointTotals(serviceId, spec.bucketType, spec.since, null)
-        if (current.isEmpty()) return emptyList()
+        val raw = readEndpointTotals(serviceId, spec.bucketType, spec.since, null)
+        if (raw.isEmpty()) return emptyList()
 
-        val previous = readEndpointTotals(serviceId, spec.bucketType, spec.previousSince, spec.since)
-        val examples = readExampleUrls(serviceId, spec.since)
+        // One fold decision for the whole read, taken from the window on
+        // display, and applied to everything the read compares against it.
+        val folds = EndpointFolding.foldMap(raw.keys)
+        val current = EndpointFolding.fold(raw, folds) { target, legacy -> target.absorb(legacy) }
+        val previous = EndpointFolding.fold(
+            readEndpointTotals(serviceId, spec.bucketType, spec.previousSince, spec.since),
+            folds,
+        ) { target, legacy -> target.absorb(legacy) }
+        // A folded endpoint keeps its own example and borrows the legacy one
+        // only when it has none — the two name the same address either way.
+        val examples = EndpointFolding.fold(readExampleUrls(serviceId, spec.since), folds) { target, _ -> target }
         val order = scriptEndpointOrder(serviceId)
 
         return current
@@ -248,6 +295,18 @@ object DashboardMetricsController {
                     .thenBy { it.key },
             )
     }
+
+    /**
+     * The endpoint order the statistics read lists, over call counts alone —
+     * the series read ranks the same window by the same rule without building
+     * an [EndpointStat] for every key it will then drop.
+     */
+    private fun rankKeys(calls: Map<String, Long>, order: Map<String, Int>): List<String> =
+        calls.keys.sortedWith(
+            compareBy<String> { order[it] ?: Int.MAX_VALUE }
+                .thenByDescending { calls[it] ?: 0L }
+                .thenBy { it },
+        )
 
     /** Averages over the calls that carried timings; null when none did. */
     private fun EndpointTotals.toPhases(): PhaseTimings? {
@@ -387,6 +446,504 @@ object DashboardMetricsController {
             historyLog.debug("service {} script does not parse — endpoints ordered by call count: {}", serviceId, e.message)
             emptyMap()
         }
+    }
+
+    // ── Per-endpoint time series ────────────────────────────────────────
+
+    /**
+     * The statistics window broken down per endpoint **and per bucket**, on the
+     * granularity and the bounds the statistics read uses for the same
+     * [window] — so a point here lines up with an `overall[]` bucket of the same
+     * `bucketStart` without the caller snapping anything.
+     *
+     * Its own resource rather than a field on the statistics response: twenty
+     * endpoints over a week of hourly buckets is two orders of magnitude more
+     * JSON than everything else that read returns, and that read is polled.
+     */
+    fun getEndpointSeries(serviceId: UUID, window: String): EndpointSeriesDto {
+        val spec = windowSpec(window)
+        val empty = EndpointSeriesDto(
+            window = window,
+            bucketType = spec.bucketType,
+            buckets = emptyList(),
+            all = emptyList(),
+            endpoints = emptyList(),
+            endpointsTruncated = false,
+        )
+        return transaction {
+            val raw = readEndpointBuckets(serviceId, spec.bucketType, spec.since)
+            if (raw.isEmpty()) return@transaction empty
+
+            // The service-wide series is summed BEFORE the fold and over every
+            // key, capped or not: relabelling a key cannot change a total, and
+            // an "all endpoints" line that quietly meant "all twenty listed
+            // endpoints" would not add up to the service's own trend.
+            val all = sortedMapOf<Instant, EndpointTotals>()
+            for (series in raw.values) {
+                for ((bucket, totals) in series) all.getOrPut(bucket) { EndpointTotals() }.absorb(totals)
+            }
+
+            val folded = EndpointFolding.fold(raw) { target, legacy ->
+                for ((bucket, totals) in legacy) target.getOrPut(bucket) { EndpointTotals() }.absorb(totals)
+                target
+            }
+            val calls = folded.mapValues { (_, series) -> series.values.sumOf { it.calls } }
+            val ranked = rankKeys(calls, scriptEndpointOrder(serviceId))
+
+            EndpointSeriesDto(
+                window = window,
+                bucketType = spec.bucketType,
+                buckets = all.keys.map { it.toString() },
+                all = all.map { (bucket, totals) -> totals.toSeriesPoint(bucket) },
+                endpoints = ranked.take(MAX_ENDPOINTS).map { key ->
+                    val (method, template) = EndpointKeys.split(key)
+                    EndpointSeries(
+                        key = key,
+                        method = method,
+                        template = template,
+                        points = folded.getValue(key).entries
+                            .sortedBy { it.key }
+                            .map { (bucket, totals) -> totals.toSeriesPoint(bucket) },
+                    )
+                },
+                endpointsTruncated = ranked.size > MAX_ENDPOINTS,
+            )
+        }
+    }
+
+    /** One bucket's totals as a series point; a zero denominator becomes null, not zero. */
+    private fun EndpointTotals.toSeriesPoint(bucket: Instant) = EndpointSeriesPoint(
+        bucketStart = bucket.toString(),
+        calls = calls,
+        phases = toPhases(),
+        avgSizeBytes = if (sized > 0) Math.round(sizeBytes.toDouble() / sized) else null,
+    )
+
+    /**
+     * `probe_step_aggregates` over `[since, ∞)` as one running total per
+     * endpoint **per bucket** — the same rows [readEndpointTotals] sums, kept
+     * apart along the time axis instead of collapsed onto it.
+     *
+     * Status codes are summed away here: the series draws timings and sizes,
+     * and keeping a code breakdown per bucket per endpoint would multiply the
+     * payload by the number of codes for a chart that never reads it.
+     */
+    private fun readEndpointBuckets(
+        serviceId: UUID,
+        bucketType: String,
+        since: Instant,
+    ): Map<String, MutableMap<Instant, EndpointTotals>> {
+        // Neither interpolated value is caller text: a UUID object and this
+        // file's own window table.
+        val sql = """
+            SELECT endpoint_key,
+                   bucket_start,
+                   SUM(call_count)      AS calls,
+                   SUM(timed_count)     AS timed,
+                   SUM(sum_dns_ms)      AS dns_ms,
+                   SUM(sum_connect_ms)  AS connect_ms,
+                   SUM(sum_tls_ms)      AS tls_ms,
+                   SUM(sum_ttfb_ms)     AS ttfb_ms,
+                   SUM(sum_transfer_ms) AS transfer_ms,
+                   SUM(sum_response_ms) AS response_ms,
+                   SUM(sum_size_bytes)  AS size_bytes,
+                   SUM(sized_count)     AS sized
+            FROM probe_step_aggregates
+            WHERE service_id = '$serviceId'
+              AND bucket_type = '$bucketType'
+              AND bucket_start >= '${sqlTimestamp(since)}'
+            GROUP BY endpoint_key, bucket_start
+            ORDER BY endpoint_key, bucket_start
+        """.trimIndent()
+
+        val out = linkedMapOf<String, MutableMap<Instant, EndpointTotals>>()
+        TransactionManager.current().exec(sql) { rs ->
+            while (rs.next()) {
+                val series = out.getOrPut(rs.getString("endpoint_key")) { linkedMapOf() }
+                val totals = series.getOrPut(rs.getTimestamp("bucket_start").toInstant()) { EndpointTotals() }
+                totals.calls += rs.getLong("calls")
+                totals.timed += rs.getLong("timed")
+                totals.dnsMs += rs.getLong("dns_ms")
+                totals.connectMs += rs.getLong("connect_ms")
+                totals.tlsMs += rs.getLong("tls_ms")
+                totals.ttfbMs += rs.getLong("ttfb_ms")
+                totals.transferMs += rs.getLong("transfer_ms")
+                totals.responseMs += rs.getLong("response_ms")
+                totals.sizeBytes += rs.getLong("size_bytes")
+                totals.sized += rs.getLong("sized")
+            }
+        }
+        return out
+    }
+
+    // ── Most-failing assertions ─────────────────────────────────────────
+
+    /**
+     * How many runs the assertion ranking may read before it stops and says so.
+     *
+     * There is no assertion rollup — the ranking is computed from raw
+     * `probe_steps.assertion_results` — so the only thing keeping it off a
+     * table with a hundred million rows in it is this cap and the window. The
+     * bound is *runs*, not steps or assertions: `probe_results` is where the
+     * `(service_id, started_at DESC)` index is, so a row limit there is an
+     * index scan that stops, and the steps hanging off those runs are reached
+     * by the foreign-key index one result at a time.
+     *
+     * 20 000 covers a week of minutely probing on a single agent, which is what
+     * the longest hourly window asks for. Past that the read is honest about
+     * how far it got rather than slower.
+     */
+    private const val ASSERTION_RUN_SCAN = 20_000
+
+    /**
+     * How many grouped assertions come back from the database before the fold
+     * and the top-[MAX_ASSERTIONS] cut are applied in the JVM.
+     *
+     * The group count is normally a script's assertion count times its call
+     * count — tens. It is only large when a script compares against an
+     * interpolated value, which stores a distinct `expected` per run; this
+     * keeps that case from materialising a row per run.
+     */
+    private const val ASSERTION_GROUP_SCAN = 1_000
+
+    /**
+     * Steps of one run the ranking reads. It is the `LIMIT` that keeps the
+     * step lookup a correlated subquery — see [readAssertionGroups] — and a
+     * ceiling on a pathological run at the same time. A probe is not a crawl:
+     * a script with two hundred calls in it is outside what this panel ranks,
+     * and its later steps are left out rather than dragged through the scan.
+     */
+    private const val MAX_STEPS_PER_RUN = 200
+
+    /**
+     * The window's most-failing assertions, grouped by endpoint and by the
+     * assertion's **declared** identity.
+     *
+     * Computed at read time from the ProbeResult `calls[].assertions` arrays the
+     * ingestor stores verbatim (spec §9). Nothing rolls those up, so the ranking
+     * reaches exactly as far back as result retention still holds — which is why
+     * the response carries the window it actually covered rather than the one it
+     * was asked for.
+     */
+    fun getAssertionFailures(serviceId: UUID, window: String): AssertionFailuresDto {
+        val spec = windowSpec(window)
+        return transaction {
+            val scanned = readAssertionScanBounds(serviceId, spec.since)
+            val rows = readAssertionGroups(serviceId, spec.since)
+            // The fold is over endpoint keys, so it is applied to the endpoint
+            // half of each row and the rows are then regrouped: one assertion
+            // evaluated under both the legacy name and the real one is one
+            // assertion. The key set is this read's own — the aggregation these
+            // rows never pass through lags by up to an hour, and deciding from
+            // it would leave a fresh window unfolded.
+            val folds = EndpointFolding.foldMap(rows.map { it.endpointKey }.distinct())
+            for (row in rows) folds[row.endpointKey]?.let { row.endpointKey = it }
+            val folded = rows.groupBy { it.identity }
+            AssertionFailuresDto(
+                window = window,
+                // What the numbers are really over: the window's own lower
+                // bound when the whole window was read, and the oldest run
+                // actually seen when the cap bit or retention had already
+                // taken the rest.
+                since = (scanned.oldest ?: spec.since).toString(),
+                until = spec.now.toString(),
+                truncated = scanned.runs >= ASSERTION_RUN_SCAN,
+                assertions = folded.values
+                    .map { group -> group.reduce(AssertionGroup::absorb) }
+                    .filter { it.failures > 0 }
+                    .sortedWith(
+                        compareByDescending<AssertionGroup> { it.failures }
+                            .thenByDescending { it.failureRate() }
+                            .thenBy { it.endpointKey }
+                            .thenBy { it.identity },
+                    )
+                    .take(MAX_ASSERTIONS)
+                    .mapNotNull { it.toDto() },
+            )
+        }
+    }
+
+    /** One `(endpoint, assertion identity)` group of the window. */
+    private class AssertionGroup(
+        /** Rewritten in place when [EndpointFolding] gives the endpoint a real method. */
+        var endpointKey: String,
+        val assertionMethod: String?,
+        val scope: String?,
+        val op: String?,
+        val expected: String?,
+        val kind: String?,
+        val expression: String?,
+        var failures: Long,
+        var evaluations: Long,
+        var lastFailedAt: Instant?,
+    ) {
+        /**
+         * The group's key, endpoint first — the fold rewrites the endpoint half
+         * and regroups on what is left, so the endpoint has to be the prefix.
+         * `\u0000` separates: it cannot occur in any of the parts.
+         */
+        val identity: String
+            get() = listOf(endpointKey, assertionMethod, scope, op, expected, kind, expression)
+                .joinToString("\u0000") { it ?: "" }
+
+        fun absorb(other: AssertionGroup): AssertionGroup {
+            failures += other.failures
+            evaluations += other.evaluations
+            val theirs = other.lastFailedAt
+            if (theirs != null && (lastFailedAt?.isBefore(theirs) != false)) lastFailedAt = theirs
+            return this
+        }
+
+        fun failureRate(): Double = if (evaluations > 0) failures.toDouble() / evaluations else 0.0
+
+        /**
+         * Null for a group that never failed, which the query's `HAVING` and
+         * the caller's filter both already exclude — the ranking would have
+         * nothing to say about it, and it has no "last failed at" to print.
+         */
+        fun toDto(): AssertionFailureStat? {
+            val failedAt = lastFailedAt ?: return null
+            val (method, template) = EndpointKeys.split(endpointKey)
+            return AssertionFailureStat(
+                endpointKey = endpointKey,
+                method = method,
+                template = template,
+                assertionMethod = assertionMethod,
+                scope = scope,
+                op = op,
+                expected = expected,
+                kind = kind,
+                expression = expression,
+                failures = failures,
+                evaluations = evaluations,
+                failureRatePct = round(failureRate() * 10000.0) / 100.0,
+                lastFailedAt = failedAt.toString(),
+            )
+        }
+    }
+
+    /** How much of the window the assertion scan actually reached. */
+    private class AssertionScan(val runs: Long, val oldest: Instant?)
+
+    /** The scanned runs' count and oldest start — the two numbers `since`/`truncated` are read off. */
+    private fun readAssertionScanBounds(serviceId: UUID, since: Instant): AssertionScan {
+        val sql = """
+            SELECT count(*) AS runs, min(started_at) AS oldest
+            FROM (${assertionScanSql(serviceId, since)}) t
+        """.trimIndent()
+        var scan = AssertionScan(0, null)
+        TransactionManager.current().exec(sql) { rs ->
+            if (rs.next()) scan = AssertionScan(rs.getLong("runs"), rs.getTimestamp("oldest")?.toInstant())
+        }
+        return scan
+    }
+
+    /**
+     * The runs the ranking is computed over: the newest [ASSERTION_RUN_SCAN] of
+     * the window, by the `(service_id, started_at DESC)` index. Skipped ticks
+     * are excluded as they are everywhere else — a tick that never ran
+     * evaluated no assertion.
+     */
+    private fun assertionScanSql(serviceId: UUID, since: Instant): String = """
+        SELECT id, started_at
+        FROM probe_results
+        WHERE service_id = '$serviceId'
+          AND started_at >= '${sqlTimestamp(since)}'
+          AND status != 'skipped'
+        ORDER BY started_at DESC
+        LIMIT $ASSERTION_RUN_SCAN
+    """.trimIndent()
+
+    /**
+     * One row per `(endpoint, assertion identity)` seen in the scanned runs.
+     *
+     * The identity is the **declared** side of the assertion and nothing else:
+     * `method`/`scope`/`op`/`expected` for a scope assertion, `kind` and the
+     * rendered `expression` for an `assert` condition. `actual`, `actualLhs`,
+     * `actualRhs` and `options` are what the target answered — grouping on them
+     * would give one row per distinct failure and rank nothing.
+     * `assertions[].index` is left out too: it moves when a script is edited,
+     * which would split one assertion's history in two.
+     *
+     * `assertion_results` holds whatever the executor wrote, so the array is
+     * substituted for an empty one rather than filtered in a `WHERE` — the
+     * expansion is evaluated before a predicate at the same level, and a row
+     * that somehow held an object would abort the whole read.
+     *
+     * **The steps are reached through a `LATERAL` with a `LIMIT`, and that is
+     * load-bearing.** Written as a plain join, the planner hash-joins the
+     * scanned runs against *all* of `probe_steps` — measured on PostgreSQL 18
+     * against 240 000 steps: `Seq Scan on probe_steps (240 002 rows)`, and the
+     * same shape with `enable_seqscan = off`, only through the index. That
+     * plan costs the whole table however narrow the window is, and stays
+     * cheapest until `probe_steps` is some 20 million rows, which is exactly
+     * the size at which the scan it then abandons would have hurt. A subquery
+     * carrying a `LIMIT` cannot be flattened into that join, so the shape is
+     * the one the cap was chosen for:
+     *
+     *     Nested Loop  (rows=180 000)
+     *       -> Limit (rows=20 000)
+     *            -> Index Scan using idx_probe_results_service
+     *       -> Index Scan using idx_probe_steps_result (20 000 searches)
+     *       -> Function Scan on jsonb_array_elements
+     *     20 000 runs / 60 000 steps / 180 000 assertions, 120 000 buffers, 1.4 s
+     *
+     * — work proportional to the window, not to the table.
+     */
+    private fun readAssertionGroups(serviceId: UUID, since: Instant): List<AssertionGroup> {
+        val failed = "a.value->>'outcome' = 'failed'"
+        val sql = """
+            WITH scanned AS (${assertionScanSql(serviceId, since)})
+            SELECT COALESCE(s.endpoint_key, ${EndpointKeySql.fallbackKey("s.request_url")}) AS endpoint_key,
+                   a.value->>'method'                          AS assertion_method,
+                   a.value->>'scope'                           AS scope,
+                   a.value->>'op'                              AS op,
+                   left(a.value->>'expected', $MAX_EXPECTED_CHARS)     AS expected,
+                   a.value->>'kind'                            AS kind,
+                   left(a.value->>'expression', $MAX_EXPRESSION_CHARS) AS expression,
+                   count(*)                                    AS evaluations,
+                   count(*) FILTER (WHERE $failed)             AS failures,
+                   max(r.started_at) FILTER (WHERE $failed)    AS last_failed_at
+            FROM scanned r
+            CROSS JOIN LATERAL (
+                SELECT st.endpoint_key, st.request_url, st.assertion_results
+                FROM probe_steps st
+                WHERE st.probe_result_id = r.id
+                LIMIT $MAX_STEPS_PER_RUN
+            ) s
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(s.assertion_results) = 'array'
+                     THEN s.assertion_results ELSE '[]'::jsonb END
+            ) AS a
+            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            HAVING count(*) FILTER (WHERE $failed) > 0
+            ORDER BY failures DESC, evaluations DESC
+            LIMIT $ASSERTION_GROUP_SCAN
+        """.trimIndent()
+
+        val out = mutableListOf<AssertionGroup>()
+        // The statement opens with a CTE, and Exposed reads the statement type
+        // off the leading keyword — left to guess it would run this through
+        // `executeUpdate` and throw on the rows it gets back.
+        TransactionManager.current().exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
+            while (rs.next()) {
+                out += AssertionGroup(
+                    endpointKey = rs.getString("endpoint_key"),
+                    assertionMethod = rs.getString("assertion_method"),
+                    scope = rs.getString("scope"),
+                    op = rs.getString("op"),
+                    expected = rs.getString("expected"),
+                    kind = rs.getString("kind"),
+                    expression = rs.getString("expression"),
+                    failures = rs.getLong("failures"),
+                    evaluations = rs.getLong("evaluations"),
+                    lastFailedAt = rs.getTimestamp("last_failed_at")?.toInstant(),
+                )
+            }
+        }
+        return out
+    }
+
+    /** An expected value is a label, not a document — enough of it to recognise. */
+    private const val MAX_EXPECTED_CHARS = 120
+
+    /** The same for a rendered `assert` condition, which is a line of source. */
+    private const val MAX_EXPRESSION_CHARS = 200
+
+    // ── Failure heatmap ─────────────────────────────────────────────────
+
+    /**
+     * The longest lookback the heatmap accepts. It is the default retention of
+     * hourly aggregate rows: asking for more could only return the same grid.
+     */
+    const val MAX_HEATMAP_DAYS = 365
+
+    /** The heatmap's default lookback — a quarter, enough for a weekly shape to show. */
+    const val DEFAULT_HEATMAP_DAYS = 90
+
+    /**
+     * Failed runs by hour of day and ISO weekday over the last [days] days.
+     *
+     * Read from the all-agents hourly rows of `probe_aggregates`, which is the
+     * only place holding a correct *run* failure count per hour:
+     * `probe_step_aggregates` counts calls, and files an assertion failure
+     * under the `200` the target answered with.
+     *
+     * **Everything is UTC and there is no timezone parameter.** An offset in
+     * the query would make every cached grid per-viewer, and a named zone would
+     * have to be applied to a `timestamp` column written in the writing JVM's
+     * wall clock — one clock for the bounds and another for the truncation is
+     * how the daily bucket already goes wrong off UTC. So the column is
+     * converted once, and the bounds and the extraction both read the result.
+     */
+    fun getFailureHeatmap(serviceId: UUID, days: Int): FailureHeatmapDto {
+        val span = days.coerceIn(1, MAX_HEATMAP_DAYS)
+        val now = Instant.now()
+        val since = now.truncatedTo(ChronoUnit.HOURS).minus(span.toLong(), ChronoUnit.DAYS)
+        val zone = ZoneId.systemDefault()
+
+        // Service id is a UUID object and the bound is this method's own
+        // arithmetic — neither is caller text. The zone is the JVM's own id.
+        val sql = """
+            SELECT extract(isodow FROM utc)::int AS weekday,
+                   extract(hour   FROM utc)::int AS hour,
+                   sum(probe_count)::bigint      AS runs,
+                   sum(round((probe_count * coalesce(error_rate, 0))::numeric))::bigint AS failed_runs,
+                   min(bucket_start)             AS first_bucket,
+                   max(bucket_start)             AS last_bucket
+            FROM (
+                SELECT bucket_start,
+                       bucket_start AT TIME ZONE '${zone.id}' AT TIME ZONE 'UTC' AS utc,
+                       probe_count,
+                       error_rate
+                FROM probe_aggregates
+                WHERE service_id = '$serviceId'
+                  AND probe_agent_id IS NULL
+                  AND bucket_type = 'hourly'
+                  AND bucket_start >= '${sqlTimestamp(since)}'
+                  AND probe_count > 0
+            ) t
+            GROUP BY 1, 2
+            ORDER BY 1, 2
+        """.trimIndent()
+
+        val cells = mutableListOf<HeatmapCell>()
+        var runs = 0L
+        var failed = 0L
+        var first: Instant? = null
+        var last: Instant? = null
+        transaction {
+            TransactionManager.current().exec(sql) { rs ->
+                while (rs.next()) {
+                    val cellRuns = rs.getLong("runs")
+                    val cellFailed = rs.getLong("failed_runs")
+                    cells += HeatmapCell(
+                        weekday = rs.getInt("weekday"),
+                        hour = rs.getInt("hour"),
+                        runs = cellRuns,
+                        failedRuns = cellFailed,
+                    )
+                    runs += cellRuns
+                    failed += cellFailed
+                    val cellFirst = rs.getTimestamp("first_bucket")?.toInstant()
+                    val cellLast = rs.getTimestamp("last_bucket")?.toInstant()
+                    if (cellFirst != null && (first?.isAfter(cellFirst) != false)) first = cellFirst
+                    if (cellLast != null && (last?.isBefore(cellLast) != false)) last = cellLast
+                }
+            }
+        }
+
+        return FailureHeatmapDto(
+            days = span,
+            timezone = "UTC",
+            since = since.toString(),
+            until = now.toString(),
+            coveredFrom = first?.toString(),
+            coveredTo = last?.toString(),
+            totalRuns = runs,
+            totalFailedRuns = failed,
+            cells = cells,
+        )
     }
 
     /**
