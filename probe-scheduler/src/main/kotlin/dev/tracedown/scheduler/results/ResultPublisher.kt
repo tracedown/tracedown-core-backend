@@ -2,6 +2,8 @@ package dev.tracedown.scheduler.results
 
 import io.lettuce.core.api.sync.RedisCommands
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
@@ -71,6 +73,15 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
          * what lets the ingestor record the actual reason instead.
          */
         bodiesWithheld: String? = null,
+        /**
+         * The endpoint each call of the dispatched script belongs to, in the
+         * script's order, so the ingestor can file every step under the call
+         * that produced it. Index-aligned with `rawResult.calls`; a run that
+         * stopped early yields a prefix of those calls, which leaves the
+         * alignment intact. Null when the script did not parse — those steps
+         * are keyed from their resolved URLs at aggregation time instead.
+         */
+        endpointKeys: List<String>? = null,
     ): UUID {
         // Minted before the push, not after the pop: the id has to be a property
         // of the message so that every delivery of it — including one the
@@ -89,6 +100,9 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
             put("startedAt", startedAt.toString())
             put("agentEgressBytes", agentEgressBytes)
             if (bodiesWithheld != null) put("bodiesWithheld", bodiesWithheld)
+            if (endpointKeys != null) {
+                put("endpointKeys", buildJsonArray { for (key in endpointKeys) add(key) })
+            }
         }
 
         redis.lpush(QUEUE_KEY, envelope.toString())

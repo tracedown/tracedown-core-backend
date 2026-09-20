@@ -9,6 +9,7 @@ import dev.tracedown.common.models.Workspaces
 import dev.tracedown.scheduler.config.SchedulerConfig
 import dev.tracedown.scheduler.results.ResultPublisher
 import dev.tracedown.scheduler.results.ResultRedactor
+import dev.tracedown.scheduler.results.ScriptEndpointKeys
 import dev.tracedown.scheduler.scheduling.QuartzManager
 import dev.tracedown.scheduler.variables.VariableResolver
 import dev.tracedown.scheduler.window.ServiceWindowEvaluator
@@ -355,6 +356,13 @@ class DispatchQueue(
             // Resolve scoped variables and rewrite $s.key → $s_key in script
             val (script, variables, secretValues) = VariableResolver.resolve(serviceId, rawScript)
 
+            // Name the endpoint each call belongs to, from the very script this
+            // tick is about to run — a later edit cannot retro-label a result
+            // that a different script produced. Keys ride on the envelope in
+            // the script's order, which is the order the calls execute in.
+            // Null when the script does not parse; never a failed dispatch.
+            val endpointKeys = ScriptEndpointKeys.keysFor(rawScript)
+
             // Load prev result
             val prev = loadPrev(service[Services.lastRunId])
 
@@ -526,6 +534,7 @@ class DispatchQueue(
                     startedAt = startedAt,
                     agentEgressBytes = execution.egressBytes,
                     bodiesWithheld = bodiesWithheld,
+                    endpointKeys = endpointKeys,
                 )
                 published++
                 accounted.set(true)

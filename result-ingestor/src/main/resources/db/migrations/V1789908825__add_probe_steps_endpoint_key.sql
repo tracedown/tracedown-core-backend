@@ -1,0 +1,17 @@
+-- The endpoint a step called, as the script wrote it: "<METHOD> <template>",
+-- with every interpolated variable left as a placeholder rather than its value
+-- (see EndpointKeys in tracedown-core-common). It is computed by the scheduler
+-- from the exact script it dispatched, so an edit racing a run cannot misalign
+-- a key with the call it describes, and carried on the result envelope.
+--
+-- Nullable on purpose, and it stays nullable: every row ingested before this
+-- column existed has none, and so does a run whose script would not parse. The
+-- aggregation derives a key for those from `request_url` instead. There is no
+-- backfill — endpoint statistics start filling from the upgrade.
+--
+-- 210 characters is the longest a key can be: the longest method (DELETE),
+-- a space, and a template capped at 200.
+--
+-- No index. Aggregation reads these rows by the result's time range, never by
+-- key, and probe_steps is one of the two big tables in the schema.
+ALTER TABLE probe_steps ADD COLUMN endpoint_key VARCHAR(210);

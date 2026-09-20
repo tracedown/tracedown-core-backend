@@ -114,6 +114,28 @@ object ResultPersistenceService {
     }
 
     /**
+     * The endpoint keys an envelope carries, one per call of the dispatched
+     * script and in the script's order, or null when it carries none.
+     *
+     * Total by construction: an envelope is the scheduler's word about a run
+     * that has already happened, and no shape of this field may cost the
+     * platform that run. Anything that is not a string is dropped to null
+     * rather than guessed at, and an over-long key is cut to what the column
+     * holds — the scheduler caps them already, so this is the belt behind the
+     * braces.
+     */
+    fun endpointKeysOf(envelope: JsonObject): List<String?>? {
+        val array = envelope["endpointKeys"] as? JsonArray ?: return null
+        return array.map { element ->
+            (element as? JsonPrimitive)
+                ?.takeIf { it.isString }
+                ?.contentOrNull
+                ?.takeIf { it.isNotBlank() }
+                ?.take(ENDPOINT_KEY_MAX_CHARS)
+        }
+    }
+
+    /**
      * Whether a failure is Postgres refusing a second insert of a result row we
      * already hold — the race between two consumers handed the same message.
      *
@@ -195,6 +217,9 @@ object ResultPersistenceService {
      */
     private const val MAX_IMPORTS_PER_RESULT = 16
     private val IMPORT_BUDGET: Duration = Duration.ofSeconds(60)
+
+    /** The width of `probe_steps.endpoint_key`. */
+    private const val ENDPOINT_KEY_MAX_CHARS = 210
 
     /** Where each call's body ended up, decided before anything is written. */
     private class BodyPlacement {
@@ -471,6 +496,16 @@ object ResultPersistenceService {
         var inPlaceStoreId = placement.inPlaceStoreId
         var committed = false
 
+        // The endpoint each call belongs to, named by the scheduler from the
+        // script it dispatched (see the scheduler's ScriptEndpointKeys) and
+        // index-aligned with `calls`. A run that stopped early produced fewer
+        // calls than the script has, so the array can be longer than `calls` —
+        // never shorter for a run that went further than the script goes. An
+        // envelope from a scheduler that predates the field, or from a script
+        // that would not parse, carries nothing: those steps are keyed from
+        // their resolved URLs at aggregation time.
+        val endpointKeys = endpointKeysOf(envelope)
+
         // The primary key is the backstop behind the redelivery check above: two
         // consumers handed the same message (a reclaim racing the consumer that
         // was thought dead) both pass the check and one of them loses here. That
@@ -527,6 +562,7 @@ object ResultPersistenceService {
                         it[probeResultId] = resultId
                         it[stepNum] = (index + 1).toShort()
                         it[requestUrl] = request?.get("url")?.jsonPrimitive?.content ?: ""
+                        it[endpointKey] = endpointKeys?.getOrNull(index)
                         it[statusCode] = response?.get("status")?.jsonPrimitive?.intOrNull?.toShort()
                         it[responseTimeMs] = response?.get("responseTimeMs")?.jsonPrimitive?.intOrNull
                         it[dnsMs] = response?.get("dnsMs")?.jsonPrimitive?.intOrNull

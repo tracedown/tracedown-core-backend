@@ -34,6 +34,18 @@ object ProbeSteps : Table("probe_steps") {
      * through that store and never deletes.
      */
     val bodyStoreId = javaUUID("body_store_id").references(BodyStores.id).nullable()
+
+    /**
+     * The endpoint this call belongs to — `"<METHOD> <template>"`, the call as
+     * the script writes it, with interpolated variables left as placeholders
+     * (`util/EndpointKeys`). Computed by the scheduler from the script it
+     * dispatched and carried on the result envelope.
+     *
+     * Null for every step ingested before the column existed and for any run
+     * whose script would not parse; the aggregation derives a key from
+     * [requestUrl] for those instead.
+     */
+    val endpointKey = varchar("endpoint_key", 210).nullable()
     val createdAt = timestamp("created_at")
 
     override val primaryKey = PrimaryKey(id)
