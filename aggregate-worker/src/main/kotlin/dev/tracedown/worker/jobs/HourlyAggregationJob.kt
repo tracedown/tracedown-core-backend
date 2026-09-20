@@ -77,6 +77,15 @@ class HourlyAggregationJob(
                 stmt.executeUpdate()
             }
 
+            // The same window rolled up per endpoint rather than per service —
+            // in this transaction and under this watermark, so a bucket is
+            // never built in one table and missing from the other.
+            conn.prepareStatement(StepAggregation.HOURLY_SQL).use { stmt ->
+                stmt.setTimestamp(1, tsStart)
+                stmt.setTimestamp(2, tsEnd)
+                stmt.executeUpdate()
+            }
+
             // Same transaction as the work it describes — see JobWatermarks.
             JobWatermarks.write(name, window.watermark)
 

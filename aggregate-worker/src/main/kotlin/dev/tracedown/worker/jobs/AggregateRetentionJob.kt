@@ -2,6 +2,7 @@ package dev.tracedown.worker.jobs
 
 import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.ProbeAggregates
+import dev.tracedown.common.models.ProbeStepAggregates
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.less
@@ -13,9 +14,10 @@ import java.time.temporal.ChronoUnit
 private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.AggregateRetentionJob")
 
 /**
- * Purges hourly aggregate rows from probe_aggregates older than the retention
- * period. Daily rollups are kept — they are cheap and back the long-range
- * charts once the raw results and hourly buckets that fed them have aged out.
+ * Purges hourly aggregate rows older than the retention period, from
+ * probe_aggregates and from the per-endpoint probe_step_aggregates beside it.
+ * Daily rollups are kept — they are cheap and back the long-range charts once
+ * the raw results and hourly buckets that fed them have aged out.
  *
  * A retention of `-1` (or `0`) keeps hourly aggregates forever; the job does
  * nothing in that case.
@@ -35,14 +37,25 @@ class AggregateRetentionJob(
 
         val cutoff = Instant.now().minus(hourlyRetentionDays.toLong(), ChronoUnit.DAYS)
 
-        val deleted = ioTransaction {
-            ProbeAggregates.deleteWhere {
+        val (deleted, deletedSteps) = ioTransaction {
+            val aggregates = ProbeAggregates.deleteWhere {
                 (ProbeAggregates.bucketType eq "hourly") and (ProbeAggregates.bucketStart less cutoff)
             }
+            // The per-endpoint rollups age out on the same window and in the
+            // same transaction: the two tables describe the same buckets, and a
+            // service whose trend stopped at the cutoff must not still be able
+            // to answer which of its endpoints was slow before it.
+            val steps = ProbeStepAggregates.deleteWhere {
+                (ProbeStepAggregates.bucketType eq "hourly") and (ProbeStepAggregates.bucketStart less cutoff)
+            }
+            aggregates to steps
         }
 
-        if (deleted > 0) {
-            log.info("Aggregate retention: deleted {} hourly aggregate rows (retention={}d)", deleted, hourlyRetentionDays)
+        if (deleted > 0 || deletedSteps > 0) {
+            log.info(
+                "Aggregate retention: deleted {} hourly aggregate rows and {} hourly endpoint rows (retention={}d)",
+                deleted, deletedSteps, hourlyRetentionDays,
+            )
         }
     }
 }

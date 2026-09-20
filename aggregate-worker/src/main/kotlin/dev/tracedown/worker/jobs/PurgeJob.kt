@@ -230,6 +230,7 @@ class PurgeJob(
             "DELETE FROM probe_steps WHERE probe_result_id IN ($results)",
             "DELETE FROM probe_results WHERE id IN ($results)",
             "DELETE FROM probe_aggregates WHERE service_id IN ($services)",
+            "DELETE FROM probe_step_aggregates WHERE service_id IN ($services)",
             "DELETE FROM service_allowed_agents WHERE service_id IN ($services)",
             "DELETE FROM notification_silences WHERE service_id IN ($services)",
             "DELETE FROM service_variables WHERE service_id IN ($services)",

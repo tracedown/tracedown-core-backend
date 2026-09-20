@@ -65,6 +65,16 @@ class DailyAggregationJob(
                 stmt.executeUpdate()
             }
 
+            // The same window rolled up per endpoint. Recomputed from the raw
+            // steps rather than summed out of the hourly rows: the hourly ones
+            // are pruned on a window of their own, and a daily bucket must not
+            // start reading differently the day its hours age out.
+            conn.prepareStatement(StepAggregation.DAILY_SQL).use { stmt ->
+                stmt.setTimestamp(1, tsStart)
+                stmt.setTimestamp(2, tsEnd)
+                stmt.executeUpdate()
+            }
+
             JobWatermarks.write(name, window.watermark)
         }
 

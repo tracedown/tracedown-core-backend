@@ -59,6 +59,7 @@ object Tables {
         ProbeAgents,
         ProbeAggregates,
         ProbeResults,
+        ProbeStepAggregates,
         ProbeSteps,
         ProjectNotificationTemplates,
         ProjectVariables,
