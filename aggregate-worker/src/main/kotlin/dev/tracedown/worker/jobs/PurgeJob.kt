@@ -241,32 +241,48 @@ class PurgeJob(
         private val CASCADE_SERVICES =
             serviceLevelCascade(PURGING_SERVICES, RESULTS_OF_PURGING_SERVICES)
 
+        /**
+         * Project-level dependents other than the services, leaf-first, for the
+         * given project scope.
+         *
+         * `project_notification_templates` is a binding with a plain FK to
+         * `projects` and no purge_after of its own, so nothing else would ever
+         * remove it: only the organization cascade reached it, by way of the
+         * templates it binds. Until container deletes stamped purge_after,
+         * neither of these two cascades ever ran, so the gap could not bite —
+         * now it would block the project row itself.
+         */
+        private fun projectLevelCascade(projects: String) = listOf(
+            "DELETE FROM notification_silences WHERE project_id IN ($projects)",
+            "DELETE FROM project_notification_templates WHERE project_id IN ($projects)",
+            "DELETE FROM project_variables WHERE project_id IN ($projects)",
+            "DELETE FROM grafana_integrations WHERE project_id IN ($projects)",
+        )
+
         // ── Project cascade ──
         private val CASCADE_PROJECTS =
-            serviceLevelCascade(SERVICES_OF_PURGING_PROJECTS, RESULTS_OF_PURGING_PROJECTS) + listOf(
-                "DELETE FROM notification_silences WHERE project_id IN ($PURGING_PROJECTS)",
-                "DELETE FROM project_variables WHERE project_id IN ($PURGING_PROJECTS)",
-                "DELETE FROM grafana_integrations WHERE project_id IN ($PURGING_PROJECTS)",
-                "DELETE FROM projects WHERE id IN ($PURGING_PROJECTS)",
-            )
+            serviceLevelCascade(SERVICES_OF_PURGING_PROJECTS, RESULTS_OF_PURGING_PROJECTS) +
+                projectLevelCascade(PURGING_PROJECTS) + listOf(
+                    "DELETE FROM projects WHERE id IN ($PURGING_PROJECTS)",
+                )
+
+        private const val PROJECTS_OF_PURGING_WORKSPACES =
+            "SELECT id FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)"
 
         // ── Workspace cascade ──
+        // A workspace-scoped rule preset holds a plain FK to `workspaces` and
+        // carries its own purge_after only when deleted on its own, so a live
+        // preset would block the workspace row. Only the organization cascade
+        // reached these before.
         private val CASCADE_WORKSPACES =
-            serviceLevelCascade(SERVICES_OF_PURGING_WORKSPACES, RESULTS_OF_PURGING_WORKSPACES) + listOf(
-                """DELETE FROM notification_silences WHERE project_id IN (
-                    SELECT id FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)
-                )""",
-                """DELETE FROM project_variables WHERE project_id IN (
-                    SELECT id FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)
-                )""",
-                """DELETE FROM grafana_integrations WHERE project_id IN (
-                    SELECT id FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)
-                )""",
-                "DELETE FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)",
-                "DELETE FROM notification_silences WHERE workspace_id IN ($PURGING_WORKSPACES)",
-                "DELETE FROM workspace_variables WHERE workspace_id IN ($PURGING_WORKSPACES)",
-                "DELETE FROM workspaces WHERE id IN ($PURGING_WORKSPACES)",
-            )
+            serviceLevelCascade(SERVICES_OF_PURGING_WORKSPACES, RESULTS_OF_PURGING_WORKSPACES) +
+                projectLevelCascade(PROJECTS_OF_PURGING_WORKSPACES) + listOf(
+                    "DELETE FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)",
+                    "DELETE FROM notification_silences WHERE workspace_id IN ($PURGING_WORKSPACES)",
+                    "DELETE FROM workspace_variables WHERE workspace_id IN ($PURGING_WORKSPACES)",
+                    "DELETE FROM org_rule_presets WHERE workspace_id IN ($PURGING_WORKSPACES)",
+                    "DELETE FROM workspaces WHERE id IN ($PURGING_WORKSPACES)",
+                )
 
         // ── Organization cascade ──
         // sessions.organization_id and users.selected_org_id are cleared by
