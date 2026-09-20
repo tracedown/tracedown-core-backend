@@ -51,7 +51,12 @@ object OrgService {
         ownerId: UUID,
         defaultGroups: List<DefaultGroupConfig>,
     ): CreateOrgResult {
-        return Interceptors.injectable("org.create", InterceptorContext(userId = ownerId)) {
+        // injectableInTx, not injectable: a before-hook that counts what this user
+        // already has and the insert below have to be one transaction, or two
+        // concurrent creations both read the pre-insert state and both pass. The
+        // inner transaction joins this one (nested transactions are off), so the
+        // body is unchanged.
+        return Interceptors.injectableInTx("org.create", InterceptorContext(userId = ownerId)) {
         transaction {
             val now = Instant.now()
             val orgId = UUID.randomUUID()
