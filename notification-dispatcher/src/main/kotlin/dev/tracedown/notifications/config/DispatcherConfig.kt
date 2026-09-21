@@ -1,5 +1,6 @@
 package dev.tracedown.notifications.config
 
+import dev.tracedown.notifications.consumers.OutboxConsumer
 import io.ktor.server.application.ApplicationEnvironment
 
 data class DatabaseConfig(
@@ -18,6 +19,18 @@ data class DispatcherConfig(
     val aesKey: String,
     val pollIntervalMs: Long,
     val batchSize: Int,
+    /**
+     * How long one instance's claim on an outbox row is honoured before
+     * another may take it. Bounds redelivery after an unclean exit, and is
+     * the retry spacing for a row that keeps failing. See [OutboxConsumer].
+     */
+    val claimLeaseSeconds: Long,
+    /**
+     * Age past which a notification that cannot be delivered is given up
+     * on rather than retried forever at the head of its service's line.
+     * Zero or less disables it. See [OutboxConsumer].
+     */
+    val maxEventAgeMinutes: Long,
     val statusPopTimeoutSeconds: Long,
     /** Base backoff (seconds) between webhook retries; grows ×4 each retry. */
     val webhookRetryBaseSeconds: Long,
@@ -48,6 +61,12 @@ data class DispatcherConfig(
                     ?.getString()?.toLong() ?: 5000L,
                 batchSize = config.propertyOrNull("dispatcher.batchSize")
                     ?.getString()?.toInt() ?: 50,
+                claimLeaseSeconds = config.propertyOrNull("dispatcher.claimLeaseSeconds")
+                    ?.getString()?.toLong()?.coerceAtLeast(1L)
+                    ?: OutboxConsumer.DEFAULT_CLAIM_LEASE_SECONDS,
+                maxEventAgeMinutes = config.propertyOrNull("dispatcher.maxEventAgeMinutes")
+                    ?.getString()?.toLong()
+                    ?: OutboxConsumer.DEFAULT_MAX_EVENT_AGE_MINUTES,
                 statusPopTimeoutSeconds = config.propertyOrNull("dispatcher.statusPopTimeoutSeconds")
                     ?.getString()?.toLong() ?: 5L,
                 webhookRetryBaseSeconds = config.propertyOrNull("dispatcher.webhookRetryBaseSeconds")

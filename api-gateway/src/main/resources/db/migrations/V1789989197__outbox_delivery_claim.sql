@@ -1,0 +1,83 @@
+-- Forward migration
+--
+-- A delivery lease on outbox rows, so the flag-style consumer can run more than
+-- one replica.
+--
+-- notification-dispatcher read `published = false` rows with no claim of any
+-- kind and set `published = true` only after delivery, so every row stayed
+-- visible to every reader for the whole duration of a batch. Two processes —
+-- which a start-first rolling deploy produces on every release, and which an
+-- operator produces by scaling the service — therefore both read the same rows
+-- and both delivered. Nothing errored; the duplicate showed up only in the
+-- inbox and in two notification_log rows.
+--
+-- claimed_by / claimed_at are that claim. The consumer sets them in the same
+-- statement that reads (UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP
+-- LOCKED) RETURNING), releases them by publishing the row, and treats a claim
+-- older than the lease as expired so a crashed process's rows are picked up by
+-- another. Both columns are nullable with no default, so the ALTERs rewrite no
+-- rows. Existing unpublished rows have a NULL claim and are immediately
+-- claimable, which is what a rolling deploy onto this migration needs.
+--
+-- Only flag consumers use these. Cursor consumers (outbox_cursors) walk the log
+-- by offset and never compete for a row, so the claim is invisible to them and
+-- the outbox purge — which keys off `published` and the cursor floor — is
+-- unchanged.
+ALTER TABLE outbox ADD COLUMN claimed_by VARCHAR(128);
+ALTER TABLE outbox ADD COLUMN claimed_at TIMESTAMP;
+
+-- The index behind the claim query's ordering rule.
+--
+-- With one consumer, a service's rows were delivered in order, because one
+-- process walked them in order. With several, two rows of the same service
+-- could be claimed by different processes and handled concurrently or
+-- backwards — a recovery mail ahead of the failure it recovers from, two
+-- passes racing the same per-recipient cooldown key. So the claim only ever
+-- takes a row that has no older unpublished row for the same service, which
+-- restores the ordering by construction. That test is the NOT EXISTS the
+-- consumer's claim statement carries, and this index is what answers it.
+--
+-- The service is read out of the payload rather than off aggregate_id, because
+-- for a probe_result.created row aggregate_id is the *result* id: unique per
+-- row, and useless as an ordering key. created_at is the probe's start time
+-- (the ingestor stamps the run, not the insert), so ordering by it is ordering
+-- by when the run actually happened; seq breaks ties.
+--
+-- Measured on PostgreSQL 18.6, 407k outbox rows (93 MB): 400k settled
+-- published rows, 2,000 unpublished probe_result.created rows spread over 400
+-- services, and 5,000 unpublished resource events that no flag consumer ever
+-- publishes. One claim of 50 rows:
+--
+--   with this index:
+--       Nested Loop Anti Join; outer Index Scan on idx_outbox_unpublished,
+--       inner Index Scan using idx_outbox_claimable (65 probes, 130 buffers)
+--       4.7 ms, 1,698 buffers total
+--   without it:
+--       the same anti join, but the inner side falls back to
+--       idx_outbox_unpublished and filters 3,065 rows per probe
+--       41.8 ms, 10,946 buffers total — 9,815 of them in the probe alone
+--
+-- The predicate is what keeps it small: 168 kB against a 93 MB table, because
+-- only unpublished probe_result.created rows are in it and a row leaves the
+-- index the moment it is published. event_type is in the predicate and not
+-- just the WHERE clause for a second reason — resource.* rows are read by
+-- cursor consumers alone and are never published, so without it every one of
+-- them would sit in the index forever and, worse, an unpublished resource row
+-- would block its own aggregate's probe rows through the NOT EXISTS.
+--
+-- A plain CREATE INDEX holds a SHARE lock for the scan. The outbox is trimmed
+-- to the retention window (7 days by default) so this is short, but an
+-- operator with a large one can build it by hand before deploying, which makes
+-- this statement a no-op:
+--
+--   CREATE INDEX CONCURRENTLY idx_outbox_claimable
+--       ON outbox ((payload ->> 'serviceId'), created_at, seq)
+--       WHERE published = false AND event_type = 'probe_result.created';
+--
+-- The migration cannot say CONCURRENTLY itself: Flyway holds an advisory lock
+-- inside a transaction across the whole run, and CREATE INDEX CONCURRENTLY
+-- waits for every transaction that can see the table — including Flyway's own.
+-- It does not fail, it hangs. See V1789461261.
+CREATE INDEX IF NOT EXISTS idx_outbox_claimable
+    ON outbox ((payload ->> 'serviceId'), created_at, seq)
+    WHERE published = false AND event_type = 'probe_result.created';
