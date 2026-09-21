@@ -71,10 +71,13 @@ import java.util.concurrent.TimeUnit
  *   recorded as failed rather than blocking the caller — shedding load is the
  *   correct answer for an alerting pipeline whose value is timeliness.
  *
- * The module runs single-instance (see `OutboxConsumer`), so the pool is
- * in-process by design: there is no second replica for a shared queue to
- * balance across, and adding one would be a horizontal-scaling change the rest
- * of the module does not support.
+ * The pool stays in-process now that the module can be replicated (see
+ * `OutboxConsumer`): the outbox claim already splits the work, so a replica
+ * only ever queues deliveries for events it alone claimed and there is nothing
+ * for a shared queue to balance. The consequence is that [queueCapacity] and
+ * the breaker's state are per replica rather than per platform — a dead
+ * endpoint is probed once per replica per open window, and the shed threshold
+ * is per replica too.
  *
  * The cost of queueing is that a shutdown mid-flight abandons whatever is still
  * queued, and the outbox event that produced it has already been marked

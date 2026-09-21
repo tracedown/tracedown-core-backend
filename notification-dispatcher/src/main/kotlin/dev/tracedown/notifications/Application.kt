@@ -85,8 +85,11 @@ fun Application.module() {
     // them — retry backoff runs here, off the outbox pipeline.
     webhookDeliveryService.start(consumerScope)
 
-    // Outbox consumer
-    val consumer = OutboxConsumer(processor, pubSubConnection, config.pollIntervalMs, config.batchSize)
+    // Outbox consumer. Claims the rows it reads, so more than one instance is
+    // safe — which is what a start-first rolling deploy needs.
+    val consumer = OutboxConsumer(
+        processor, pubSubConnection, config.pollIntervalMs, config.batchSize, config.claimLeaseSeconds,
+    )
     consumer.start(consumerScope)
 
     // Email status consumer — dedicated connection because BRPOP blocks it, and

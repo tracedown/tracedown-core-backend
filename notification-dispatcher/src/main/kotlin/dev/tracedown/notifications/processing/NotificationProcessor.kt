@@ -6,6 +6,7 @@ import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Workspaces
+import dev.tracedown.notifications.consumers.OutboxEventProcessor
 import dev.tracedown.notifications.delivery.EmailDeliveryService
 import dev.tracedown.notifications.delivery.WebhookDeliveryService
 import dev.tracedown.notifications.recipients.RecipientCooldown
@@ -47,7 +48,7 @@ class NotificationProcessor(
     private val emailDeliveryService: EmailDeliveryService,
     private val webhookDeliveryService: WebhookDeliveryService,
     private val recipientCooldown: RecipientCooldown,
-) {
+) : OutboxEventProcessor {
 
     private val log = LoggerFactory.getLogger(javaClass)
 
@@ -56,7 +57,7 @@ class NotificationProcessor(
      *
      * @param payload the outbox event payload containing resultId, serviceId, etc.
      */
-    suspend fun process(payload: JsonObject) {
+    override suspend fun process(payload: JsonObject) {
         val resultId = UUID.fromString(payload["resultId"]?.jsonPrimitive?.content ?: return)
         val serviceId = UUID.fromString(payload["serviceId"]?.jsonPrimitive?.content ?: return)
         val projectId = UUID.fromString(payload["projectId"]?.jsonPrimitive?.content ?: return)
