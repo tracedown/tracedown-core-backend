@@ -24,7 +24,9 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.innerJoin
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
@@ -299,10 +301,17 @@ class DispatchQueue(
         // (concurrent-run protection is the probe_active lock, not this set).
         queuedServices.remove(serviceId)
 
-        // Load service from DB
+        // Load service from DB, with its project and workspace. The ancestry is
+        // part of the eligibility question: a container delete carries its
+        // services down, but reading `services` alone would let a service the
+        // cascade missed keep probing a target inside a project its owner
+        // deleted. No row here — for any of the three reasons — unschedules.
         val service = transaction {
-            Services.selectAll()
-                .where { Services.id eq serviceId }
+            (Services innerJoin Projects innerJoin Workspaces).selectAll()
+                .where {
+                    (Services.id eq serviceId) and
+                        (Projects.deleted eq false) and (Workspaces.deleted eq false)
+                }
                 .firstOrNull()
         }
 

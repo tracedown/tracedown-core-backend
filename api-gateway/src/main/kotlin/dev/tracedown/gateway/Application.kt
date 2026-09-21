@@ -184,7 +184,7 @@ fun Application.module() {
         conn.sync()
     }
 
-    ServiceController.init { redisA }
+    dev.tracedown.gateway.util.ScheduleNudge.init { redisA }
     dev.tracedown.common.realtime.RealtimePublisher.init { redisA }
 
     // Redis C (resource hierarchy cache) — optional, disabled if not configured.

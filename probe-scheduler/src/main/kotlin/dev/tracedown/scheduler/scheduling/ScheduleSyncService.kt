@@ -1,11 +1,14 @@
 package dev.tracedown.scheduler.scheduling
 
+import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.Services
+import dev.tracedown.common.models.Workspaces
 import io.lettuce.core.pubsub.RedisPubSubAdapter
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection
 import kotlinx.coroutines.*
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.innerJoin
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.slf4j.LoggerFactory
@@ -31,11 +34,29 @@ class ScheduleSyncService(
     private val serviceVersions = ConcurrentHashMap<UUID, Int>()
     private var sweepJob: Job? = null
 
+    /**
+     * Every service this scheduler may run: active, not deleted, and with a
+     * live project and workspace above it.
+     *
+     * The ancestry is part of the question, not a nicety. Deleting a container
+     * is supposed to carry its services down with it, but if a cascade ever
+     * misses one, selecting on `services` alone would keep probing a target
+     * inside a project the owner deleted — writing results and sending alerts
+     * for something that is not supposed to exist. Joining the parents in makes
+     * that unreachable rather than merely unlikely; both joins are on primary
+     * keys, so the sweep costs the same as before.
+     */
+    private fun liveServices() = (Services innerJoin Projects innerJoin Workspaces)
+        .selectAll()
+        .where {
+            (Services.isActive eq true) and (Services.deleted eq false) and
+                (Projects.deleted eq false) and (Workspaces.deleted eq false)
+        }
+
     /** Performs initial full scan and loads all active services. */
     fun bootstrap() {
         val services = transaction {
-            Services.selectAll()
-                .where { (Services.isActive eq true) and (Services.deleted eq false) }
+            liveServices()
                 .map { row ->
                     Triple(
                         row[Services.id],
@@ -122,11 +143,16 @@ class ScheduleSyncService(
     fun handleNudge(serviceId: UUID) {
         try {
             val service = transaction {
-                Services.selectAll()
-                    .where { Services.id eq serviceId }
+                (Services innerJoin Projects innerJoin Workspaces).selectAll()
+                    .where {
+                        (Services.id eq serviceId) and
+                            (Projects.deleted eq false) and (Workspaces.deleted eq false)
+                    }
                     .firstOrNull()
             }
 
+            // A missing row now also means "its project or workspace is gone",
+            // which unschedules on exactly the same branch.
             if (service == null || service[Services.deleted] || !service[Services.isActive]) {
                 quartzManager.unscheduleService(serviceId)
                 serviceVersions.remove(serviceId)
@@ -144,8 +170,7 @@ class ScheduleSyncService(
     /** Lightweight consistency sweep — only reads id + version. */
     private fun sweep() {
         val dbState = transaction {
-            Services.selectAll()
-                .where { (Services.isActive eq true) and (Services.deleted eq false) }
+            liveServices()
                 .associate { row ->
                     row[Services.id] to Pair(row[Services.schedule], row[Services.version])
                 }

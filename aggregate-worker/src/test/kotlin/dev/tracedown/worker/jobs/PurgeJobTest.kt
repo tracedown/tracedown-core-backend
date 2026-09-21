@@ -6,17 +6,20 @@ import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.BodyStores
 import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.NotificationSilences
+import dev.tracedown.common.models.NotificationTemplates
 import dev.tracedown.common.models.OrgEncryptionKeys
 import dev.tracedown.common.models.OrgAuditLog
 import dev.tracedown.common.models.OrgGroups
 import dev.tracedown.common.models.OrgUserGroups
 import dev.tracedown.common.models.OrgUsers
+import dev.tracedown.common.models.OrgRulePresets
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.PasswordResetTokens
 import dev.tracedown.common.models.PendingBodyDeletions
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
+import dev.tracedown.common.models.ProjectNotificationTemplates
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ResourcePermissions
 import dev.tracedown.common.models.ResourceWebhookAccess
@@ -152,23 +155,66 @@ class PurgeJobTest {
             return id
         }
 
-        private fun insertWorkspace(orgId: UUID): UUID {
+        private fun insertWorkspace(orgId: UUID, purge: Boolean = false): UUID {
             val id = UUID.randomUUID()
             Workspaces.insert {
                 it[Workspaces.id] = id
                 it[organizationId] = orgId
                 it[name] = "ws"
                 it[createdAt] = NOW
+                if (purge) {
+                    it[deleted] = true
+                    it[deletedAt] = PAST
+                    it[purgeAfter] = PAST
+                }
             }
             return id
         }
 
-        private fun insertProject(wsId: UUID): UUID {
+        private fun insertProject(wsId: UUID, purge: Boolean = false): UUID {
             val id = UUID.randomUUID()
             Projects.insert {
                 it[Projects.id] = id
                 it[workspaceId] = wsId
                 it[name] = "proj"
+                it[createdAt] = NOW
+                if (purge) {
+                    it[deleted] = true
+                    it[deletedAt] = PAST
+                    it[purgeAfter] = PAST
+                }
+            }
+            return id
+        }
+
+        /** A template bound to a project — the binding is what blocks the project row. */
+        private fun insertProjectTemplateBinding(orgId: UUID, projectId: UUID): UUID {
+            val templateId = UUID.randomUUID()
+            NotificationTemplates.insert {
+                it[NotificationTemplates.id] = templateId
+                it[organizationId] = orgId
+                it[name] = "tpl"
+                it[text] = "{{status}}"
+                it[createdAt] = NOW
+            }
+            val bindingId = UUID.randomUUID()
+            ProjectNotificationTemplates.insert {
+                it[ProjectNotificationTemplates.id] = bindingId
+                it[notificationTemplateId] = templateId
+                it[ProjectNotificationTemplates.projectId] = projectId
+            }
+            return bindingId
+        }
+
+        /** A script preset scoped to one workspace — it holds an FK to that row. */
+        private fun insertWorkspacePreset(orgId: UUID, workspaceId: UUID): UUID {
+            val id = UUID.randomUUID()
+            OrgRulePresets.insert {
+                it[OrgRulePresets.id] = id
+                it[organizationId] = orgId
+                it[OrgRulePresets.workspaceId] = workspaceId
+                it[displayName] = "preset"
+                it[script] = ""
                 it[createdAt] = NOW
             }
             return id
@@ -919,6 +965,106 @@ class PurgeJobTest {
             }
         } finally {
             transaction { exec("DROP TABLE IF EXISTS purge_blocker") }
+        }
+    }
+
+    // ── (c2) Container purges ──
+    //
+    // Until container deletes stamped purge_after, a project or workspace never
+    // became due and these two cascades never ran. They run now, so everything
+    // holding an FK to those rows has to go first or the row itself is blocked.
+
+    @Test
+    fun `project purge takes its services, variables, bindings and integrations`() {
+        lateinit var proj: UUID
+        lateinit var svc: UUID
+        lateinit var binding: UUID
+        lateinit var result: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            proj = insertProject(ws, purge = true)
+            svc = insertService(proj)
+            result = insertResult(svc, proj, ws, org)
+            insertStep(result, null)
+            binding = insertProjectTemplateBinding(org, proj)
+        }
+
+        runPurge()
+
+        transaction {
+            assertEquals(0, count(Projects, Projects.id eq proj), "the project row itself must go")
+            assertEquals(0, count(Services, Services.id eq svc), "its services go with it")
+            assertEquals(0, count(ProbeResults, ProbeResults.id eq result))
+            assertEquals(
+                0, count(ProjectNotificationTemplates, ProjectNotificationTemplates.id eq binding),
+                "a template binding holds a plain FK to the project and nothing else would remove it",
+            )
+        }
+    }
+
+    @Test
+    fun `workspace purge takes its projects, services and workspace-scoped presets`() {
+        lateinit var ws: UUID
+        lateinit var proj: UUID
+        lateinit var svc: UUID
+        lateinit var preset: UUID
+        lateinit var binding: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            ws = insertWorkspace(org, purge = true)
+            proj = insertProject(ws)
+            svc = insertService(proj)
+            insertResult(svc, proj, ws, org)
+            preset = insertWorkspacePreset(org, ws)
+            binding = insertProjectTemplateBinding(org, proj)
+        }
+
+        runPurge()
+
+        transaction {
+            assertEquals(0, count(Workspaces, Workspaces.id eq ws), "the workspace row itself must go")
+            assertEquals(0, count(Projects, Projects.id eq proj))
+            assertEquals(0, count(Services, Services.id eq svc))
+            assertEquals(
+                0, count(OrgRulePresets, OrgRulePresets.id eq preset),
+                "a workspace-scoped preset would otherwise block the workspace row forever",
+            )
+            assertEquals(0, count(ProjectNotificationTemplates, ProjectNotificationTemplates.id eq binding))
+        }
+    }
+
+    @Test
+    fun `a container purge leaves an org-wide preset and a sibling workspace alone`() {
+        lateinit var doomed: UUID
+        lateinit var survivor: UUID
+        lateinit var orgWidePreset: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            doomed = insertWorkspace(org, purge = true)
+            survivor = insertWorkspace(org)
+            orgWidePreset = UUID.randomUUID()
+            OrgRulePresets.insert {
+                it[OrgRulePresets.id] = orgWidePreset
+                it[organizationId] = org
+                it[displayName] = "org-wide"
+                it[script] = ""
+                it[createdAt] = NOW
+            }
+        }
+
+        runPurge()
+
+        transaction {
+            assertEquals(0, count(Workspaces, Workspaces.id eq doomed))
+            assertEquals(1, count(Workspaces, Workspaces.id eq survivor))
+            assertEquals(
+                1, count(OrgRulePresets, OrgRulePresets.id eq orgWidePreset),
+                "a preset with no workspace belongs to the org, not to the workspace that purged",
+            )
         }
     }
 

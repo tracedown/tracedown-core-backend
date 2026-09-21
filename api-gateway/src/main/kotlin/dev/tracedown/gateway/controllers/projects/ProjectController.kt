@@ -40,8 +40,10 @@ import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.gateway.util.ConflictException
+import dev.tracedown.gateway.util.DeletionCascade
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
+import dev.tracedown.gateway.util.ScheduleNudge
 import dev.tracedown.gateway.util.VariableCrypto
 import dev.tracedown.gateway.util.requireCachedPermissions
 import org.jetbrains.exposed.v1.core.and
@@ -192,9 +194,15 @@ object ProjectController {
         }
     }
 
-    /** Soft-deletes a project. Requires write access. */
+    /**
+     * Soft-deletes a project and everything under it. Requires write access.
+     *
+     * The services go down with it in the same transaction — a project whose
+     * probes kept firing was the whole bug — and each one is nudged so the
+     * scheduler drops it now rather than at its next consistency sweep.
+     */
     fun delete(orgId: UUID, projectId: UUID, userId: UUID) {
-        transaction {
+        val cascaded = transaction {
             val ctx = ResourceResolver.resolveProject(projectId, orgId)
             val cached = requireCachedPermissions(orgId, userId)
             requireProjectWriteAccess(projectId, ctx.workspaceId, cached)
@@ -203,9 +211,13 @@ object ProjectController {
                 .where { Projects.id eq projectId }
                 .firstOrNull()?.get(Projects.name)
 
+            val now = Instant.now()
+            val cascaded = DeletionCascade.project(projectId, now)
+
             Projects.update({ Projects.id eq projectId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = now
             }
 
             AuditService.log(orgId, userId, "delete.project", "project", projectId.toString(), entityDisplayName = deletedName)
@@ -214,8 +226,11 @@ object ProjectController {
                 buildJsonObject { put("id", projectId.toString()); put("orgId", orgId.toString()); put("parentId", ctx.workspaceId.toString()) },
             )
             RealtimePublisher.publish("workspace:${ctx.workspaceId}", orgId, "project.deleted", buildJsonObject { put("projectId", projectId.toString()) })
+            cascaded
         }
         ResourceResolver.invalidateProject(projectId)
+        cascaded.serviceIds.forEach(ResourceResolver::invalidateService)
+        ScheduleNudge.publishAll(cascaded.serviceIds)
     }
 
     // ── Variables ──

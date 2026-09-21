@@ -36,7 +36,10 @@ import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.common.variables.SystemVariables
 import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.gateway.util.ConflictException
+import dev.tracedown.gateway.util.DeletionCascade
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.ResourceResolver
+import dev.tracedown.gateway.util.ScheduleNudge
 import dev.tracedown.gateway.util.VariableCrypto
 import dev.tracedown.gateway.util.requireCachedPermissions
 import dev.tracedown.gateway.util.requireOrgWrite
@@ -157,9 +160,17 @@ object WorkspaceController {
         }
     }
 
-    /** Soft-deletes a workspace. Requires write access to the workspace. */
+    /**
+     * Soft-deletes a workspace, its projects and their services. Requires write
+     * access to the workspace.
+     *
+     * The subtree goes down in the same transaction — a workspace whose probes
+     * kept firing was the whole bug — and every service it carried down is
+     * nudged so the scheduler drops it now rather than at its next consistency
+     * sweep.
+     */
     fun delete(orgId: UUID, workspaceId: UUID, userId: UUID) {
-        transaction {
+        val cascaded = transaction {
             val cached = requireCachedPermissions(orgId, userId)
             requireWorkspaceWriteAccess(workspaceId, orgId, cached)
 
@@ -167,9 +178,13 @@ object WorkspaceController {
                 .where { Workspaces.id eq workspaceId }
                 .firstOrNull()?.get(Workspaces.name)
 
+            val now = Instant.now()
+            val cascaded = DeletionCascade.workspace(workspaceId, now)
+
             Workspaces.update({ Workspaces.id eq workspaceId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = now
             }
 
             AuditService.log(orgId, userId, "delete.workspace", "workspace", workspaceId.toString(), entityDisplayName = deletedName)
@@ -178,7 +193,11 @@ object WorkspaceController {
                 buildJsonObject { put("id", workspaceId.toString()); put("orgId", orgId.toString()) },
             )
             RealtimePublisher.publish("org:$orgId", orgId, "workspace.deleted", buildJsonObject { put("workspaceId", workspaceId.toString()) })
+            cascaded
         }
+        cascaded.projectIds.forEach(ResourceResolver::invalidateProject)
+        cascaded.serviceIds.forEach(ResourceResolver::invalidateService)
+        ScheduleNudge.publishAll(cascaded.serviceIds)
     }
 
     // ── Variables ──

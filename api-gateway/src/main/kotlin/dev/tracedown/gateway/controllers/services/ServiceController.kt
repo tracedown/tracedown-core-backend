@@ -61,6 +61,7 @@ import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
+import dev.tracedown.gateway.util.ScheduleNudge
 import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.gateway.util.ServiceContext
 import dev.tracedown.gateway.util.VariableCrypto
@@ -105,30 +106,11 @@ object ServiceController {
     private val validProbeModes = setOf("consecutive", "simultaneous", "random")
     private val validQueuePolicies = setOf("skip", "enqueue_once")
 
-    private var redisProvider: (() -> io.lettuce.core.api.sync.RedisCommands<String, String>)? = null
-
-    /** Injects the Redis connection provider for schedule nudge publishing. */
-    fun init(redisProvider: () -> io.lettuce.core.api.sync.RedisCommands<String, String>) {
-        this.redisProvider = redisProvider
-    }
-
     /** Publishes a schedule nudge so the scheduler picks up changes immediately. */
-    private fun publishNudge(serviceId: UUID) {
-        try {
-            redisProvider?.invoke()?.publish("schedule:nudge", serviceId.toString())
-        } catch (e: Exception) {
-            log.warn("failed to publish schedule:nudge for {}: {}", serviceId, e.message)
-        }
-    }
+    private fun publishNudge(serviceId: UUID) = ScheduleNudge.publish(serviceId)
 
     /** Publishes a run-now trigger so the scheduler dispatches one immediate probe. */
-    private fun publishTriggerRun(serviceId: UUID) {
-        try {
-            redisProvider?.invoke()?.publish("probe:trigger", serviceId.toString())
-        } catch (e: Exception) {
-            log.warn("failed to publish probe:trigger for {}: {}", serviceId, e.message)
-        }
-    }
+    private fun publishTriggerRun(serviceId: UUID) = ScheduleNudge.trigger(serviceId)
 
     /**
      * Requests an immediate one-off probe run for a service. Requires write access.
