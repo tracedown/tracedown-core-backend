@@ -1,5 +1,8 @@
 package dev.tracedown.notifications.consumers
 
+import dev.tracedown.common.alerts.AlertContext
+import dev.tracedown.common.alerts.SystemAlertRouting
+import dev.tracedown.common.alerts.SystemAlertService
 import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.Outbox
 import io.lettuce.core.pubsub.RedisPubSubAdapter
@@ -7,7 +10,11 @@ import io.lettuce.core.pubsub.StatefulRedisPubSubConnection
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.jetbrains.exposed.v1.core.VarCharColumnType
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -17,6 +24,8 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.slf4j.LoggerFactory
 import java.net.InetAddress
+import java.time.Duration
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ThreadLocalRandom
 
@@ -110,22 +119,93 @@ import java.util.concurrent.ThreadLocalRandom
  * time, so it orders rows by when the runs actually happened.
  *
  * The cost is head-of-line blocking: a row that keeps failing holds up its own
- * service's later rows. That is deliberate. Delivering a recovery while the
- * failure it recovers from is still undelivered is worse than delivering
- * neither, and it is bounded — every other service is unaffected, the stalled
- * row stays visible as an unpublished row that the outbox purge will not
- * remove, and failures on this path are almost always systemic (Redis or the
- * database unreachable) rather than specific to one row.
+ * service's later rows. Delivering a recovery while the failure it recovers
+ * from is still undelivered is worse than delivering neither — but only up to a
+ * point, and [maxEventAgeMinutes] is that point. See below.
  *
- * ## Failure and poison rows
+ * ## Failure, poison rows, and giving up
  *
- * A row whose processing throws is not published, exactly as before, so it is
- * retried. What is new is the spacing: its claim is deliberately **left in
- * place**, so it cannot be re-claimed until the lease expires. There is no
- * attempt counter on the outbox, and the lease is what replaces one — a row
- * that fails forever is retried every [claimLeaseSeconds] instead of every
- * [pollIntervalMs], which used to mean a hot loop every five seconds for as
- * long as the failure lasted.
+ * A row whose processing throws is not published, so it is retried. What the
+ * claim adds is spacing: the claim is deliberately **left in place**, so the row
+ * cannot be re-claimed until the lease expires. There is no attempt counter on
+ * the outbox and the lease is what replaces one — a row that fails forever is
+ * retried every [claimLeaseSeconds] instead of every [pollIntervalMs], which
+ * used to mean a hot loop every five seconds for as long as the failure lasted.
+ *
+ * On its own that is not safe for an alerting product. Combine "a failing row
+ * keeps its claim" with "no row is claimed while an older one of the same
+ * service is unpublished" and a single permanently undeliverable event silences
+ * its service **forever**: every later failure and recovery queues behind it and
+ * nobody is ever told anything about that service again. Before the claim
+ * existed a poison row was retried endlessly but did not block the rows behind
+ * it, so this would be a regression, and a silent one — never alerting is far
+ * worse than the duplicate alert the claim was introduced to remove.
+ *
+ * So a row that cannot be delivered eventually stops holding the line. The bound
+ * is **age, not attempts**: no new column is needed, and it says the right
+ * thing — a notification about a probe that ran hours ago has stopped being an
+ * alert. Once a delivery attempt fails on a row older than
+ * [maxEventAgeMinutes], the row is published **without being delivered**,
+ * logged at ERROR with its ids, its age and the failing exception, and raised as
+ * an org-scoped [SystemAlertService.NOTIFICATION_DROPPED] alert so the
+ * organization can see that it lost an alert rather than silently not getting
+ * one. Its successors then become claimable, are attempted in turn, and are
+ * either delivered or given up on the same way — so a chain of stuck rows drains
+ * rather than compounding.
+ *
+ * Three properties of that rule are load-bearing:
+ *
+ *  - **Only a row that actually failed is ever given up on.** The age is checked
+ *    in the failure path, never before an attempt. A dispatcher that was simply
+ *    down — for three hours, or for a day — comes back and delivers its whole
+ *    backlog, however old, because those rows succeed on the first attempt.
+ *    Nothing deliverable is ever dropped for being old.
+ *  - **The age uses `created_at`**, which for these rows is the probe's start
+ *    time, not the insert time. That is deliberate twice over: it is the same
+ *    column the ordering rule sorts on, so expiry and ordering can never
+ *    disagree about which row is older; and staleness is a property of the event
+ *    being reported ("this service failed at T"), not of when a row happened to
+ *    be written. A probe that itself ran long shifts its own `created_at`
+ *    earlier by at most one probe timeout — tens of seconds against a bound
+ *    measured in hours — so it cannot matter. A backlog anywhere upstream (the
+ *    result queue, not just the outbox) ages a row the same way, which is
+ *    correct: the alert really is that old.
+ *  - **A healthy row queued behind a slow batch is not at risk.** It is not
+ *    expired by sitting in a queue; it is expired only by failing while past the
+ *    bound.
+ *
+ * Quiet hours and the per-recipient cooldown do not interact with any of this.
+ * Both filter recipients *inside* a successful [process] call, so a row they
+ * silence is published normally and never reaches the age path.
+ *
+ * Setting [maxEventAgeMinutes] to zero or less disables giving up entirely and
+ * restores unbounded head-of-line blocking. That is a deliberate escape hatch,
+ * not a default.
+ *
+ * ### Follow-up, deliberately not built here
+ *
+ * When a large backlog does drain, every queued failure for a service is
+ * delivered in sequence. For email this mostly collapses on its own: the
+ * per-recipient cooldown is opened by the first of them and silently drops the
+ * rest of the same kind, so a three-hour outage of thirty-six failing runs
+ * produces roughly one failure mail and one recovery. Webhooks are not
+ * cooldown-gated, so a bound endpoint does receive the whole burst. Coalescing a
+ * stale backlog down to the latest state per service would fix that properly,
+ * but it is a change to what [process] is handed rather than to how rows are
+ * claimed, so it does not belong in this class.
+ *
+ * ### Why the drop is not recorded in `notification_log`
+ *
+ * It would not fit and nothing would read it. The table's `channel` is
+ * `CHECK (channel IN ('email', 'webhook'))` and a given-up row never reached a
+ * channel; `recipient` is `NOT NULL` and is the column both the GDPR export and
+ * the erasure purge match on, so inventing a value there is the one thing that
+ * column must not carry. `'suppressed'` exists in the status constraint but
+ * means a per-user control silenced a delivery, which is a different event from
+ * the platform abandoning one. Above all the table has no read surface in the
+ * product at all — no route, no view — whereas `system_alerts` has both banners
+ * and the warning log, so that is where "why did I get no alert" is actually
+ * answerable.
  *
  * ## Everything else on the outbox is untouched
  *
@@ -158,6 +238,11 @@ class OutboxConsumer(
     /** How long a claim is honoured before the row is considered abandoned. */
     private val claimLeaseSeconds: Long = DEFAULT_CLAIM_LEASE_SECONDS,
     /**
+     * Age past which a failing event is given up on instead of being retried
+     * forever at the head of its service's line. Zero or less disables it.
+     */
+    private val maxEventAgeMinutes: Long = DEFAULT_MAX_EVENT_AGE_MINUTES,
+    /**
      * Value written to `claimed_by`. Stable for the life of the process.
      *
      * Diagnostic only — mutual exclusion comes from the claiming statement, not
@@ -188,8 +273,8 @@ class OutboxConsumer(
         // Start poll loop
         job = scope.launch {
             log.info(
-                "outbox consumer started (instance={}, poll={}ms, batch={}, lease={}s)",
-                instanceId, pollIntervalMs, batchSize, claimLeaseSeconds,
+                "outbox consumer started (instance={}, poll={}ms, batch={}, lease={}s, maxEventAge={}min)",
+                instanceId, pollIntervalMs, batchSize, claimLeaseSeconds, maxEventAgeMinutes,
             )
             while (isActive) {
                 try {
@@ -277,28 +362,100 @@ class OutboxConsumer(
 
         log.debug("processing {} outbox events", events.size)
 
-        val processedIds = mutableListOf<UUID>()
+        // A row is settled either by being delivered or by being given up on.
+        // Both publish it, which is what releases its hold on the line.
+        val settledIds = mutableListOf<UUID>()
         try {
-            for ((id, payload) in events) {
+            for (event in events) {
                 try {
-                    processor.process(payload)
-                    processedIds.add(id)
+                    processor.process(event.payload)
+                    settledIds.add(event.id)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    // Left claimed on purpose: the lease is the retry backoff.
-                    log.error("failed to process outbox event {}: {}", id, e.message, e)
+                    if (isPastMaxAge(event.createdAt)) {
+                        giveUp(event, e)
+                        settledIds.add(event.id)
+                    } else {
+                        // Left claimed on purpose: the lease is the retry backoff.
+                        log.error("failed to process outbox event {}: {}", event.id, e.message, e)
+                    }
                 }
             }
         } finally {
-            // Publish what was delivered even when the batch is being
-            // cancelled. A shutdown mid-batch would otherwise turn completed
-            // deliveries into redeliveries for whoever picks the rows up next.
-            if (processedIds.isNotEmpty()) {
-                withContext(NonCancellable) { markPublished(processedIds) }
+            // Publish what was settled even when the batch is being cancelled.
+            // A shutdown mid-batch would otherwise turn completed deliveries
+            // into redeliveries for whoever picks the rows up next.
+            if (settledIds.isNotEmpty()) {
+                withContext(NonCancellable) { markPublished(settledIds) }
             }
         }
         return true
+    }
+
+    /** Whether an event is old enough to be abandoned rather than retried. */
+    private fun isPastMaxAge(createdAt: Instant): Boolean {
+        if (maxEventAgeMinutes <= 0) return false
+        return createdAt.isBefore(Instant.now().minus(Duration.ofMinutes(maxEventAgeMinutes)))
+    }
+
+    /**
+     * Abandons an event that failed and is past [maxEventAgeMinutes]: it is
+     * published without being delivered, so its service's later events can move.
+     *
+     * Loud on purpose, on two channels. The ERROR log carries the ids, the age
+     * and the failing exception, for whoever is looking at the process. The
+     * org-scoped alert carries the same to the organization, because the thing
+     * it will otherwise experience is a service it hears nothing about, with no
+     * way to tell that from a service that is fine. Offered to the routing seam
+     * first so a host that operates the platform can claim it instead.
+     */
+    private fun giveUp(event: ClaimedEvent, cause: Exception) {
+        val ageMinutes = Duration.between(event.createdAt, Instant.now()).toMinutes()
+        val serviceId = event.payload["serviceId"]?.jsonPrimitive?.contentOrNull
+        val resultId = event.payload["resultId"]?.jsonPrimitive?.contentOrNull
+        val orgId = event.payload["organizationId"]?.jsonPrimitive?.contentOrNull
+            ?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+
+        log.error(
+            "giving up on outbox event {} (service={}, result={}, age={}min > {}min) after {}: {} — " +
+                "it is published undelivered so this service's later notifications can proceed",
+            event.id, serviceId, resultId, ageMinutes, maxEventAgeMinutes,
+            cause.javaClass.simpleName, cause.message, cause,
+        )
+
+        if (orgId == null) return
+        val data = buildJsonObject {
+            put("serviceId", serviceId ?: "")
+            put("probeResultId", resultId ?: "")
+            put("outboxId", event.id.toString())
+            put("ageMinutes", ageMinutes)
+            put("maxEventAgeMinutes", maxEventAgeMinutes)
+            put("lastError", cause.javaClass.simpleName)
+        }
+        val ctx = AlertContext(
+            alertType = SystemAlertService.NOTIFICATION_DROPPED,
+            subject = serviceId ?: "",
+            orgId = orgId,
+            orgScoped = true,
+            severity = "error",
+            data = data,
+        )
+        try {
+            if (!SystemAlertRouting.handled(ctx)) {
+                SystemAlertService.raise(
+                    orgId = orgId,
+                    alertType = SystemAlertService.NOTIFICATION_DROPPED,
+                    subject = serviceId ?: "",
+                    severity = "error",
+                    data = data,
+                )
+            }
+        } catch (e: Exception) {
+            // Never let reporting the drop stop the row from being published —
+            // that would put the head-of-line block straight back.
+            log.warn("could not raise the dropped-notification alert: {}", e.message)
+        }
     }
 
     /**
@@ -312,7 +469,7 @@ class OutboxConsumer(
      * `claimLeaseSeconds` and `batchSize` are numeric values under our control
      * and are inlined; the instance id is a parameter.
      */
-    private suspend fun claimBatch(): List<Pair<UUID, JsonObject>> = ioTransaction {
+    private suspend fun claimBatch(): List<ClaimedEvent> = ioTransaction {
         val sql = """
             WITH claimed AS (
                 UPDATE outbox
@@ -338,10 +495,10 @@ class OutboxConsumer(
                        )
              RETURNING id, payload, created_at, seq
             )
-            SELECT id, payload FROM claimed ORDER BY created_at, seq
+            SELECT id, payload, created_at FROM claimed ORDER BY created_at, seq
         """.trimIndent()
 
-        val claimed = mutableListOf<Pair<UUID, JsonObject>>()
+        val claimed = mutableListOf<ClaimedEvent>()
         // The statement opens with a data-modifying CTE. Exposed reads the type
         // off the leading keyword and would run this through executeUpdate,
         // throwing on the rows it gets back.
@@ -351,12 +508,22 @@ class OutboxConsumer(
             explicitStatementType = StatementType.SELECT,
         ) { rs ->
             while (rs.next()) {
-                claimed += (rs.getObject("id") as UUID) to
-                    Json.parseToJsonElement(rs.getString("payload")).jsonObject
+                claimed += ClaimedEvent(
+                    id = rs.getObject("id") as UUID,
+                    payload = Json.parseToJsonElement(rs.getString("payload")).jsonObject,
+                    createdAt = rs.getTimestamp("created_at").toInstant(),
+                )
             }
         }
         claimed
     }
+
+    /**
+     * One claimed row. [createdAt] is the probe's start time, which is both the
+     * ordering key and the basis for [isPastMaxAge] — see the class notes on why
+     * those must be the same column.
+     */
+    private data class ClaimedEvent(val id: UUID, val payload: JsonObject, val createdAt: Instant)
 
     /**
      * Marks delivered rows published, which is also what releases their claim.
@@ -417,6 +584,27 @@ class OutboxConsumer(
          * window an alert can absorb. Raise it if `batchSize` is raised.
          */
         const val DEFAULT_CLAIM_LEASE_SECONDS = 120L
+
+        /**
+         * Default age, in minutes, past which a failing event is abandoned.
+         *
+         * Six hours. It is a ceiling and a floor at once, and the two pull in
+         * opposite directions. As a ceiling it is the longest one undeliverable
+         * event may hold its service's line — a day would be too long to leave a
+         * service silently unalerted. As a floor it is how long a systemic
+         * failure may last before the oldest events start being abandoned, since
+         * a dependency that is down fails every row alike; six hours is well
+         * past any deploy, restart or dependency outage an operator would leave
+         * unattended.
+         *
+         * It does not need to cover a dispatcher outage, however long: rows are
+         * only ever abandoned in the failure path, and a dispatcher that was
+         * merely down delivers its whole backlog on the first attempt.
+         *
+         * Comfortably inside the outbox retention window (7 days) either way, so
+         * an abandoned row is still there to be looked at afterwards.
+         */
+        const val DEFAULT_MAX_EVENT_AGE_MINUTES = 360L
 
         /** Claim rounds one poll may run before yielding to the interval. */
         private const val MAX_ROUNDS_PER_POLL = 10

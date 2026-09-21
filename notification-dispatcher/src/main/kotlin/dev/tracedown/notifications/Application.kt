@@ -88,7 +88,8 @@ fun Application.module() {
     // Outbox consumer. Claims the rows it reads, so more than one instance is
     // safe — which is what a start-first rolling deploy needs.
     val consumer = OutboxConsumer(
-        processor, pubSubConnection, config.pollIntervalMs, config.batchSize, config.claimLeaseSeconds,
+        processor, pubSubConnection, config.pollIntervalMs, config.batchSize,
+        config.claimLeaseSeconds, config.maxEventAgeMinutes,
     )
     consumer.start(consumerScope)
 

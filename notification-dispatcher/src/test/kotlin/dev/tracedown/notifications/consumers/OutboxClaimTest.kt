@@ -2,7 +2,10 @@ package dev.tracedown.notifications.consumers
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.Outbox
+import dev.tracedown.common.models.SystemAlerts
+import dev.tracedown.common.models.Users
 import io.lettuce.core.pubsub.RedisPubSubListener
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection
 import io.lettuce.core.pubsub.api.sync.RedisPubSubCommands
@@ -101,7 +104,10 @@ class OutboxClaimTest {
 
     @BeforeEach
     fun clean() {
-        transaction { Outbox.deleteAll() }
+        transaction {
+            Outbox.deleteAll()
+            SystemAlerts.deleteAll()
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
@@ -115,6 +121,7 @@ class OutboxClaimTest {
         serviceId: UUID,
         startedAt: Instant,
         eventType: String = EVENT,
+        orgId: UUID = UUID.randomUUID(),
     ): UUID {
         val resultId = UUID.randomUUID()
         transaction {
@@ -126,12 +133,44 @@ class OutboxClaimTest {
                 it[payload] = buildJsonObject {
                     put("resultId", resultId.toString())
                     put("serviceId", serviceId.toString())
+                    put("organizationId", orgId.toString())
                 }
                 it[published] = false
                 it[createdAt] = startedAt
             }
         }
         return resultId
+    }
+
+    /** A real organization, so the dropped-notification alert has somewhere to land. */
+    private fun insertOrg(): UUID {
+        val userId = UUID.randomUUID()
+        val orgId = UUID.randomUUID()
+        transaction {
+            Users.insert {
+                it[id] = userId
+                it[email] = "owner-$userId@example.test"
+                it[passwordHash] = "x"
+                it[displayName] = "owner"
+                it[createdAt] = Instant.now()
+            }
+            Organizations.insert {
+                it[id] = orgId
+                it[name] = "org-$orgId"
+                it[ownerId] = userId
+                it[createdAt] = Instant.now()
+            }
+        }
+        return orgId
+    }
+
+    private fun droppedAlerts(orgId: UUID): List<JsonObject?> = transaction {
+        SystemAlerts.selectAll()
+            .where {
+                (SystemAlerts.organizationId eq orgId) and
+                    (SystemAlerts.alertType eq "notification_dropped")
+            }
+            .map { it[SystemAlerts.data] }
     }
 
     private fun publishedCount(): Long = transaction {
@@ -164,6 +203,7 @@ class OutboxClaimTest {
         batchSize: Int = 5,
         leaseSeconds: Long = 120L,
         pollIntervalMs: Long = 50L,
+        maxAgeMinutes: Long = OutboxConsumer.DEFAULT_MAX_EVENT_AGE_MINUTES,
         pubSub: StatefulRedisPubSubConnection<String, String> = noopPubSub(),
     ) = OutboxConsumer(
         processor = processor,
@@ -171,6 +211,7 @@ class OutboxClaimTest {
         pollIntervalMs = pollIntervalMs,
         batchSize = batchSize,
         claimLeaseSeconds = leaseSeconds,
+        maxEventAgeMinutes = maxAgeMinutes,
         instanceId = instanceId,
     )
 
@@ -444,6 +485,195 @@ class OutboxClaimTest {
 
         assertEquals(listOf(healthy), seen)
         assertEquals(2L, unpublishedCount(), "the poison row and the one queued behind it both wait")
+    }
+
+    // ── Giving up on an event that cannot be delivered ──────────────────────
+
+    /**
+     * The regression the ordering rule would otherwise introduce.
+     *
+     * Combine "a failing row keeps its claim" with "nothing is claimed while an
+     * older row of the same service is unpublished" and one undeliverable event
+     * silences its service forever. The age bound is what stops that: the head
+     * is published undelivered and the queue behind it drains.
+     */
+    @Test
+    fun `a poison head past the age is given up on and the service moves on`() = runBlocking {
+        val org = insertOrg()
+        val svc = UUID.randomUUID()
+        val base = Instant.now().minus(3, ChronoUnit.HOURS)
+        val poison = insertEvent(svc, base, orgId = org)
+        val next = insertEvent(svc, base.plusSeconds(60), orgId = org)
+        val last = insertEvent(svc, base.plusSeconds(120), orgId = org)
+
+        val delivered = mutableListOf<UUID>()
+        val c = consumer(
+            { payload ->
+                val id = resultIdOf(payload)
+                if (id == poison) throw RuntimeException("undeliverable")
+                delivered += id
+            },
+            "instance-a",
+            batchSize = 10,
+            maxAgeMinutes = 60,
+        )
+
+        withTimeoutOrNull(20_000) {
+            var more = true
+            while (more) more = c.claimAndProcessOnce()
+        }
+
+        assertEquals(listOf(next, last), delivered, "the rows behind the poison head must be delivered, in order")
+        assertEquals(0L, unpublishedCount(), "the poison head is published undelivered so it stops blocking")
+
+        val alerts = droppedAlerts(org)
+        assertEquals(1, alerts.size, "the organization must be told it lost a notification")
+        val data = alerts.single()!!
+        assertEquals(svc.toString(), data["serviceId"]!!.jsonPrimitive.content)
+        assertEquals("RuntimeException", data["lastError"]!!.jsonPrimitive.content)
+    }
+
+    /** A whole chain of undeliverable heads drains rather than compounding. */
+    @Test
+    fun `a chain of undeliverable events drains one after another`() = runBlocking {
+        val org = insertOrg()
+        val svc = UUID.randomUUID()
+        val base = Instant.now().minus(3, ChronoUnit.HOURS)
+        val poison = (0 until 3).map { insertEvent(svc, base.plusSeconds(it * 60L), orgId = org) }
+        val healthy = insertEvent(svc, base.plusSeconds(300), orgId = org)
+
+        val delivered = mutableListOf<UUID>()
+        val attempts = ConcurrentHashMap<UUID, AtomicInteger>()
+        val c = consumer(
+            { payload ->
+                val id = resultIdOf(payload)
+                attempts.computeIfAbsent(id) { AtomicInteger() }.incrementAndGet()
+                if (id in poison) throw IllegalStateException("undeliverable")
+                delivered += id
+            },
+            "instance-a",
+            batchSize = 10,
+            maxAgeMinutes = 60,
+        )
+
+        withTimeoutOrNull(20_000) {
+            var more = true
+            while (more) more = c.claimAndProcessOnce()
+        }
+
+        assertEquals(listOf(healthy), delivered)
+        assertEquals(0L, unpublishedCount(), "every link of the chain is settled")
+        poison.forEach { assertEquals(1, attempts[it]?.get(), "each was attempted once, then abandoned") }
+    }
+
+    /**
+     * The dispatcher-outage case: down for hours, back up, backlog intact.
+     *
+     * Nothing deliverable is ever dropped for being old — the age is only ever
+     * consulted after a delivery has already failed — so a service that is
+     * still down does not go unreported just because the dispatcher was away.
+     */
+    @Test
+    fun `an old but deliverable backlog is delivered in full`() = runBlocking {
+        val org = insertOrg()
+        val base = Instant.now().minus(3, ChronoUnit.HOURS)
+        val services = List(3) { UUID.randomUUID() }
+        val expected = mutableListOf<UUID>()
+        services.forEach { svc ->
+            repeat(4) { i -> expected += insertEvent(svc, base.plusSeconds(i * 60L), orgId = org) }
+        }
+
+        val delivered = java.util.Collections.synchronizedList(mutableListOf<UUID>())
+        val c = consumer(
+            { payload -> delivered += resultIdOf(payload) },
+            "instance-a",
+            batchSize = 10,
+            maxAgeMinutes = 60,
+        )
+
+        withTimeoutOrNull(30_000) {
+            var more = true
+            while (more) more = c.claimAndProcessOnce()
+        }
+
+        assertEquals(expected.size, delivered.size, "a stale backlog is delivered, not discarded")
+        assertEquals(expected.toSet(), delivered.toSet())
+        assertEquals(0L, unpublishedCount())
+        assertTrue(droppedAlerts(org).isEmpty(), "nothing was dropped, so nothing should be reported")
+    }
+
+    /**
+     * A healthy row sitting behind an abandoned head is delivered on its own
+     * merits, not abandoned for being the same age.
+     */
+    @Test
+    fun `an old healthy row behind an abandoned head is delivered, not dropped`() = runBlocking {
+        val org = insertOrg()
+        val svc = UUID.randomUUID()
+        val base = Instant.now().minus(5, ChronoUnit.HOURS)
+        val poison = insertEvent(svc, base, orgId = org)
+        val healthy = insertEvent(svc, base.plusSeconds(30), orgId = org)
+
+        val delivered = mutableListOf<UUID>()
+        val c = consumer(
+            { payload ->
+                val id = resultIdOf(payload)
+                if (id == poison) throw RuntimeException("undeliverable")
+                delivered += id
+            },
+            "instance-a",
+            batchSize = 10,
+            maxAgeMinutes = 60,
+        )
+
+        withTimeoutOrNull(20_000) {
+            var more = true
+            while (more) more = c.claimAndProcessOnce()
+        }
+
+        assertEquals(listOf(healthy), delivered, "the successor is just as old and is still delivered")
+        assertEquals(1, droppedAlerts(org).size, "only the undeliverable one is reported")
+    }
+
+    /** Inside the bound, a failure is still a retry — nothing is given up on. */
+    @Test
+    fun `a failing row inside the age bound is retried, not abandoned`() = runBlocking {
+        val org = insertOrg()
+        val svc = UUID.randomUUID()
+        insertEvent(svc, Instant.now().minus(5, ChronoUnit.MINUTES), orgId = org)
+
+        val attempts = AtomicInteger()
+        val c = consumer(
+            { attempts.incrementAndGet(); throw RuntimeException("transient") },
+            "instance-a",
+            maxAgeMinutes = 60,
+        )
+
+        assertTrue(c.claimAndProcessOnce())
+        assertEquals(1L, unpublishedCount(), "a recent failure stays for the next lease")
+        assertTrue(droppedAlerts(org).isEmpty())
+
+        expireAllClaims(200)
+        assertTrue(c.claimAndProcessOnce())
+        assertEquals(2, attempts.get())
+        assertEquals(1L, unpublishedCount())
+    }
+
+    /** Zero or less restores unbounded blocking — the deliberate escape hatch. */
+    @Test
+    fun `a non-positive age bound never gives up`() = runBlocking {
+        val org = insertOrg()
+        val svc = UUID.randomUUID()
+        insertEvent(svc, Instant.now().minus(30, ChronoUnit.DAYS), orgId = org)
+
+        val c = consumer({ throw RuntimeException("undeliverable") }, "instance-a", maxAgeMinutes = 0)
+
+        assertTrue(c.claimAndProcessOnce())
+        expireAllClaims(200)
+        assertTrue(c.claimAndProcessOnce())
+
+        assertEquals(1L, unpublishedCount(), "with the bound disabled the row is retried forever")
+        assertTrue(droppedAlerts(org).isEmpty())
     }
 
     // ── Single instance ─────────────────────────────────────────────────────

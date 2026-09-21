@@ -90,6 +90,21 @@ object SystemAlertService {
     const val OUTBOX_CONSUMER_STALLED = "outbox_consumer_stalled"
 
     /**
+     * A notification for one probe result could not be delivered and has been
+     * abandoned rather than retried any further. The run happened and its
+     * result is recorded; the notification it should have produced was not
+     * sent and will not be.
+     *
+     * Raised at `error` for the same reason as [RESULT_INGEST_FAILED]: it
+     * reports a gap the platform itself created, and nothing else in the
+     * product will ever show it. Without it the organization sees a service it
+     * simply hears nothing about, which is indistinguishable from a service
+     * that is fine. Subject is the service, so one episode covers a service
+     * rather than one per abandoned event.
+     */
+    const val NOTIFICATION_DROPPED = "notification_dropped"
+
+    /**
      * The health challenge could not be completed because the token endpoint
      * (or the store behind it) was unreachable from the scheduler itself. The
      * round says nothing about the agent, so the subject names the endpoint,
