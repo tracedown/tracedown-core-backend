@@ -26,6 +26,19 @@ private fun JdbcTransaction.execCount(sql: String): Long =
  * notification-log sources) are cleared automatically by ON DELETE SET NULL
  * actions declared in the schema.
  *
+ * A container's cascade reaches its descendants by parentage, not by their own
+ * deletion state, so a child that was never soft-deleted at all — a legacy row
+ * under a container deleted before the cascade existed — is erased with its
+ * parent rather than blocking it. The converse is equally fine: a child the
+ * user deleted earlier carries an earlier purge_after and simply goes first, in
+ * its own group.
+ *
+ * The one thing the job does not do is infer a purge date. `purge_after` is
+ * read, never computed: a soft-deleted row without one is not purged, because
+ * the column is the whole and only answer to "when does this go". Rows that
+ * predate every delete path stamping it are repaired once, at startup, by
+ * [PurgeScheduleRepair].
+ *
  * Stored response bodies referenced by probe_steps rows are deleted from body
  * storage *before* the rows are purged, mirroring [RetentionJob]. A failing
  * storage backend never blocks the database purge; the URI it could not delete
@@ -87,7 +100,7 @@ class PurgeJob(
         // ── Leaf tables with their own purge_after (no dependents) ──
         for (table in listOf(
             "service_variables", "project_variables", "workspace_variables", "org_variables",
-            "org_domains", "api_keys", "org_rule_presets", "grafana_integrations",
+            "webhook_variables", "org_domains", "api_keys", "org_rule_presets", "grafana_integrations",
         )) {
             add(PurgeUnit(table) { execCount(PURGE_OWN.format(table)) })
         }
@@ -108,6 +121,13 @@ class PurgeJob(
             ) + execCount(PURGE_OWN.format("notification_templates"))
         })
 
+        // Memberships removed on their own: a member an admin removed, an invite
+        // that was revoked, the memberships an account closure gave up. Nothing
+        // purged these before — only the whole organization did — so a removed
+        // member's row, and the email address it can be joined back to, stayed
+        // for as long as the organization did.
+        add(PurgeUnit("org_users") { CASCADE_ORG_USERS.sumOf { execCount(it) } })
+
         // ── Container entities, each cascading its dependents ──
         add(PurgeUnit("services") {
             deleteStoredBodies(RESULTS_OF_PURGING_SERVICES)
@@ -123,6 +143,12 @@ class PurgeJob(
         })
         add(PurgeUnit("organizations") {
             deleteStoredBodies(RESULTS_OF_PURGING_ORGS)
+            // An organization's body stores are removed by the FK's own
+            // ON DELETE CASCADE, and that cascade is blocked by anything still
+            // pointing at a store. Agents and bootstrap tokens are platform
+            // rows that outlive the organization, so their pointer is released
+            // here — the count is not a deletion and is not tallied.
+            RELEASE_ORG_BODY_STORES.forEach { execCount(it) }
             CASCADE_ORGANIZATIONS.sumOf { execCount(it) }
         })
 
@@ -269,20 +295,69 @@ class PurgeJob(
         private const val PROJECTS_OF_PURGING_WORKSPACES =
             "SELECT id FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)"
 
+        /**
+         * Workspace-level dependents other than the projects, leaf-first, for
+         * the given workspace scope.
+         *
+         * A workspace-scoped rule preset holds a plain FK to `workspaces` and
+         * carries its own purge_after only when deleted on its own, so a live
+         * preset blocks the workspace row.
+         */
+        private fun workspaceLevelCascade(workspaces: String) = listOf(
+            "DELETE FROM notification_silences WHERE workspace_id IN ($workspaces)",
+            "DELETE FROM workspace_variables WHERE workspace_id IN ($workspaces)",
+            "DELETE FROM org_rule_presets WHERE workspace_id IN ($workspaces)",
+        )
+
         // ── Workspace cascade ──
-        // A workspace-scoped rule preset holds a plain FK to `workspaces` and
-        // carries its own purge_after only when deleted on its own, so a live
-        // preset would block the workspace row. Only the organization cascade
-        // reached these before.
         private val CASCADE_WORKSPACES =
             serviceLevelCascade(SERVICES_OF_PURGING_WORKSPACES, RESULTS_OF_PURGING_WORKSPACES) +
                 projectLevelCascade(PROJECTS_OF_PURGING_WORKSPACES) + listOf(
                     "DELETE FROM projects WHERE workspace_id IN ($PURGING_WORKSPACES)",
-                    "DELETE FROM notification_silences WHERE workspace_id IN ($PURGING_WORKSPACES)",
-                    "DELETE FROM workspace_variables WHERE workspace_id IN ($PURGING_WORKSPACES)",
-                    "DELETE FROM org_rule_presets WHERE workspace_id IN ($PURGING_WORKSPACES)",
+                ) + workspaceLevelCascade(PURGING_WORKSPACES) + listOf(
                     "DELETE FROM workspaces WHERE id IN ($PURGING_WORKSPACES)",
                 )
+
+        // ── Membership cascade ──
+        // A membership removed on its own — not as part of its organization
+        // purging — takes exactly what hangs off that membership: the silences
+        // it owns, its group assignments, and the resource grants keyed to it.
+        // `resource_permissions` is polymorphic, so no foreign key reaches it;
+        // 'org_user' is the one person-shaped principal and `principal_id` is
+        // the membership id, which is why it has to be deleted here by hand
+        // rather than left to the schema.
+        private const val PURGING_ORG_USERS = "SELECT id FROM org_users WHERE $PURGE_DUE"
+
+        private val CASCADE_ORG_USERS = listOf(
+            "DELETE FROM notification_silences WHERE org_user_id IN ($PURGING_ORG_USERS)",
+            "DELETE FROM org_user_groups WHERE org_user_id IN ($PURGING_ORG_USERS)",
+            "DELETE FROM resource_permissions WHERE principal_type = 'org_user' " +
+                "AND principal_id IN ($PURGING_ORG_USERS)",
+            "DELETE FROM org_users WHERE id IN ($PURGING_ORG_USERS)",
+        )
+
+        private const val WORKSPACES_OF_PURGING_ORGS =
+            "SELECT id FROM workspaces WHERE organization_id IN ($PURGING_ORGS)"
+
+        private const val PROJECTS_OF_PURGING_ORGS =
+            "SELECT p.id FROM projects p JOIN workspaces w ON p.workspace_id = w.id " +
+                "WHERE w.organization_id IN ($PURGING_ORGS)"
+
+        // ── Organization body stores ──
+        // The `body_stores.organization_id` FK cascades, so the stores go when
+        // the organization row does — but only if nothing still references
+        // them. Probe agents and bootstrap tokens are platform-level rows that
+        // survive the organization, so their pointer back at its store is
+        // released rather than deleted. The organization's own probe_steps are
+        // already gone by then (the service cascade runs first), which is why
+        // `body_stores` itself is deleted at the end of that cascade.
+        private const val ORG_BODY_STORES =
+            "SELECT id FROM body_stores WHERE organization_id IN ($PURGING_ORGS)"
+
+        private val RELEASE_ORG_BODY_STORES = listOf(
+            "UPDATE probe_agents SET body_store_id = NULL WHERE body_store_id IN ($ORG_BODY_STORES)",
+            "UPDATE agent_bootstrap_tokens SET body_store_id = NULL WHERE body_store_id IN ($ORG_BODY_STORES)",
+        )
 
         // ── Organization cascade ──
         // sessions.organization_id and users.selected_org_id are cleared by
@@ -299,19 +374,26 @@ class PurgeJob(
             """DELETE FROM notification_silences WHERE org_user_id IN (
                 SELECT id FROM org_users WHERE organization_id IN ($PURGING_ORGS)
             )""",
-        ) + serviceLevelCascade(SERVICES_OF_PURGING_ORGS, RESULTS_OF_PURGING_ORGS) + listOf(
-            """DELETE FROM project_variables WHERE project_id IN (
-                SELECT p.id FROM projects p JOIN workspaces w ON p.workspace_id = w.id
-                WHERE w.organization_id IN ($PURGING_ORGS)
-            )""",
+        ) + serviceLevelCascade(SERVICES_OF_PURGING_ORGS, RESULTS_OF_PURGING_ORGS) +
+            // The same project-level step the project and workspace cascades
+            // run, rather than a third hand-written copy of it: spelling it out
+            // here is how `project_notification_templates` came to be missing
+            // from this cascade while the other two had it, and the projects
+            // delete below then failed on its foreign key.
+            projectLevelCascade(PROJECTS_OF_PURGING_ORGS) + listOf(
+            // An integration whose project row is already gone.
             "DELETE FROM grafana_integrations WHERE organization_id IN ($PURGING_ORGS)",
-            """DELETE FROM projects WHERE workspace_id IN (
-                SELECT id FROM workspaces WHERE organization_id IN ($PURGING_ORGS)
-            )""",
-            "DELETE FROM workspace_variables WHERE workspace_id IN (SELECT id FROM workspaces WHERE organization_id IN ($PURGING_ORGS))",
+            "DELETE FROM projects WHERE workspace_id IN ($WORKSPACES_OF_PURGING_ORGS)",
+            // …and the same workspace-level step, for the same reason: a
+            // workspace-scoped rule preset blocks the workspaces delete below.
+        ) + workspaceLevelCascade(WORKSPACES_OF_PURGING_ORGS) + listOf(
             "DELETE FROM workspaces WHERE organization_id IN ($PURGING_ORGS)",
-            // Resource bindings before the delivery configs they point at.
+            // Resource bindings and webhook variables before the delivery
+            // configs they point at. The variables' own FK cascades, but an
+            // organization-scoped row is deleted by name here too so the
+            // organization cascade says what it removes.
             "DELETE FROM resource_webhook_access WHERE org_id IN ($PURGING_ORGS)",
+            "DELETE FROM webhook_variables WHERE organization_id IN ($PURGING_ORGS)",
             "DELETE FROM webhook_deliveries WHERE organization_id IN ($PURGING_ORGS)",
             "DELETE FROM org_variables WHERE organization_id IN ($PURGING_ORGS)",
             "DELETE FROM org_domains WHERE organization_id IN ($PURGING_ORGS)",
@@ -334,6 +416,8 @@ class PurgeJob(
             "DELETE FROM notification_templates WHERE organization_id IN ($PURGING_ORGS)",
             // Org-scoped audit history dies with the org.
             "DELETE FROM org_audit_log WHERE organization_id IN ($PURGING_ORGS)",
+            // After the probe_steps that recorded a body in one of them.
+            "DELETE FROM body_stores WHERE organization_id IN ($PURGING_ORGS)",
             "DELETE FROM organizations WHERE id IN ($PURGING_ORGS)",
         )
 

@@ -324,7 +324,6 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
             password = body.password,
             code = body.code,
             deleteOwnedOrgs = body.deleteOwnedOrgs,
-            purgeRetentionDays = appConfig.systemLimits.purgeRetentionDays,
         )
         call.respond(mapOf("ok" to true))
     }

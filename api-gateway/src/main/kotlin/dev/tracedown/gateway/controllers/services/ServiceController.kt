@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.controllers.services
 
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
@@ -525,9 +526,11 @@ object ServiceController {
                 .where { Services.id eq serviceId }
                 .firstOrNull()?.get(Services.name)
 
+            val now = Instant.now()
             Services.update({ Services.id eq serviceId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             AuditService.log(orgId, userId, "delete.service", "service", serviceId.toString(), entityDisplayName = deletedName)
@@ -1188,6 +1191,7 @@ object ServiceController {
                     }) {
                         it[deleted] = true
                         it[deletedAt] = now
+                        it[purgeAfter] = DeletionRetention.purgeAfter(now)
                     }
                 }
             }
@@ -1220,9 +1224,11 @@ object ServiceController {
                 throw BadRequestException(ErrorCodes.SYSTEM_VARIABLE)
             }
 
+            val now = Instant.now()
             ServiceVariables.update({ ServiceVariables.id eq varId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
             OutboxEmit.emitResourceEvent(
                 "resource.variable.deleted", "variable", varId,

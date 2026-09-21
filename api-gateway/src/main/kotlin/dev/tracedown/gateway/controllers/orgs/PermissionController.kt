@@ -2,6 +2,7 @@ package dev.tracedown.gateway.controllers.orgs
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.buildJsonObject
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.realtime.RealtimePublisher
 
 import dev.tracedown.common.audit.AuditService
@@ -172,7 +173,7 @@ object PermissionController {
             OrgUsers.update({ OrgUsers.id eq row[OrgUsers.id] }) {
                 it[deleted] = true
                 it[deletedAt] = now
-                it[purgeAfter] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
                 it[isActive] = false
             }
 

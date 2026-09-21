@@ -354,6 +354,10 @@ fun Route.agentAdminRoutes() {
             // Free the slug (unique index) for future re-bootstraps; keep it
             // recognizable in audit/history joins. varchar(64): trim the base
             // so the suffix always fits.
+            // No purge date, because there is no three-tier deletion here:
+            // `probe_agents` carries a bare `deleted` flag and nothing else. A
+            // decommissioned agent is kept on purpose — probe_results point at
+            // it, and history has to keep naming the agent that ran the probe.
             val freedSlug = "${resource.slug.take(45)}-deleted-${Instant.now().epochSecond}"
             ProbeAgents.update({ ProbeAgents.id eq agentId }) {
                 it[isActive] = false

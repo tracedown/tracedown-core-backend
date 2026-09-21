@@ -53,6 +53,14 @@ data class WorkerConfig(
     val auditLogRetentionDays: Int,
     /** How long to keep notification delivery history in days. Zero or negative keeps forever. */
     val notificationLogRetentionDays: Int,
+    /**
+     * Days after a soft-delete before the purge job may erase the row — the
+     * gateway's `systemLimits.purgeRetentionDays`, read here from the same
+     * variable. Zero (the install default) makes a deleted row purgeable at
+     * once; negative is meaningless for a row already marked deleted and is
+     * ignored by [dev.tracedown.common.config.DeletionRetention].
+     */
+    val purgeRetentionDays: Int,
     /** Mirrors the gateway flag; disables domain re-verification when true. */
     val trustedDomainMode: Boolean,
     /**
@@ -127,6 +135,9 @@ data class WorkerConfig(
                     ?.getString()?.toInt() ?: 90,
                 notificationLogRetentionDays = config.propertyOrNull("worker.notificationLogRetentionDays")
                     ?.getString()?.toInt() ?: 90,
+                purgeRetentionDays = config.propertyOrNull("worker.purgeRetentionDays")
+                    ?.getString()?.toIntOrNull()
+                    ?: dev.tracedown.common.config.DeletionRetention.DEFAULT_RETENTION_DAYS,
                 trustedDomainMode = config.propertyOrNull("worker.trustedDomainMode")
                     ?.getString()?.toBoolean() ?: true,
                 outboxCursorStaleHorizon = config.propertyOrNull("worker.outboxCursorStaleHours")

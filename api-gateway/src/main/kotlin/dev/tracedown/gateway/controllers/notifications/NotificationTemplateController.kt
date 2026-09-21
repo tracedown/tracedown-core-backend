@@ -2,6 +2,7 @@ package dev.tracedown.gateway.controllers.notifications
 
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.models.NotificationTemplates
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ProjectNotificationTemplates
@@ -183,9 +184,11 @@ object NotificationTemplateController {
                 .where { NotificationTemplates.id eq templateId }
                 .firstOrNull()?.get(NotificationTemplates.name)
 
+            val now = Instant.now()
             NotificationTemplates.update({ NotificationTemplates.id eq templateId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             AuditService.log(orgId, userId, "delete.notification-template", "notification-template", templateId.toString(), entityDisplayName = templateName)

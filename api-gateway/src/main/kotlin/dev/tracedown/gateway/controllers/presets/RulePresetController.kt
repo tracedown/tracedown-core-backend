@@ -4,6 +4,7 @@ import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWriteResource
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.OrgRulePresets
 import dev.tracedown.common.models.Workspaces
@@ -152,7 +153,7 @@ object RulePresetController {
             OrgRulePresets.update({ OrgRulePresets.id eq presetId }) {
                 it[deleted] = true
                 it[deletedAt] = now
-                it[purgeAfter] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
             AuditService.log(orgId, requestingUserId, "delete.rule_preset", "rule-preset", presetId.toString(),
                 entityDisplayName = row[OrgRulePresets.displayName])

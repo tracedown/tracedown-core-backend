@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.controllers.webhooks
 
 import dev.tracedown.common.auth.canWrite
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.common.models.OutboxEmit
@@ -195,6 +196,7 @@ object WebhookVariableController {
         transaction {
             requireOrgWrite(orgId, userId) { it.webhooks }
 
+            val now = Instant.now()
             val updated = WebhookVariables.update({
                 (WebhookVariables.id eq varId) and
                     (WebhookVariables.webhookId eq webhookId) and
@@ -202,7 +204,8 @@ object WebhookVariableController {
                     (WebhookVariables.deleted eq false)
             }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
             if (updated == 0) throw NotFoundException()
             OutboxEmit.emitResourceEvent(

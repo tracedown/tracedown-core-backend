@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.routes.v1.orgs
 
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.Users
@@ -131,9 +132,9 @@ fun Route.orgSettingsRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher
             val owner = Users.selectAll().where { Users.id eq principal.userId }.firstOrNull()
             orgName to owner
         }
-        OrgSettingsController.deleteOrg(orgId, principal.userId, appConfig.systemLimits.purgeRetentionDays)
+        OrgSettingsController.deleteOrg(orgId, principal.userId)
         if (orgName != null && owner != null) {
-            sendOrgDeletedEmail(emailPublisher, owner, orgName, appConfig.systemLimits.purgeRetentionDays)
+            sendOrgDeletedEmail(emailPublisher, owner, orgName)
         }
         call.respond(mapOf("ok" to true))
     }
@@ -148,7 +149,6 @@ private fun sendOrgDeletedEmail(
     emailPublisher: EmailPublisher,
     owner: ResultRow,
     orgName: String,
-    purgeRetentionDays: Int,
 ) {
     val now = Instant.now()
     val date = DateTimeFormatter.ISO_LOCAL_DATE.withZone(ZoneOffset.UTC)
@@ -160,7 +160,9 @@ private fun sendOrgDeletedEmail(
             "userName" to owner[Users.displayName],
             "orgName" to orgName,
             "deletedDate" to date.format(now),
-            "purgeDate" to date.format(now.plusSeconds(purgeRetentionDays * 86400L)),
+            // The same stamp the delete just wrote, from the same helper — the
+            // date the owner is told is the date the purge job will act on.
+            "purgeDate" to date.format(DeletionRetention.purgeAfter(now)),
         ),
         source = "api-gateway",
     )

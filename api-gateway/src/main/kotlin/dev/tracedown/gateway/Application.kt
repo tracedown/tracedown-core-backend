@@ -159,6 +159,12 @@ fun Application.module() {
     // How many variables one resource may hold — an operator-set guard against
     // runaway creation, identical for every organization.
     VariableLimits.init(appConfig.systemLimits.maxVarsPerResource)
+    // How long a soft-deleted row is kept before the purge job may erase it.
+    // Every delete path stamps `purge_after` from this one number, so "delete"
+    // means the same thing whichever endpoint was called. The aggregate-worker
+    // reads the same variable — it both deletes rows of its own and runs the
+    // purge.
+    dev.tracedown.common.config.DeletionRetention.init(appConfig.systemLimits.purgeRetentionDays)
 
     ServiceController.init(trustedDomainMode = appConfig.platform.trustedDomainMode)
     // Same resolution the scheduler makes, from the same variable, so a script

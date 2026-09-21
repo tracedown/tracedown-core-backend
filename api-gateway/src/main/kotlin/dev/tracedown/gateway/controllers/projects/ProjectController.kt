@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.controllers.projects
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.buildJsonObject
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.realtime.RealtimePublisher
 
 import dev.tracedown.common.audit.AuditService
@@ -217,7 +218,7 @@ object ProjectController {
             Projects.update({ Projects.id eq projectId }) {
                 it[deleted] = true
                 it[deletedAt] = now
-                it[purgeAfter] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             AuditService.log(orgId, userId, "delete.project", "project", projectId.toString(), entityDisplayName = deletedName)
@@ -401,9 +402,11 @@ object ProjectController {
                 throw BadRequestException(ErrorCodes.SYSTEM_VARIABLE)
             }
 
+            val now = Instant.now()
             ProjectVariables.update({ ProjectVariables.id eq varId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
             OutboxEmit.emitResourceEvent(
                 "resource.variable.deleted", "variable", varId,
