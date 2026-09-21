@@ -16,6 +16,7 @@ import dev.tracedown.gateway.util.parseUuid
 import dev.tracedown.gateway.util.requireCachedPermissions
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.resources.get
@@ -25,6 +26,7 @@ import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import java.util.UUID
 
 /**
  * @OpenAPITag Dashboard Metrics
@@ -40,6 +42,32 @@ class ServiceMetrics(val serviceId: String) {
 
     @Resource("statistics")
     class Statistics(val parent: ServiceMetrics, val window: String = "24h")
+
+    /**
+     * The statistics window per endpoint over time. A resource of its own, not
+     * a field on [Statistics]: twenty endpoints over a week of hourly buckets
+     * dwarf the rest of that response, which the dashboard polls.
+     */
+    @Resource("statistics/endpoint-series")
+    class EndpointSeries(val parent: ServiceMetrics, val window: String = "24h")
+
+    /**
+     * The window's most-failing assertions. The only read in the family that
+     * touches raw `probe_steps` rather than a rollup, so it is asked for when
+     * the panel is looked at rather than on every statistics poll.
+     */
+    @Resource("statistics/assertions")
+    class Assertions(val parent: ServiceMetrics, val window: String = "24h")
+
+    /**
+     * Failed runs by hour of day and weekday. Has a lookback of its own —
+     * weeks, not the selected window — so it does not take a `window` at all.
+     */
+    @Resource("statistics/failure-heatmap")
+    class FailureHeatmap(
+        val parent: ServiceMetrics,
+        val days: Int = DashboardMetricsController.DEFAULT_HEATMAP_DAYS,
+    )
 }
 
 private val STATISTICS_WINDOWS = setOf("24h", "7d", "30d", "90d")
@@ -111,17 +139,35 @@ fun Route.dashboardMetricsRoutes() {
 
     /** Deep statistics (uptime/error-rate/latency trend + per-region) from probe_aggregates. */
     get<ServiceMetrics.Statistics> { resource ->
-        val (principal, orgId) = requireAuthWithOrg(call)
-        val serviceId = parseUuid(resource.parent.serviceId, "service ID")
-        transaction {
-            val ctx = ResourceResolver.resolveService(serviceId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))) {
-                throw NotFoundException()
-            }
-        }
+        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
         if (resource.window !in STATISTICS_WINDOWS) throw BadRequestException(ErrorCodes.FIELD_INVALID)
         call.respond(DashboardMetricsController.getServiceStatistics(serviceId, resource.window))
+    }
+
+    /** The same window per endpoint over time, on the same buckets, from probe_step_aggregates. */
+    get<ServiceMetrics.EndpointSeries> { resource ->
+        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
+        if (resource.window !in STATISTICS_WINDOWS) throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        call.respond(DashboardMetricsController.getEndpointSeries(serviceId, resource.window))
+    }
+
+    /** The window's most-failing assertions, computed from raw probe_steps. */
+    get<ServiceMetrics.Assertions> { resource ->
+        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
+        if (resource.window !in STATISTICS_WINDOWS) throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        call.respond(DashboardMetricsController.getAssertionFailures(serviceId, resource.window))
+    }
+
+    /** Failed runs by UTC hour of day and ISO weekday, from the hourly rollups. */
+    get<ServiceMetrics.FailureHeatmap> { resource ->
+        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
+        // Refused rather than quietly clamped: a heatmap of "the last 0 days"
+        // and one of "the last 4000" are both a caller mistake, and answering
+        // the second would scan whatever retention happens to hold.
+        if (resource.days < 1 || resource.days > DashboardMetricsController.MAX_HEATMAP_DAYS) {
+            throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        }
+        call.respond(DashboardMetricsController.getFailureHeatmap(serviceId, resource.days))
     }
 
     /** Aggregated metrics for accessible services in a project. Filters by service-level permissions. */
@@ -214,6 +260,25 @@ fun Route.dashboardMetricsRoutes() {
         }
         call.respond(DashboardMetricsController.getAggregatedHistory(serviceIds, hours))
     }
+}
+
+/**
+ * The access check the four statistics reads share: the service has to exist in
+ * the caller's organization and be reachable through their permissions, or the
+ * answer is the one an unknown id gets — a route must not confirm the existence
+ * of a service the caller cannot see.
+ */
+private fun requireStatisticsAccess(call: ApplicationCall, rawServiceId: String): UUID {
+    val (principal, orgId) = requireAuthWithOrg(call)
+    val serviceId = parseUuid(rawServiceId, "service ID")
+    transaction {
+        val ctx = ResourceResolver.resolveService(serviceId, orgId)
+        val cached = requireCachedPermissions(orgId, principal.userId)
+        if (!canAccessResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))) {
+            throw NotFoundException()
+        }
+    }
+    return serviceId
 }
 
 /** Zeroed aggregate for resources whose services have no metrics yet — counts still apply. */

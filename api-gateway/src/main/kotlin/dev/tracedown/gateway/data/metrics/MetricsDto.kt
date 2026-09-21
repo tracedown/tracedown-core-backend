@@ -139,3 +139,153 @@ data class ServiceStatisticsDto(
     /** True when endpoints past the cap were dropped from [endpoints]. */
     val endpointsTruncated: Boolean = false,
 )
+
+/**
+ * One endpoint's numbers for one bucket of the statistics window.
+ *
+ * Averages are taken from the stored sums and their own denominators, never
+ * from other averages: [phases] is null exactly when the bucket timed no call
+ * (all six members share that one denominator), and [avgSizeBytes] is null when
+ * no call in it reported a size. Null means "nothing to divide by", not zero.
+ */
+@Serializable
+data class EndpointSeriesPoint(
+    /** ISO-8601 bucket start (UTC), the same spelling [StatBucket.bucketStart] uses. */
+    val bucketStart: String,
+    val calls: Long,
+    val phases: PhaseTimings?,
+    val avgSizeBytes: Long?,
+)
+
+/** One endpoint's time series over the statistics window. */
+@Serializable
+data class EndpointSeries(
+    val key: String,
+    val method: String,
+    val template: String,
+    /** Ascending by bucket start, and sparse: a bucket with no call has no point. */
+    val points: List<EndpointSeriesPoint>,
+)
+
+/**
+ * The statistics window broken down per endpoint **over time** — the same
+ * buckets the service-level trend uses, from `probe_step_aggregates`.
+ *
+ * Kept off the statistics response on purpose: twenty endpoints over a week of
+ * hourly buckets is two orders of magnitude more JSON than the rest of that
+ * read, which the dashboard polls.
+ */
+@Serializable
+data class EndpointSeriesDto(
+    val window: String,
+    /** "hourly" | "daily" — the same mapping the statistics read applies. */
+    val bucketType: String,
+    /**
+     * The ascending, de-duplicated union of every bucket start that appears
+     * anywhere in this response, [all] included: the chart's axis, without
+     * walking every series to rebuild it.
+     */
+    val buckets: List<String>,
+    /**
+     * The whole service, every endpoint of a bucket summed — *including* the
+     * ones past the cap, so the chart's "all endpoints" mode is the service and
+     * not its top twenty.
+     */
+    val all: List<EndpointSeriesPoint>,
+    /** The same endpoints, in the same order and under the same cap, as the statistics read. */
+    val endpoints: List<EndpointSeries>,
+    val endpointsTruncated: Boolean = false,
+)
+
+/**
+ * How often one assertion of one endpoint failed over the window.
+ *
+ * Identity is the **declared** side of the assertion only — what the script
+ * asked for, never what the target answered. `actual`/`actualLhs`/`actualRhs`
+ * would make every distinct failure its own row.
+ *
+ * A field that does not apply to the assertion's shape is null, never omitted:
+ * scope assertions (`.expect()`, `.check()`) carry [scope]/[op]/[expected],
+ * `.assert()` conditions carry [kind]/[expression]. The label is composed by the
+ * caller — the API returns parts, not display text.
+ */
+@Serializable
+data class AssertionFailureStat(
+    val endpointKey: String,
+    val method: String,
+    val template: String,
+    /** `assertions[].method` (spec §9), verbatim: "expect" | "check" | "assert". */
+    val assertionMethod: String?,
+    val scope: String?,
+    val op: String?,
+    /** The expected value as text, truncated; null for an `assert` condition. */
+    val expected: String?,
+    val kind: String?,
+    /** The condition rendered back to source form, truncated; null for a scope assertion. */
+    val expression: String?,
+    val failures: Long,
+    /** Every evaluation of this assertion in the window — "indeterminate" included. */
+    val evaluations: Long,
+    /** Percentage 0..100, two decimals. */
+    val failureRatePct: Double,
+    /** ISO-8601 start of the newest run that failed this assertion. */
+    val lastFailedAt: String,
+)
+
+/**
+ * The window's most-failing assertions, computed at read time from raw
+ * `probe_steps.assertion_results` — there is no assertion rollup, so this read
+ * sees exactly as far back as result retention still holds.
+ *
+ * [since] is what the numbers are really over: the window's own lower bound
+ * normally, and the oldest run actually scanned when the row cap bit
+ * ([truncated]) or when retention had already taken the rest.
+ */
+@Serializable
+data class AssertionFailuresDto(
+    val window: String,
+    val since: String,
+    val until: String,
+    val truncated: Boolean,
+    /** Descending by failure count; at most [dev.tracedown.gateway.controllers.metrics.DashboardMetricsController.MAX_ASSERTIONS]. */
+    val assertions: List<AssertionFailureStat>,
+)
+
+/** One hour-of-week cell of the failure heatmap. */
+@Serializable
+data class HeatmapCell(
+    /** ISO-8601 weekday, 1 = Monday … 7 = Sunday, in UTC. */
+    val weekday: Int,
+    /** Hour of day 0..23, in UTC. */
+    val hour: Int,
+    val runs: Long,
+    val failedRuns: Long,
+)
+
+/**
+ * Failed runs by hour of day and day of week, from the all-agents hourly rows
+ * of `probe_aggregates` — the only place that holds a correct *run* failure
+ * count per hour.
+ *
+ * **Everything in it is UTC**, which [timezone] states so the axis can be
+ * labelled honestly. There is no timezone parameter: an offset in the query
+ * would make every cached grid per-viewer, and a named zone would have to be
+ * applied to a column stored in the writing JVM's wall clock — which is exactly
+ * the kind of mixed-clock arithmetic this family already has one bug from.
+ */
+@Serializable
+data class FailureHeatmapDto(
+    /** The lookback actually used, after clamping. */
+    val days: Int,
+    val timezone: String,
+    /** The requested bounds. */
+    val since: String,
+    val until: String,
+    /** Oldest and newest hour that carried runs; null when the service has no history. */
+    val coveredFrom: String?,
+    val coveredTo: String?,
+    val totalRuns: Long,
+    val totalFailedRuns: Long,
+    /** Ascending by weekday then hour, and sparse: a cell with no runs is absent. */
+    val cells: List<HeatmapCell>,
+)
