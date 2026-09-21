@@ -478,13 +478,17 @@ class OutboxClaimTest {
 
     @Test
     fun `the interval poll picks up work without a nudge`() = runBlocking {
-        val resultId = insertEvent(UUID.randomUUID(), Instant.now().minus(1, ChronoUnit.HOURS))
-
         val seen = java.util.Collections.synchronizedList(mutableListOf<UUID>())
         val c = consumer({ payload -> seen += resultIdOf(payload) }, "instance-a", pollIntervalMs = 30L)
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
             c.start(scope)
+            // Write only after the startup poll has already come back empty, so
+            // the row can only be found by a later tick of the interval. The
+            // pub/sub stand-in delivers nothing, so there is no nudge either.
+            delay(300)
+            val resultId = insertEvent(UUID.randomUUID(), Instant.now().minus(1, ChronoUnit.HOURS))
+
             withTimeoutOrNull(10_000) { while (seen.isEmpty()) delay(10) }
             assertEquals(listOf(resultId), seen.toList())
         } finally {
