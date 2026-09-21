@@ -7,6 +7,7 @@ import at.favre.lib.crypto.bcrypt.BCrypt
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.PermissionCacheService
+import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
 import dev.tracedown.common.onboarding.AccountLifecycle
@@ -101,9 +102,26 @@ object OrgSettingsController {
     /**
      * Transfers ownership to another active member of the organization.
      * Only the current owner can transfer.
+     *
+     * An external module may intercept this to veto a change of owner — the hook
+     * is the only place outside org creation where a user becomes an owner, so a
+     * host with its own rules about who may hold an organization needs both or
+     * neither. The new owner's id is in `extra["newOwnerId"]`.
+     *
+     * The hook runs inside the transaction that writes `owner_id`, so a check
+     * that reads what the recipient already owns is atomic with the write.
      */
+    @Injectable("org.ownership.transfer")
     fun transferOwnership(orgId: UUID, newOwnerId: UUID, requestingUserId: UUID): OrgSettings {
-        return transaction {
+        return Interceptors.injectableInTx(
+            "org.ownership.transfer",
+            InterceptorContext(
+                orgId = orgId,
+                userId = requestingUserId,
+                extra = mutableMapOf("newOwnerId" to newOwnerId),
+            ),
+        ) {
+        transaction {
             val org = Organizations.selectAll()
                 .where { (Organizations.id eq orgId) and (Organizations.deleted eq false) }
                 .firstOrNull()
@@ -143,6 +161,7 @@ object OrgSettingsController {
                 RealtimePublisher.publish("org:$orgId", orgId, "settings.updated")
 
             orgSettingsFrom(orgId)
+        }
         }
     }
 
