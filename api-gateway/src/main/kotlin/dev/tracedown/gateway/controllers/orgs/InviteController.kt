@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.controllers.orgs
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.buildJsonObject
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.realtime.RealtimePublisher
 
 import dev.tracedown.common.onboarding.PasswordHasher
@@ -458,9 +459,11 @@ object InviteController {
             // re-invite resurrects an empty row rather than the pre-configured
             // sections and groups this one carried.
             MembershipAccess.revokeAll(orgId, invite[OrgUsers.id])
+            val now = Instant.now()
             OrgUsers.update({ OrgUsers.id eq invite[OrgUsers.id] }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             val inviteEmail = Users.selectAll()

@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.controllers.orgs
 
 import dev.tracedown.common.auth.canWrite
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.pfs.Page
@@ -198,13 +199,15 @@ object OrgVariableController {
         transaction {
             requireOrgWrite(orgId, userId) { it.settings }
 
+            val now = Instant.now()
             val updated = OrgVariables.update({
                 (OrgVariables.id eq varId) and
                     (OrgVariables.organizationId eq orgId) and
                     (OrgVariables.deleted eq false)
             }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
             if (updated == 0) throw NotFoundException()
             OutboxEmit.emitResourceEvent(

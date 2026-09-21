@@ -2,6 +2,7 @@ package dev.tracedown.gateway.controllers.webhooks
 
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
@@ -152,9 +153,11 @@ object WebhookController {
                 .where { WebhookDeliveries.id eq webhookId }
                 .firstOrNull()?.get(WebhookDeliveries.name)
 
+            val now = Instant.now()
             WebhookDeliveries.update({ WebhookDeliveries.id eq webhookId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             AuditService.log(orgId, userId, "delete.webhook", "webhook", webhookId.toString(), entityDisplayName = webhookName)

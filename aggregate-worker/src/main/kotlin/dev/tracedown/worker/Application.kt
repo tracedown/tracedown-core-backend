@@ -1,6 +1,7 @@
 package dev.tracedown.worker
 
 import dev.tracedown.common.config.DatabaseFactory
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.config.SecretGuard
 import dev.tracedown.common.health.databaseCheck
 import dev.tracedown.common.health.installHealthEndpoints
@@ -13,6 +14,7 @@ import dev.tracedown.worker.jobs.HourlyAggregationJob
 import dev.tracedown.worker.jobs.OrphanUserPurgeJob
 import dev.tracedown.worker.jobs.OutboxPurgeJob
 import dev.tracedown.worker.jobs.PurgeJob
+import dev.tracedown.worker.jobs.PurgeScheduleRepair
 import dev.tracedown.worker.jobs.RetentionJob
 import dev.tracedown.common.domain.HttpDnsDomainVerifier
 import dev.tracedown.worker.jobs.AggregateRetentionJob
@@ -56,6 +58,18 @@ fun Application.module() {
         password = config.database.password,
         maximumPoolSize = 5,
     )
+
+    // How long a soft-deleted row is kept before the purge may erase it. The
+    // same setting the api-gateway reads: it stamps `purge_after` on delete,
+    // this worker stamps it on the accounts and invites it sweeps, and the
+    // purge job acts on it.
+    DeletionRetention.init(config.purgeRetentionDays)
+
+    // Rows soft-deleted before every delete path stamped a purge date were left
+    // with none, so nothing would ever erase them. Repair them against the
+    // configured retention before any job runs — idempotent, and it only ever
+    // moves a purge date later.
+    PurgeScheduleRepair.run()
 
     // Body storage client (for deleting bodies during retention and purge),
     // confined to platform storage: a stored URI outside it is skipped.
@@ -155,6 +169,14 @@ fun Application.module() {
             "no window of their own — bodies follow their results"
         },
         config.hourlyAggregateRetentionDays
+    )
+    log.info(
+        "aggregate-worker purge window: {}",
+        if (config.purgeRetentionDays > 0) {
+            "deleted rows are kept ${config.purgeRetentionDays} day(s) before erasure"
+        } else {
+            "deleted rows are erased on the next purge run"
+        },
     )
 
     // Shutdown hooks

@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.controllers.workspaces
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.buildJsonObject
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.realtime.RealtimePublisher
 
 import dev.tracedown.common.audit.AuditService
@@ -184,7 +185,7 @@ object WorkspaceController {
             Workspaces.update({ Workspaces.id eq workspaceId }) {
                 it[deleted] = true
                 it[deletedAt] = now
-                it[purgeAfter] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             AuditService.log(orgId, userId, "delete.workspace", "workspace", workspaceId.toString(), entityDisplayName = deletedName)
@@ -369,9 +370,11 @@ object WorkspaceController {
                 throw BadRequestException(ErrorCodes.SYSTEM_VARIABLE)
             }
 
+            val now = Instant.now()
             WorkspaceVariables.update({ WorkspaceVariables.id eq varId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
             OutboxEmit.emitResourceEvent(
                 "resource.variable.deleted", "variable", varId,

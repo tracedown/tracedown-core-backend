@@ -256,7 +256,8 @@ class ContainerCascadeDeleteTest {
         )
         assertEquals(
             project[Projects.deletedAt], project[Projects.purgeAfter],
-            "Core keeps no retention window: purge_after is the deletion instant",
+            "with the install default of no retention, purge_after is the deletion instant " +
+                "(DeletionRetentionStampTest pins the configured case)",
         )
         assertEquals(project[Projects.deletedAt], service[Services.purgeAfter])
     }

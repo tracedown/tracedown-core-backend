@@ -6,6 +6,7 @@ import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWriteResource
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.GrafanaIntegrations
 import dev.tracedown.common.models.Services
@@ -173,9 +174,11 @@ object GrafanaIntegrationController {
             requireProjectAccess(orgId, projectId, userId, write = true)
             val existing = findRow(projectId) ?: throw NotFoundException()
 
+            val now = Instant.now()
             GrafanaIntegrations.update({ GrafanaIntegrations.id eq existing[GrafanaIntegrations.id] }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             AuditService.log(

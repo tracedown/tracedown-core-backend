@@ -2,6 +2,7 @@ package dev.tracedown.gateway.controllers.domains
 
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.domain.DomainVerifier
 import dev.tracedown.common.domain.dns.DnsProviderProfiles
 import dev.tracedown.common.models.OrgDomains
@@ -162,9 +163,11 @@ object DomainController {
                 .where { OrgDomains.id eq domainId }
                 .firstOrNull()?.get(OrgDomains.domain)
 
+            val now = Instant.now()
             OrgDomains.update({ OrgDomains.id eq domainId }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
             AuditService.log(orgId, userId, "delete.domain", "domain", domainId.toString(), entityDisplayName = deletedDomain)

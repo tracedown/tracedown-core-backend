@@ -5,6 +5,7 @@ import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.SessionAuthenticator
 import dev.tracedown.common.auth.SessionResult
 import dev.tracedown.common.auth.TokenHasher
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.common.models.OrgGroups
 import dev.tracedown.common.models.OrgUserGroups
@@ -1275,17 +1276,16 @@ object AuthController {
      * row is kept. [AccountLifecycle.ORPHAN_GRACE_SECONDS] exists so an account
      * that lost its last membership without asking can be revived by a re-invite.
      * Nothing here was unasked for: the holder proved who they were and pressed
-     * the button. So the window is the operator's configured retention
-     * ([purgeRetentionDays], `systemLimits.purgeRetentionDays`) — the same one
-     * the deleted organizations above are given, and the same one whose zero
-     * default is what makes "delete" mean deleted on this install.
+     * the button, so no grace window is added on top and the row is kept for
+     * exactly the operator's configured retention ([DeletionRetention]) — the
+     * same window the deleted organizations above are given, and the same one
+     * whose zero default is what makes "delete" mean deleted on this install.
      */
     fun deleteAccount(
         userId: UUID,
         password: String,
         code: String? = null,
         deleteOwnedOrgs: Boolean = false,
-        purgeRetentionDays: Int = 0,
     ) {
         // Identity first: nothing below runs, and nothing is written to any
         // audit log, until the person at the keyboard has proved who they are.
@@ -1327,14 +1327,10 @@ object AuthController {
         // Owned organizations go through the ordinary deletion path — same owner
         // check, same interception seam, same probe teardown — rather than a
         // second, quieter copy of it here.
-        toDelete.forEach { OrgSettingsController.deleteOrg(it, userId, purgeRetentionDays) }
+        toDelete.forEach { OrgSettingsController.deleteOrg(it, userId) }
 
         transaction {
             val now = Instant.now()
-            // The operator's retention setting, in seconds. Zero — the default —
-            // makes every row below purgeable immediately, which is the whole
-            // contract of `systemLimits.purgeRetentionDays = 0`.
-            val retentionSeconds = purgeRetentionDays * 86_400L
             val memberships = OrgUsers.selectAll()
                 .where { (OrgUsers.userId eq userId) and (OrgUsers.deleted eq false) }
                 .map { it[OrgUsers.id] to it[OrgUsers.organizationId] }
@@ -1344,14 +1340,15 @@ object AuthController {
                 OrgUsers.update({ OrgUsers.id eq membershipId }) {
                     it[deleted] = true
                     it[deletedAt] = now
-                    it[purgeAfter] = now.plusSeconds(retentionSeconds)
+                    it[purgeAfter] = DeletionRetention.purgeAfter(now)
                     it[isActive] = false
                 }
             }
 
-            // Sessions and silences go with it. The window is the configured
-            // retention, not the orphan grace: this closure was requested.
-            AccountLifecycle.reconcile(userId, now, retentionSeconds)
+            // Sessions and silences go with it. No orphan grace on top: this
+            // closure was requested, so the configured retention is the whole
+            // window.
+            AccountLifecycle.reconcile(userId, now, extraGraceSeconds = 0L)
 
             memberships.forEach { (_, orgId) ->
                 RealtimePublisher.publish("org:$orgId", orgId, "user.removed", buildJsonObject {

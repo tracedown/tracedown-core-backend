@@ -7,28 +7,27 @@ import at.favre.lib.crypto.bcrypt.BCrypt
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.PermissionCacheService
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
 import dev.tracedown.common.onboarding.AccountLifecycle
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Organizations
-import dev.tracedown.common.models.Projects
-import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Users
-import dev.tracedown.common.models.Workspaces
 import dev.tracedown.gateway.data.orgs.OrgSettings
 import dev.tracedown.gateway.data.orgs.UpdateOrgSettingsRequest
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.DeletionCascade
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.ResourceResolver
+import dev.tracedown.gateway.util.ScheduleNudge
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.core.inList
-import org.jetbrains.exposed.v1.core.innerJoin
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
@@ -166,15 +165,20 @@ object OrgSettingsController {
     }
 
     /**
-     * Soft-deletes an organization. Only the owner can delete.
-     * Sets deleted/deletedAt on the org and all its memberships.
-     * Clears selectedOrgId for affected users.
+     * Soft-deletes an organization and everything under it. Only the owner can
+     * delete.
+     *
+     * The whole subtree — workspaces, projects, services, scrape credentials and
+     * memberships — goes down in the same transaction, stamped with the
+     * organization's own deletion instant and its purge date, so a restore can
+     * tell exactly what this delete took. Clears `selectedOrgId` for affected
+     * users and reconciles each account that is left without an organization.
      */
-    fun deleteOrg(orgId: UUID, requestingUserId: UUID, purgeRetentionDays: Int) {
+    fun deleteOrg(orgId: UUID, requestingUserId: UUID) {
         // An external module intercepts a successful org deletion to run its own
         // teardown (an after-hook fires only once the soft-delete below commits, so
         // an unauthorized attempt never triggers it). Core defines only the seam.
-        Interceptors.injectable(
+        val cascaded = Interceptors.injectable(
             "org.delete",
             InterceptorContext(orgId = orgId, userId = requestingUserId),
         ) {
@@ -189,40 +193,24 @@ object OrgSettingsController {
             }
 
             val now = Instant.now()
-            val purgeAfter = now.plusSeconds(purgeRetentionDays * 86400L)
 
             Organizations.update({ Organizations.id eq orgId }) {
                 it[deleted] = true
                 it[deletedAt] = now
-                it[Organizations.purgeAfter] = purgeAfter
+                it[Organizations.purgeAfter] = DeletionRetention.purgeAfter(now)
             }
 
-            // Stop the org's probes: soft-delete its services so the scheduler
-            // drops them on its next consistency sweep instead of firing against a
-            // deleted org.
-            val serviceIds = (Services innerJoin Projects innerJoin Workspaces).selectAll()
-                .where { (Workspaces.organizationId eq orgId) and (Services.deleted eq false) }
-                .map { it[Services.id] }
-            if (serviceIds.isNotEmpty()) {
-                Services.update({ Services.id inList serviceIds }) {
-                    it[Services.deleted] = true
-                    it[Services.deletedAt] = now
-                }
-            }
-
-            // Members to reconcile once their memberships here are gone.
+            // Members to reconcile once their memberships here are gone — read
+            // before the cascade below soft-deletes those memberships.
             val affectedUserIds = OrgUsers.selectAll()
                 .where { (OrgUsers.organizationId eq orgId) and (OrgUsers.deleted eq false) }
                 .map { it[OrgUsers.userId] }
                 .distinct()
 
-            // Soft-delete all memberships
-            OrgUsers.update({
-                (OrgUsers.organizationId eq orgId) and (OrgUsers.deleted eq false)
-            }) {
-                it[deleted] = true
-                it[deletedAt] = now
-            }
+            // The subtree goes with it: workspaces, projects, services (so the
+            // scheduler drops them rather than firing against a deleted org),
+            // scrape credentials and memberships, all on the same stamp.
+            val cascaded = DeletionCascade.organization(orgId, now)
 
             // Clear selectedOrgId for users who had this org selected
             Users.update({ Users.selectedOrgId eq orgId }) {
@@ -234,8 +222,17 @@ object OrgSettingsController {
 
             AuditService.log(orgId, requestingUserId, "delete.org", "org", orgId.toString(),
                 entityDisplayName = org[Organizations.name])
+            cascaded
         }
         }
+
+        // Same follow-up the workspace and project deletes do, for the same
+        // reason: the resolver cache would otherwise keep answering for a
+        // container that is gone, and the scheduler would keep the org's probes
+        // until its next consistency sweep.
+        cascaded.projectIds.forEach(ResourceResolver::invalidateProject)
+        cascaded.serviceIds.forEach(ResourceResolver::invalidateService)
+        ScheduleNudge.publishAll(cascaded.serviceIds)
     }
 
     private fun orgSettingsFrom(orgId: UUID): OrgSettings {

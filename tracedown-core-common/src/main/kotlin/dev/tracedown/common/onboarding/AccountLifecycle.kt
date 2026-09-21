@@ -1,5 +1,6 @@
 package dev.tracedown.common.onboarding
 
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Sessions
@@ -48,7 +49,13 @@ object AccountLifecycle {
      *
      * It is deliberately NOT the window for a deliberate self-service closure:
      * that is a request, and the operator's own retention setting governs how
-     * long a deleted thing is kept. See the [reconcile] `graceSeconds` override.
+     * long a deleted thing is kept. See the [reconcile] `extraGraceSeconds`
+     * override.
+     *
+     * It is a floor on top of that retention, never a replacement for it: the
+     * purge date is the later of the two (see [DeletionRetention.purgeAfter]),
+     * so a grace window cannot erase a row before the operator's retention is
+     * up, and a retention cannot cut a grace window short.
      */
     const val ORPHAN_GRACE_SECONDS: Long = 7 * 86_400L
 
@@ -85,19 +92,20 @@ object AccountLifecycle {
      *    [graceSeconds] before it becomes purgeable.
      *  - has a membership again, but the account was soft-deleted → revive it.
      *
-     * [graceSeconds] defaults to [ORPHAN_GRACE_SECONDS], which is right for every
-     * caller that reaches here because a membership went away underneath the
-     * account. A caller acting on the account holder's own explicit request
-     * passes the operator's configured retention instead — see
-     * `systemLimits.purgeRetentionDays`, whose whole point is that zero means
-     * "gone means gone". A grace window nobody asked for would quietly defeat it.
+     * [extraGraceSeconds] defaults to [ORPHAN_GRACE_SECONDS], which is right for
+     * every caller that reaches here because a membership went away underneath
+     * the account. A caller acting on the account holder's own explicit request
+     * passes `0` instead: nothing there was unasked for, so the operator's
+     * configured retention is the whole window — and its zero default is what
+     * makes "gone means gone" true on a default install. A grace window nobody
+     * asked for would quietly defeat it.
      *
      * No-op when the account is already in the correct state, or does not exist.
      */
     fun reconcile(
         userId: UUID,
         now: Instant = Instant.now(),
-        graceSeconds: Long = ORPHAN_GRACE_SECONDS,
+        extraGraceSeconds: Long = ORPHAN_GRACE_SECONDS,
     ) {
         val user = Users.selectAll().where { Users.id eq userId }.firstOrNull() ?: return
         val alreadyDeleted = user[Users.deleted]
@@ -109,7 +117,7 @@ object AccountLifecycle {
             Users.update({ Users.id eq userId }) {
                 it[deleted] = true
                 it[deletedAt] = now
-                it[purgeAfter] = now.plusSeconds(graceSeconds)
+                it[purgeAfter] = DeletionRetention.purgeAfter(now, extraGraceSeconds)
                 it[isActive] = false
             }
         }
@@ -158,7 +166,7 @@ object AccountLifecycle {
         }) {
             it[deleted] = true
             it[deletedAt] = now
-            it[purgeAfter] = now
+            it[purgeAfter] = DeletionRetention.purgeAfter(now)
             it[isActive] = false
         }
     }
@@ -195,6 +203,7 @@ object AccountLifecycle {
         OrgUsers.update({ OrgUsers.id inList membershipIds }) {
             it[deleted] = true
             it[deletedAt] = now
+            it[purgeAfter] = DeletionRetention.purgeAfter(now)
             it[isActive] = false
         }
         // Reconcile each affected account: a stub left with no membership is

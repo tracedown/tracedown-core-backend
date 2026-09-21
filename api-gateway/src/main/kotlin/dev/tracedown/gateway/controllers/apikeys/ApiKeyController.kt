@@ -2,6 +2,7 @@ package dev.tracedown.gateway.controllers.apikeys
 
 import at.favre.lib.crypto.bcrypt.BCrypt
 import dev.tracedown.common.audit.AuditService
+import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
@@ -131,11 +132,13 @@ object ApiKeyController {
                 .where { (ApiKeys.id eq keyId) and (ApiKeys.organizationId eq orgId) }
                 .firstOrNull()?.get(ApiKeys.name)
 
+            val now = Instant.now()
             val updated = ApiKeys.update({
                 (ApiKeys.id eq keyId) and (ApiKeys.organizationId eq orgId) and (ApiKeys.deleted eq false)
             }) {
                 it[deleted] = true
-                it[deletedAt] = Instant.now()
+                it[deletedAt] = now
+                it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
             if (updated == 0) throw NotFoundException()
 
