@@ -53,7 +53,7 @@ dependencies {
     implementation(libs.bouncycastle.pkix)
     implementation(libs.bouncycastle.prov)
 
-    implementation("dev.lacelang:kotlin-validator:0.1.6")
+    implementation("dev.lacelang:kotlin-validator:0.1.7")
 
     // JUnit Platform 6. The BOM is what actually moves the engine: both
     // kotlin-test-junit5 and testcontainers-junit-jupiter still ask for

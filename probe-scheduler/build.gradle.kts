@@ -46,7 +46,7 @@ dependencies {
     // Pinned to the same version api-gateway validates scripts with: the two
     // read the same scripts, and a key derived from a different grammar than
     // the one that accepted the script would describe a different script.
-    implementation("dev.lacelang:kotlin-validator:0.1.6")
+    implementation("dev.lacelang:kotlin-validator:0.1.7")
 
     // Serialization & coroutines
     implementation(libs.kotlinx.serialization.json)
