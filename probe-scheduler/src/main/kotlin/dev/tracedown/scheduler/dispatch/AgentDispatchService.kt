@@ -68,6 +68,14 @@ class AgentDispatchService(
         val result: JsonObject?,
         val agentEgressBytes: Long,
         val failure: AgentFailure? = null,
+        /**
+         * True when [result] is the agent's own answer — it ran the script and
+         * sent a ProbeResult back. False for every synthetic result, including
+         * the timeout the scheduler records when the agent held the job and
+         * never answered: that one is filed as a result but proves nothing
+         * about the agent being alive.
+         */
+        val fromAgent: Boolean = false,
     )
 
     /**
@@ -189,7 +197,7 @@ class AgentDispatchService(
                     AgentFailure.MALFORMED_RESULT,
                 )
             }
-            DispatchResult(decoded, agentEgressBytes)
+            DispatchResult(decoded, agentEgressBytes, fromAgent = true)
         } catch (e: ConnectTimeoutException) {
             // Never got a connection, so the script never started: safe to
             // re-run elsewhere. Distinct from the request/socket timeouts

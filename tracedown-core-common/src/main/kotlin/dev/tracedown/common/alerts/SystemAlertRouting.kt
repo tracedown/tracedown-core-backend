@@ -19,6 +19,14 @@ data class AlertContext(
     val orgScoped: Boolean,
     val severity: String,
     val data: JsonObject?,
+    /**
+     * True when this raise re-observes a condition that was already alerted
+     * on and has not cleared since — the agent is still down, still slow. The
+     * org banner path wants every observation (it refreshes the episode a
+     * banner is showing); a router keeping an operator feed wants only the
+     * first, or the feed fills with one row per minute of the same outage.
+     */
+    val recurring: Boolean = false,
 )
 
 /**

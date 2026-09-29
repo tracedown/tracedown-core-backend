@@ -81,6 +81,12 @@ object ProbeExecutionBackends {
 class AgentExecutionBackend(
     private val selector: AgentSelector,
     private val dispatch: AgentDispatchService,
+    /**
+     * Where an agent's own answers are noted, so the health round can tell an
+     * agent that is running probes from one that is gone. Null keeps the
+     * backend exactly as it was.
+     */
+    private val liveness: AgentLiveness? = null,
 ) : ProbeExecutionBackend {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -141,6 +147,9 @@ class AgentExecutionBackend(
             )
             attempts++
             egressBytes += dispatched.agentEgressBytes
+            // Only the agent's own answer counts — a synthetic timeout is the
+            // scheduler's word, not the agent's.
+            if (dispatched.fromAgent) liveness?.markSeen(agent.id)
 
             val failure = dispatched.failure
             if (dispatched.result != null || failure == null) {

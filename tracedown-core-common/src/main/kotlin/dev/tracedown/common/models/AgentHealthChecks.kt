@@ -11,6 +11,8 @@ object AgentHealthChecks : Table("agent_health_checks") {
     val challengedAt = timestamp("challenged_at")
     val respondedAt = timestamp("responded_at").nullable()
     val roundTripMs = integer("round_trip_ms").nullable()
+    /** The agent's own time on the challenge (its fetch of the token), when it answered. */
+    val agentElapsedMs = integer("agent_elapsed_ms").nullable()
     val result = varchar("result", 16)
     val createdAt = timestamp("created_at")
 

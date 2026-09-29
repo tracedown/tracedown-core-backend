@@ -38,6 +38,24 @@ object SystemAlertService {
     const val AGENT_DEGRADED = "agent_degraded"
 
     /**
+     * An agent that was [AGENT_DOWN] or [AGENT_DEGRADED] is back. Raised once,
+     * at the transition, so a feed of platform alerts can close the episode
+     * it opened. Offered to the routing seam only — it is not a condition an
+     * org can act on, so it never becomes a banner.
+     */
+    const val AGENT_RECOVERED = "agent_recovered"
+
+    /**
+     * One health round found most of the fleet slow at once. Agents on
+     * different continents do not all slow down in the same minute on their
+     * own; that is the platform side of the challenge — the host, the token
+     * endpoint, the path out — and it is raised as one alert about the round
+     * instead of one [AGENT_DEGRADED] per agent, which blamed each of them for
+     * it. Subject is the token endpoint, as for [HEALTH_TOKEN_UNAVAILABLE].
+     */
+    const val HEALTH_ROUND_SLOW = "health_round_slow"
+
+    /**
      * A probe tick found no executor it was allowed to run on, so the run was
      * recorded as skipped. Distinct from [DISPATCH_CAPACITY]: nothing was over
      * capacity, there was simply nothing healthy (or nothing allowlisted) to

@@ -1,6 +1,7 @@
 package dev.tracedown.scheduler.scheduling
 
 import dev.tracedown.scheduler.crypto.AgentMtlsClientFactory
+import dev.tracedown.scheduler.dispatch.AgentLiveness
 import io.lettuce.core.api.sync.RedisCommands
 
 /**
@@ -18,13 +19,19 @@ object HealthChallengeContext {
     lateinit var clientFactory: AgentMtlsClientFactory
         private set
 
+    /** The dispatch path's record of which agents have answered a run lately. */
+    lateinit var liveness: AgentLiveness
+        private set
+
     fun init(
         redis: RedisCommands<String, String>,
         gatewayUrl: String,
         clientFactory: AgentMtlsClientFactory,
+        liveness: AgentLiveness,
     ) {
         this.redis = redis
         this.gatewayUrl = gatewayUrl
         this.clientFactory = clientFactory
+        this.liveness = liveness
     }
 }

@@ -14,6 +14,7 @@ import dev.tracedown.scheduler.crypto.RevocationChecker
 import dev.tracedown.scheduler.crypto.SchedulerCertService
 import dev.tracedown.scheduler.dispatch.AgentDispatchService
 import dev.tracedown.scheduler.dispatch.AgentExecutionBackend
+import dev.tracedown.scheduler.dispatch.AgentLiveness
 import dev.tracedown.scheduler.dispatch.ProbeExecutionBackends
 import dev.tracedown.scheduler.dispatch.AgentSelector
 import dev.tracedown.scheduler.dispatch.DispatchQueue
@@ -106,8 +107,12 @@ fun Application.module() {
         )
     }
 
+    // Shared between dispatch (which writes it) and the health round (which
+    // reads it): an agent that answered a run is alive whatever its challenge said.
+    val agentLiveness = AgentLiveness(redis)
+
     val executionBackend = ProbeExecutionBackends.provider?.invoke()
-        ?: AgentExecutionBackend(AgentSelector(redis), AgentDispatchService(agentClientFactory, sealing))
+        ?: AgentExecutionBackend(AgentSelector(redis), AgentDispatchService(agentClientFactory, sealing), agentLiveness)
 
     // Queue policy
     val queuePolicy = QueuePolicyManager(redis)
@@ -179,6 +184,7 @@ fun Application.module() {
         redis = redis,
         gatewayUrl = config.gatewayUrl,
         clientFactory = agentClientFactory,
+        liveness = agentLiveness,
     )
 
     // Schedule health challenges: every 1 minute, offset to :30 so the
