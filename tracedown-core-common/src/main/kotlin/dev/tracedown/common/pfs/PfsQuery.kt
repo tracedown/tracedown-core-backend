@@ -1,5 +1,7 @@
 package dev.tracedown.common.pfs
 
+import dev.tracedown.common.errors.ErrorCodes
+
 import org.jetbrains.exposed.v1.core.*
 import org.jetbrains.exposed.v1.javatime.JavaInstantColumnType
 import org.jetbrains.exposed.v1.jdbc.*
@@ -22,7 +24,16 @@ fun Query.applyPfs(params: PfsParams): Pair<Query, Long> {
 fun Query.applyFilters(params: PfsParams): Query {
     for (filter in params.filters) {
         val col = TableRegistry.resolveColumn(filter.table, filter.column)
-        this.andWhere { buildFilterOp(col, filter) }
+        // A value that does not parse as the column's type, or an operator the
+        // type has no meaning for, is the request's mistake, not a failure.
+        val op = try {
+            buildFilterOp(col, filter)
+        } catch (e: IllegalArgumentException) {
+            throw PfsValidationException(ErrorCodes.FIELD_INVALID)
+        } catch (e: java.time.format.DateTimeParseException) {
+            throw PfsValidationException(ErrorCodes.FIELD_INVALID)
+        }
+        this.andWhere { op }
     }
     return this
 }

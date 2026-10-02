@@ -185,6 +185,8 @@ class MeRoutesTest {
                 it[createdBy] = userId
                 it[name] = "export-test-key"
                 it[keyHash] = API_KEY_HASH
+                it[keyPrefix] = "td_abcdefgh"
+                it[access] = dev.tracedown.common.auth.AccessLevel.WRITE
                 it[createdAt] = Instant.now()
             }
             OrgVariables.insert {
@@ -387,6 +389,8 @@ class MeRoutesTest {
 
         val apiKeys = body["apiKeys"]!!.jsonArray
         assertEquals("export-test-key", apiKeys.single().jsonObject["name"]!!.jsonPrimitive.content)
+        assertEquals("td_abcdefgh", apiKeys.single().jsonObject["prefix"]!!.jsonPrimitive.content)
+        assertEquals("write", apiKeys.single().jsonObject["access"]!!.jsonPrimitive.content)
         val variables = body["variables"]!!.jsonArray
         assertEquals("EXPORT_TEST_SECRET", variables.single().jsonObject["key"]!!.jsonPrimitive.content)
         assertTrue(body["sessions"]!!.jsonArray.isNotEmpty(), "the current session must be listed")
@@ -396,6 +400,23 @@ class MeRoutesTest {
         assertFalse(raw.contains(SECRET_VARIABLE_VALUE), "variable value leaked into export")
         assertFalse(raw.contains(token), "session token leaked into export")
         assertFalse(raw.contains("\$2a\$"), "a bcrypt hash leaked into export")
+    }
+
+    @Test
+    fun `with rate limiting off, an unknown key is refused every time and metered never`() {
+        // This gateway runs with the limiter switched off (see setup): no
+        // budget, no headers, no refusal other than the key's own.
+        repeat(40) { n ->
+            val request = Request.Builder()
+                .url("http://localhost:$serverPort/api/public/v1/key")
+                .header("Authorization", "Bearer td_unknown-$n")
+                .build()
+            client.newCall(request).execute().use { response ->
+                assertEquals(401, response.code)
+                assertEquals("invalid_api_key", json(response.body!!.string())["error"]!!.jsonPrimitive.content)
+                assertEquals(null, response.header("X-RateLimit-Limit"))
+            }
+        }
     }
 
     @Test

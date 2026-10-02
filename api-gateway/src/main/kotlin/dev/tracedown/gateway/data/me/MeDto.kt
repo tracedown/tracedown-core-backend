@@ -85,6 +85,8 @@ data class ExportAuditEntry(
     val entityDisplayName: String? = null,
     val diff: JsonElement? = null,
     val comment: String? = null,
+    /** The API key the action was taken through, when it was. */
+    val apiKeyId: String? = null,
     val createdAt: String,
 )
 
@@ -93,6 +95,8 @@ data class ExportAuditEntry(
 data class ExportApiKey(
     val organizationId: String,
     val name: String,
+    val prefix: String? = null,
+    val access: String,
     val lastUsedAt: String? = null,
     val expiresAt: String? = null,
     val revoked: Boolean,

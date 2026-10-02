@@ -23,6 +23,11 @@ import dev.tracedown.common.onboarding.OrgService
 import dev.tracedown.gateway.controllers.services.ServiceController
 import dev.tracedown.gateway.controllers.workspaces.WorkspaceController
 import dev.tracedown.gateway.routes.pingRoute
+import dev.tracedown.gateway.routes.publicapi.PublicApi
+import dev.tracedown.gateway.routes.publicapi.publicApiRoutes
+import dev.tracedown.gateway.controllers.apikeys.ApiKeyController
+import dev.tracedown.gateway.util.ApiNamespace
+import dev.tracedown.gateway.util.ApiRateLimit
 import dev.tracedown.gateway.routes.v1.agents.AgentHealthResponse
 import dev.tracedown.gateway.routes.v1.agents.AgentStatus
 import dev.tracedown.gateway.routes.v1.agents.agentRoutes
@@ -159,6 +164,8 @@ fun Application.module() {
     // How many variables one resource may hold — an operator-set guard against
     // runaway creation, identical for every organization.
     VariableLimits.init(appConfig.systemLimits.maxVarsPerResource)
+    // How many API keys one user may hold — the same kind of guard, per person.
+    ApiKeyController.init(appConfig.systemLimits.maxApiKeysPerUser)
     // How long a soft-deleted row is kept before the purge job may erase it.
     // Every delete path stamps `purge_after` from this one number, so "delete"
     // means the same thing whichever endpoint was called. The aggregate-worker
@@ -232,6 +239,9 @@ fun Application.module() {
     // Redis B is allowed to drop counters, and losing it locks logins out.
     // In the default single-instance setup this is the same server either way.
     val rateLimiter = RateLimiter(redis = { redisA }, config = rateLimitConfig)
+    // The key-authenticated API is metered per key, where the key is read,
+    // rather than per address by the plugin below.
+    ApiRateLimit.init(rateLimiter.takeIf { rateLimitConfig.enabled })
 
     // The seal the history endpoint writes on a closed hour has to live as
     // long as an hourly bucket the ingest path writes, so both sides read the
@@ -496,11 +506,21 @@ fun Application.module() {
     // still get it on the paths the limiter skips, and when it is switched off.
     installClientAddress(rateLimitConfig.trustedProxies)
 
+    // Everything a key-authenticated request must pass, keyed on its path and
+    // installed ahead of the routes it may or may not reach. See PublicApi.
+    PublicApi.install(this)
+
     install(createApplicationPlugin("RateLimit") {
         onCall { call ->
             if (!rateLimitConfig.enabled) return@onCall
 
-            val tier = dev.tracedown.gateway.util.rateLimitTierFor(call.request.local.uri) ?: return@onCall
+            val uri = call.request.local.uri
+            val tier = dev.tracedown.gateway.util.rateLimitTierFor(uri, call.request.httpMethod)
+            // The key-authenticated API has no tier here — it is metered per
+            // key — but it still keys its failure count on this address, and it
+            // is where automation behind shared addresses arrives. It is
+            // watched like the rest.
+            if (tier == null && !ApiNamespace.isPublicUri(uri)) return@onCall
 
             // Key on the real client IP, taken a trusted number of proxy hops
             // back from the TCP peer so a client-supplied XFF cannot spoof it.
@@ -513,6 +533,7 @@ fun Application.module() {
                 resolvedIp = ip,
                 forwarded = xff?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList(),
             )
+            if (tier == null) return@onCall
 
             val result = rateLimiter.check(ip, tier)
             call.response.headers.append("X-RateLimit-Limit", result.limit.toString())
@@ -557,6 +578,7 @@ fun Application.module() {
         systemAlertRoutes()
         notificationTemplateRoutes()
         apiKeyRoutes()
+        publicApiRoutes()
         resultRoutes()
         dashboardMetricsRoutes()
         usageRoutes()

@@ -9,6 +9,9 @@ import io.ktor.util.AttributeKey
 /** Where the resolved address lives for the duration of one call. */
 private val ClientAddressKey = AttributeKey<String>("ClientAddress")
 
+/** The configured hop count, kept on the application for [clientIp] to resolve with on demand. */
+private val TrustedProxiesKey = AttributeKey<Int>("ClientAddressTrustedProxies")
+
 /** The longest an address gets: an IPv6 literal with an embedded IPv4 tail. */
 private const val MAX_ADDRESS_LENGTH = 45
 
@@ -28,35 +31,43 @@ private const val MAX_ADDRESS_LENGTH = 45
  * address still has to be there for the routes that record it.
  */
 fun Application.installClientAddress(trustedProxies: Int) {
+    attributes.put(TrustedProxiesKey, trustedProxies)
     install(createApplicationPlugin("ClientAddress") {
-        onCall { call ->
-            // The literal peer — `origin.remoteHost` may reverse-resolve DNS,
-            // which stalls the event loop and yields a name the caller controls.
-            val peer = call.request.local.remoteAddress
-            val resolved = resolveClientIp(
-                xff = call.request.headers["X-Forwarded-For"],
-                directPeer = peer,
-                trustedProxies = trustedProxies,
-            )
-            // Every hop a correct configuration selects was written by a proxy,
-            // so it is an address. One longer than an address can be was written
-            // by the caller — which only reaches this position on a deployment
-            // claiming more proxies than it has. Fall back to the peer rather
-            // than carry it into a rate-limit key or a column it does not fit.
-            call.attributes.put(
-                ClientAddressKey,
-                if (resolved.length <= MAX_ADDRESS_LENGTH) resolved else peer,
-            )
-        }
+        onCall { call -> call.attributes.put(ClientAddressKey, call.resolveAddress(trustedProxies)) }
     })
+}
+
+private fun ApplicationCall.resolveAddress(trustedProxies: Int): String {
+    // The literal peer — `origin.remoteHost` may reverse-resolve DNS,
+    // which stalls the event loop and yields a name the caller controls.
+    val peer = request.local.remoteAddress
+    val resolved = resolveClientIp(
+        xff = request.headers["X-Forwarded-For"],
+        directPeer = peer,
+        trustedProxies = trustedProxies,
+    )
+    // Every hop a correct configuration selects was written by a proxy,
+    // so it is an address. One longer than an address can be was written
+    // by the caller — which only reaches this position on a deployment
+    // claiming more proxies than it has. Fall back to the peer rather
+    // than carry it into a rate-limit key or a column it does not fit.
+    return if (resolved.length <= MAX_ADDRESS_LENGTH) resolved else peer
 }
 
 /**
  * The caller's address for this call: the real client when the deployment sits
  * behind the configured number of reverse proxies, the direct peer otherwise.
  *
+ * Resolves on demand when asked before the plugin has run for this call —
+ * something a host installed ahead of this module can cause, by asking who is
+ * calling before the module's own plugins get their turn. Answering with the
+ * peer there would key that caller on the proxy, which is every caller at once.
+ *
  * Falls back to the direct peer if [installClientAddress] never ran, so a call
  * assembled outside the server pipeline still answers with something true.
  */
-fun ApplicationCall.clientIp(): String =
-    attributes.getOrNull(ClientAddressKey) ?: request.local.remoteAddress
+fun ApplicationCall.clientIp(): String {
+    attributes.getOrNull(ClientAddressKey)?.let { return it }
+    val trustedProxies = application.attributes.getOrNull(TrustedProxiesKey) ?: return request.local.remoteAddress
+    return resolveAddress(trustedProxies).also { attributes.put(ClientAddressKey, it) }
+}

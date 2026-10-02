@@ -42,6 +42,7 @@ object TableRegistry {
         "webhook_deliveries" to WebhookDeliveries,
         "resource_webhook_access" to ResourceWebhookAccess,
         "org_audit_log" to OrgAuditLog,
+        "api_keys" to ApiKeys,
         "notification_silences" to NotificationSilences,
         "sessions" to Sessions,
         "notification_templates" to NotificationTemplates,
@@ -123,7 +124,13 @@ object TableRegistry {
         ),
         "org_audit_log" to setOf(
             "id", "organization_id", "user_id", "action", "entity_type",
-            "entity_id", "entity_display_name", "comment", "created_at",
+            "entity_id", "entity_display_name", "comment", "api_key_id", "created_at",
+        ),
+        // key_hash is the credential's digest and stays out, like every other
+        // token column: a filter on it is an oracle for the digest.
+        "api_keys" to setOf(
+            "id", "organization_id", "created_by", "name", "key_prefix", "access",
+            "last_used_at", "expires_at", "revoked", "created_at",
         ),
         "notification_silences" to setOf(
             "id", "org_user_id", "workspace_id", "project_id", "service_id",

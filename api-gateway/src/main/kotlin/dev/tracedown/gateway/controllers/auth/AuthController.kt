@@ -22,6 +22,7 @@ import dev.tracedown.common.models.Sessions
 import dev.tracedown.common.models.TotpRecoveryCodes
 import dev.tracedown.common.models.Users
 import dev.tracedown.gateway.context.AuthPrincipal
+import dev.tracedown.gateway.context.SessionAuth
 import dev.tracedown.gateway.data.auth.LoginRequest
 import dev.tracedown.gateway.data.auth.LoginResponse
 import dev.tracedown.gateway.data.auth.MeResponse
@@ -74,13 +75,11 @@ object AuthController {
 
     private val secureRandom = SecureRandom()
     private const val CHALLENGE_TTL_SECONDS = 300L // 5 minutes
-    private const val SESSION_TOUCH_DEBOUNCE_SECONDS = 60L
     // Per-login guess cap. The account-wide limit that actually bounds guessing
     // lives in TotpPolicy — this one only stops a single pending session being
     // hammered, and a fresh login resets it by design.
 
     /** Tracks last touch time per session to debounce last_active_at updates. */
-    private val sessionTouchCache = java.util.concurrent.ConcurrentHashMap<UUID, Long>()
 
     private lateinit var hmacKey: ByteArray
     private var totpIssuer: String = "Tracedown"
@@ -114,7 +113,7 @@ object AuthController {
             // the app's "no organizations" screen (e.g. removed from their last
             // org, or a pending invitee). Org-mandated TOTP only applies when
             // there is actually an org to enforce it.
-            val totpEnforced = targetOrgId != null && isTotpEnforcedForOrg(userId, targetOrgId)
+            val totpEnforced = targetOrgId != null && SessionAuth.isTotpEnforcedForOrg(userId, targetOrgId)
 
             when {
                 userHasTotp -> {
@@ -160,6 +159,24 @@ object AuthController {
             throw UnauthorizedException()
         }
 
+        return try {
+            verifyTotpOnce(pendingId, code, sessionTtlMinutes, ipAddress, userAgent)
+        } catch (refused: TotpRefused) {
+            // Written on its own, after the refusing transaction rolled back:
+            // a counter written inside it would roll back with it, and the
+            // lockout would never arrive.
+            refused.record()
+            throw UnauthorizedException(ErrorCodes.INVALID_TOTP_CODE)
+        }
+    }
+
+    private fun verifyTotpOnce(
+        pendingId: UUID,
+        code: String,
+        sessionTtlMinutes: Long,
+        ipAddress: String?,
+        userAgent: String?,
+    ): LoginResponse {
         return transaction {
             val pending = Sessions.selectAll()
                 .where {
@@ -196,15 +213,7 @@ object AuthController {
             }
 
             if (!consumeSecondFactor(user, code)) {
-                val failure = TotpPolicy.afterFailure(user[Users.totpFailedAttempts], attemptedAt)
-                Users.update({ Users.id eq userId }) {
-                    it[totpFailedAttempts] = failure.attempts
-                    if (failure.lockedUntil != null) it[totpLockedUntil] = failure.lockedUntil
-                }
-                Sessions.update({ Sessions.id eq pendingId }) {
-                    it[totpAttemptCount] = attempts + 1
-                }
-                throw UnauthorizedException(ErrorCodes.INVALID_TOTP_CODE)
+                throw TotpRefused(userId, TotpPolicy.afterFailure(user[Users.totpFailedAttempts], attemptedAt), pendingId)
             }
 
             // A completed second factor clears the account's guess history.
@@ -359,70 +368,6 @@ object AuthController {
         }
     }
 
-    /**
-     * Resolves a session token to an AuthPrincipal.
-     * Checks TOTP enrollment enforcement — if TOTP is required but not enrolled,
-     * throws 403 unless the request path is exempt (handled by caller).
-     */
-    fun resolveSession(token: String, checkTotpEnrollment: Boolean = true): AuthPrincipal {
-        // Validity is decided by the shared authenticator (one definition for
-        // gateway + realtime). Per-reason mapping preserves the gateway's error codes.
-        val ctx = when (val result = SessionAuthenticator.authenticate(token)) {
-            is SessionResult.Valid -> result.context
-            is SessionResult.Invalid -> throw when (result.reason) {
-                SessionResult.Reason.EXPIRED -> UnauthorizedException(ErrorCodes.SESSION_EXPIRED)
-                SessionResult.Reason.USER_DELETED -> UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
-                SessionResult.Reason.USER_INACTIVE -> UnauthorizedException(ErrorCodes.ACCOUNT_DEACTIVATED)
-                SessionResult.Reason.NOT_FOUND, SessionResult.Reason.REVOKED -> UnauthorizedException()
-            }
-        }
-
-        // TOTP enrollment guard — gateway policy, only enforced for the session's org.
-        val orgId = ctx.organizationId
-        if (checkTotpEnrollment && !ctx.totpEnabled && orgId != null) {
-            val enforced = transaction { isTotpEnforcedForOrg(ctx.userId, orgId) }
-            if (enforced) throw ForbiddenException()
-        }
-
-        touchSessionActivity(ctx.sessionId)
-
-        return AuthPrincipal(
-            userId = ctx.userId,
-            sessionId = ctx.sessionId,
-            email = ctx.email,
-            organizationId = ctx.organizationId,
-        )
-    }
-
-    /**
-     * Debounced session activity touch. Only writes to the DB if the session
-     * hasn't been touched in the last [SESSION_TOUCH_DEBOUNCE_SECONDS].
-     * Uses atomic ConcurrentHashMap.compute to prevent concurrent requests
-     * from racing past the debounce check.
-     */
-    private fun touchSessionActivity(sessionId: UUID) {
-        val now = Instant.now().epochSecond
-        var shouldWrite = false
-        sessionTouchCache.compute(sessionId) { _, lastTouch ->
-            if (lastTouch == null || now - lastTouch >= SESSION_TOUCH_DEBOUNCE_SECONDS) {
-                shouldWrite = true
-                now
-            } else {
-                lastTouch
-            }
-        }
-        if (!shouldWrite) return
-
-        try {
-            transaction {
-                Sessions.update({ Sessions.id eq sessionId }) {
-                    it[lastActiveAt] = Instant.now()
-                }
-            }
-        } catch (_: Exception) {
-            // Best-effort — if it fails, next debounce window will retry
-        }
-    }
 
     /** Revokes a session. */
     fun logout(sessionId: UUID) {
@@ -765,9 +710,28 @@ object AuthController {
     /**
      * Re-verifies the caller's identity for sensitive operations: password
      * always; a TOTP (or recovery) code when the user is enrolled. Throws on
-     * any mismatch. Call within a transaction-free context.
+     * any mismatch.
+     *
+     * The second factor is held to the same lockout as at login: an account
+     * whose code failed too often is refused until the lock lifts, and a wrong
+     * code counts towards it. Without that, a stolen session could try codes
+     * here as fast as the rate limiter lets it, which login never allows.
+     *
+     * Opens its own transaction and commits: a consumed code and a counted
+     * failure both have to stick whether or not what the caller does next
+     * succeeds. So a caller that has reasons of its own to refuse checks them
+     * BEFORE calling this, or the user pays a code for a refusal.
      */
     fun verifyIdentity(userId: UUID, password: String, code: String?) {
+        try {
+            verifyIdentityOnce(userId, password, code)
+        } catch (refused: TotpRefused) {
+            refused.record()
+            throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
+        }
+    }
+
+    private fun verifyIdentityOnce(userId: UUID, password: String, code: String?) {
         transaction {
             val user = Users.selectAll()
                 .where { (Users.id eq userId) and (Users.deleted eq false) }
@@ -782,8 +746,44 @@ object AuthController {
             val secret = user[Users.totpSecretEncrypted]
             val iv = user[Users.totpSecretIv]
             if (secret != null && iv != null) {
-                if (code.isNullOrBlank()) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
-                if (!consumeSecondFactor(user, code)) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
+                val attemptedAt = Instant.now()
+                if (TotpPolicy.isLocked(user[Users.totpLockedUntil], attemptedAt)) {
+                    throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
+                }
+                if (code.isNullOrBlank() || !consumeSecondFactor(user, code)) {
+                    throw TotpRefused(userId, TotpPolicy.afterFailure(user[Users.totpFailedAttempts], attemptedAt))
+                }
+                Users.update({ Users.id eq userId }) {
+                    it[totpFailedAttempts] = 0
+                    it[totpLockedUntil] = null
+                }
+            }
+        }
+    }
+
+    /**
+     * A second factor that did not verify. Thrown out of the refusing
+     * transaction so that it rolls back, then [record]ed in a transaction of
+     * its own: a counter written beside the refusal would roll back with it,
+     * and the lockout it feeds would never arrive.
+     */
+    private class TotpRefused(
+        val userId: UUID,
+        val failure: TotpPolicy.Failure,
+        val pendingSessionId: UUID? = null,
+    ) : RuntimeException() {
+        fun record() = transaction {
+            Users.update({ Users.id eq userId }) {
+                it[totpFailedAttempts] = failure.attempts
+                if (failure.lockedUntil != null) it[totpLockedUntil] = failure.lockedUntil
+            }
+            if (pendingSessionId != null) {
+                val attempts = Sessions.select(Sessions.totpAttemptCount)
+                    .where { Sessions.id eq pendingSessionId }
+                    .firstOrNull()?.get(Sessions.totpAttemptCount) ?: return@transaction
+                Sessions.update({ Sessions.id eq pendingSessionId }) {
+                    it[totpAttemptCount] = attempts + 1
+                }
             }
         }
     }
@@ -972,44 +972,6 @@ object AuthController {
         }
     }
 
-    /**
-     * Checks if TOTP is enforced for a user in a specific org.
-     * Reads from permission_cache if available, otherwise checks org + groups directly.
-     */
-    private fun isTotpEnforcedForOrg(userId: UUID, orgId: UUID): Boolean {
-        val membership = OrgUsers.selectAll()
-            .where {
-                (OrgUsers.userId eq userId) and
-                (OrgUsers.organizationId eq orgId) and
-                (OrgUsers.status eq "active") and
-                (OrgUsers.deleted eq false)
-            }
-            .firstOrNull() ?: return false
-
-        val cache = membership[OrgUsers.permissionCache]
-        if (cache != null) {
-            return CachedPermissions.fromJsonObject(cache).totpRequired
-        }
-
-        // Fallback: check org and groups directly
-        val org = Organizations.selectAll()
-            .where { Organizations.id eq orgId }
-            .firstOrNull()
-        if (org != null && org[Organizations.totpRequired]) return true
-
-        val groupIds = OrgUserGroups.selectAll()
-            .where { OrgUserGroups.orgUserId eq membership[OrgUsers.id] }
-            .map { it[OrgUserGroups.orgGroupId] }
-
-        for (groupId in groupIds) {
-            val group = OrgGroups.selectAll()
-                .where { OrgGroups.id eq groupId }
-                .firstOrNull()
-            if (group != null && group[OrgGroups.totpRequired]) return true
-        }
-
-        return false
-    }
 
     /**
      * A fixed, valid bcrypt hash (cost 12, matching [PasswordHasher]) that no

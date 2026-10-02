@@ -8,6 +8,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 
 /**
@@ -144,6 +146,36 @@ fun resolveCachedPermissions(orgId: java.util.UUID, userId: java.util.UUID): Cac
 
     // Fallback to direct columns (cache not yet computed) — no resource grants
     return CachedPermissions(OrgPermissions.from(membership), emptyMap(), false)
+}
+
+/**
+ * Which of [pairs] — (organization, user) — [resolveCachedPermissions] would
+ * answer for: the organization exists, and the user owns it or is an active
+ * member. The same predicate, asked for many pairs in two queries instead of
+ * two per pair; a list that has to say whether each of its rows could still
+ * act uses this, and must agree with what a request would find.
+ */
+fun actingPairs(pairs: Collection<Pair<java.util.UUID, java.util.UUID>>): Set<Pair<java.util.UUID, java.util.UUID>> {
+    if (pairs.isEmpty()) return emptySet()
+    val orgIds = pairs.map { it.first }.toSet()
+    val userIds = pairs.map { it.second }.toSet()
+
+    val owners = Organizations.select(Organizations.id, Organizations.ownerId)
+        .where { (Organizations.id inList orgIds) and (Organizations.deleted eq false) }
+        .associate { it[Organizations.id] to it[Organizations.ownerId] }
+    val members = OrgUsers.select(OrgUsers.organizationId, OrgUsers.userId)
+        .where {
+            (OrgUsers.organizationId inList orgIds) and
+            (OrgUsers.userId inList userIds) and
+            (OrgUsers.status eq "active") and
+            (OrgUsers.deleted eq false)
+        }
+        .map { it[OrgUsers.organizationId] to it[OrgUsers.userId] }
+        .toSet()
+
+    return pairs.filter { (orgId, userId) ->
+        orgId in owners && (owners[orgId] == userId || (orgId to userId) in members)
+    }.toSet()
 }
 
 /**

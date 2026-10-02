@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.util
 
 import dev.tracedown.common.net.PathCanonicalizer
+import io.ktor.http.HttpMethod
 import io.lettuce.core.api.sync.RedisCommands
 import org.slf4j.LoggerFactory
 
@@ -26,19 +27,17 @@ class RateLimiter(
     )
 
     /**
-     * Checks whether the request from [ip] on the given [tier] is allowed.
-     * Returns the result with limit/remaining for response headers.
+     * Counts one request by [subject] against [tier] and says whether it is
+     * allowed. The subject is whatever the tier is keyed on — a client address
+     * for most, a key's digest for [Tier.API]. Returns the result with
+     * limit/remaining for response headers.
      */
-    fun check(ip: String, tier: Tier): RateLimitResult {
-        val tierConfig = when (tier) {
-            Tier.GENERAL -> config.general
-            Tier.AUTH -> config.auth
-            Tier.INTERNAL -> config.internal
-        }
+    fun check(subject: String, tier: Tier): RateLimitResult {
+        val tierConfig = tierConfig(tier)
 
         val nowSeconds = System.currentTimeMillis() / 1000
         val windowKey = nowSeconds / tierConfig.windowSeconds
-        val key = "rate:${tier.name.lowercase()}:$ip:$windowKey"
+        val key = "rate:${tier.name.lowercase()}:$subject:$windowKey"
 
         return try {
             val count = redis().incr(key)
@@ -83,10 +82,11 @@ class RateLimiter(
                         retryAfterSeconds = tierConfig.windowSeconds,
                     )
                 }
-                Tier.GENERAL, Tier.INTERNAL -> {
+                Tier.GENERAL, Tier.INTERNAL, Tier.API, Tier.API_FAILURE -> {
                     // Open, like the general tier: an agent fleet that cannot
                     // enrol or renew its certificates is an outage, and the
                     // limiter store being down is not a reason to cause one.
+                    // The same goes for the key-authenticated API.
                     log.warn("Rate limiter Redis error on {} tier, failing open: {}", tier, e.message)
                     RateLimitResult(
                         allowed = true,
@@ -99,9 +99,88 @@ class RateLimiter(
         }
     }
 
+    /**
+     * Where [subject] stands on [tier] in the current window, without spending
+     * any of it: `allowed` is false once the budget is used up. For a budget
+     * that counts failures — the caller looks first, and records a failure with
+     * [check] only once it knows the attempt was one. Fails open, like the
+     * tiers it is used for.
+     */
+    fun peek(subject: String, tier: Tier): RateLimitResult {
+        val tierConfig = tierConfig(tier)
+        val nowSeconds = System.currentTimeMillis() / 1000
+        val windowKey = nowSeconds / tierConfig.windowSeconds
+        val count = try {
+            redis().get("rate:${tier.name.lowercase()}:$subject:$windowKey")?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            log.warn("Rate limiter Redis error reading {} tier, failing open: {}", tier, e.message)
+            0L
+        }
+        val spent = count >= tierConfig.maxRequests
+        return RateLimitResult(
+            allowed = !spent,
+            limit = tierConfig.maxRequests,
+            remaining = (tierConfig.maxRequests - count).coerceAtLeast(0).toInt(),
+            retryAfterSeconds = if (spent) tierConfig.windowSeconds - nowSeconds % tierConfig.windowSeconds else 0,
+        )
+    }
+
+    /**
+     * A short-lived mark the limiter's store keeps on behalf of its callers —
+     * state that has to be the same on every instance sharing the store, which
+     * a counter in one process's memory is not. Best-effort: a store that is
+     * away remembers nothing and [remembered] answers false.
+     */
+    fun remember(mark: String, seconds: Long) {
+        try {
+            redis().set("rate:mark:$mark", "1", io.lettuce.core.SetArgs.Builder.ex(seconds))
+        } catch (e: Exception) {
+            log.warn("Rate limiter Redis error writing a mark: {}", e.message)
+        }
+    }
+
+    fun remembered(mark: String): Boolean =
+        try {
+            redis().exists("rate:mark:$mark") > 0
+        } catch (e: Exception) {
+            log.warn("Rate limiter Redis error reading a mark: {}", e.message)
+            false
+        }
+
+    fun forget(mark: String) {
+        try {
+            redis().del("rate:mark:$mark")
+        } catch (e: Exception) {
+            log.warn("Rate limiter Redis error clearing a mark: {}", e.message)
+        }
+    }
+
+    private fun tierConfig(tier: Tier): TierConfig = when (tier) {
+        Tier.GENERAL -> config.general
+        Tier.AUTH -> config.auth
+        Tier.INTERNAL -> config.internal
+        Tier.API -> config.api
+        Tier.API_FAILURE -> config.apiFailure
+    }
+
     enum class Tier {
         GENERAL,
         AUTH,
+
+        /**
+         * The key-authenticated API, metered per key rather than per address:
+         * automation tends to share one — a CI fleet behind a single NAT — and
+         * a per-address budget would have its runners starve each other.
+         */
+        API,
+
+        /**
+         * Requests to the key-authenticated API whose token named no key at
+         * all, metered per address. A key that exists spends none of it; this
+         * only bounds how many lookups a caller without one can make the
+         * gateway perform.
+         */
+        API_FAILURE,
 
         /**
          * Endpoints that are unauthenticated by design — agent enrolment and
@@ -120,8 +199,10 @@ class RateLimiter(
 /**
  * Which budget a request path is metered against.
  *
- * Only `/ping` is exempt, and only because a liveness probe that a limiter can
- * refuse is not a liveness probe. Everything else is metered, including
+ * `/ping` is exempt, because a liveness probe that a limiter can refuse is not
+ * a liveness probe. The key-authenticated API answers null here too, but is
+ * not exempt: it is metered per key where the key is read, rather than per
+ * address (see [ApiRateLimit]). Everything else is metered here, including
  * the `/internal/` routes: they are unauthenticated by design — they carry a
  * bootstrap token or proof of possession of an agent's private key — and they
  * used to be exempt from metering as well, on reasoning that was about
@@ -130,7 +211,7 @@ class RateLimiter(
  * stranger, and on a deployment with no reverse proxy in front they are
  * published straight to the internet.
  */
-fun rateLimitTierFor(rawPath: String): RateLimiter.Tier? {
+fun rateLimitTierFor(rawPath: String, method: HttpMethod = HttpMethod.Get): RateLimiter.Tier? {
     // Classify on the canonical path, so `//api/v1/auth/login` (which routes to
     // the login handler all the same) is metered on the strict AUTH budget
     // rather than the fail-open GENERAL one it lands on when the raw URI is read
@@ -139,12 +220,17 @@ fun rateLimitTierFor(rawPath: String): RateLimiter.Tier? {
     val path = PathCanonicalizer.canonicalize(rawPath) ?: return RateLimiter.Tier.AUTH
     return when {
     path == "/ping" -> null
+    // Metered where the key is read, per key — see ApiRateLimit.
+    ApiNamespace.isPublic(path) -> null
     path.startsWith("/internal/") -> RateLimiter.Tier.INTERNAL
     // The data export fans out over many per-user queries, so it shares the
     // stricter auth tier rather than the general one.
     path.startsWith("/api/v1/auth/login") ||
         path.startsWith("/api/v1/auth/password-reset") ||
         path.startsWith("/api/v1/me/export") -> RateLimiter.Tier.AUTH
+    // Minting a key re-checks the password, so a stolen session could guess
+    // at it here; the login budget is the one for guessing passwords.
+    method == HttpMethod.Post && path == "/api/v1/me/api-keys" -> RateLimiter.Tier.AUTH
         else -> RateLimiter.Tier.GENERAL
     }
 }
@@ -184,6 +270,10 @@ data class RateLimitConfig(
     val auth: TierConfig,
     /** Budget for the unauthenticated-by-design agent enrolment endpoints. */
     val internal: TierConfig = TierConfig(maxRequests = 60, windowSeconds = 60),
+    /** Budget of one API key. */
+    val api: TierConfig = TierConfig(maxRequests = 300, windowSeconds = 60),
+    /** Budget of one address for requests to the key-authenticated API that carried no usable key. */
+    val apiFailure: TierConfig = TierConfig(maxRequests = 30, windowSeconds = 60),
     /**
      * Number of trusted reverse proxies in front of the gateway. The client IP
      * used for rate-limit keys is taken this many hops back from the TCP peer,
@@ -193,6 +283,13 @@ data class RateLimitConfig(
     val trustedProxies: Int,
 ) {
     companion object {
+        /**
+         * A configured window, never below one second. The window is a divisor:
+         * a zero from a mistyped variable would turn every metered request into
+         * an arithmetic error instead of a limit.
+         */
+        private fun window(configured: Long?): Long = (configured ?: 60L).coerceAtLeast(1)
+
         fun load(config: io.ktor.server.config.ApplicationConfig): RateLimitConfig {
             return RateLimitConfig(
                 enabled = config.propertyOrNull("rateLimit.enabled")
@@ -202,14 +299,14 @@ data class RateLimitConfig(
                 general = TierConfig(
                     maxRequests = config.propertyOrNull("rateLimit.general.maxRequests")
                         ?.getString()?.toInt() ?: 120,
-                    windowSeconds = config.propertyOrNull("rateLimit.general.windowSeconds")
-                        ?.getString()?.toLong() ?: 60L,
+                    windowSeconds = window(config.propertyOrNull("rateLimit.general.windowSeconds")
+                        ?.getString()?.toLong()),
                 ),
                 auth = TierConfig(
                     maxRequests = config.propertyOrNull("rateLimit.auth.maxRequests")
                         ?.getString()?.toInt() ?: 15,
-                    windowSeconds = config.propertyOrNull("rateLimit.auth.windowSeconds")
-                        ?.getString()?.toLong() ?: 60L,
+                    windowSeconds = window(config.propertyOrNull("rateLimit.auth.windowSeconds")
+                        ?.getString()?.toLong()),
                 ),
                 // Generous next to the auth tier on purpose: a whole fleet may
                 // bootstrap in the same minute, and one agent retrying a failed
@@ -217,8 +314,20 @@ data class RateLimitConfig(
                 internal = TierConfig(
                     maxRequests = config.propertyOrNull("rateLimit.internal.maxRequests")
                         ?.getString()?.toInt() ?: 60,
-                    windowSeconds = config.propertyOrNull("rateLimit.internal.windowSeconds")
-                        ?.getString()?.toLong() ?: 60L,
+                    windowSeconds = window(config.propertyOrNull("rateLimit.internal.windowSeconds")
+                        ?.getString()?.toLong()),
+                ),
+                api = TierConfig(
+                    maxRequests = config.propertyOrNull("rateLimit.api.maxRequests")
+                        ?.getString()?.toInt() ?: 300,
+                    windowSeconds = window(config.propertyOrNull("rateLimit.api.windowSeconds")
+                        ?.getString()?.toLong()),
+                ),
+                apiFailure = TierConfig(
+                    maxRequests = config.propertyOrNull("rateLimit.apiFailure.maxRequests")
+                        ?.getString()?.toInt() ?: 30,
+                    windowSeconds = window(config.propertyOrNull("rateLimit.apiFailure.windowSeconds")
+                        ?.getString()?.toLong()),
                 ),
             )
         }

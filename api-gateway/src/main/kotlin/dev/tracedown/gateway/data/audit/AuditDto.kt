@@ -16,6 +16,10 @@ data class AuditLogEntry(
     val entityDisplayName: String? = null,
     val diff: String?,
     val comment: String?,
+    /** The API key the action came through, when it was not a signed-in session. */
+    val apiKeyId: String? = null,
+    /** That key's name, while the key still exists. */
+    val apiKeyName: String? = null,
     val createdAt: String,
 )
 

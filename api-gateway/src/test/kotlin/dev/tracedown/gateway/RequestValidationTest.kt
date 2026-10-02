@@ -74,10 +74,20 @@ class RequestValidationTest {
 
     @Test
     fun `CreateApiKeyRequest caps the name at the column width and bounds the expiry`() {
-        assertTrue(CreateApiKeyRequest("ci key", 30).validate().isEmpty())
-        assertTrue(CreateApiKeyRequest("ci key", null).validate().isEmpty(), "null expiry is allowed")
-        assertEquals(listOf("name_too_long"), CreateApiKeyRequest("n".repeat(129), 30).validate())
-        assertEquals(listOf("invalid_expiresInDays"), CreateApiKeyRequest("ci key", 0).validate())
+        assertTrue(CreateApiKeyRequest("ci key", 30, password = "pw").validate().isEmpty())
+        assertTrue(CreateApiKeyRequest("ci key", null, password = "pw").validate().isEmpty(), "null expiry is allowed")
+        assertEquals(listOf("name_too_long"), CreateApiKeyRequest("n".repeat(129), 30, password = "pw").validate())
+        assertEquals(listOf("invalid_expiresInDays"), CreateApiKeyRequest("ci key", 0, password = "pw").validate())
+        assertEquals(listOf("invalid_expiresInDays"), CreateApiKeyRequest("ci key", 3651, password = "pw").validate())
+    }
+
+    @Test
+    fun `CreateApiKeyRequest knows two access levels and asks for the password`() {
+        assertTrue(CreateApiKeyRequest("k", access = "read", password = "pw").validate().isEmpty())
+        assertTrue(CreateApiKeyRequest("k", access = "write", password = "pw").validate().isEmpty())
+        assertEquals(listOf("invalid_access"), CreateApiKeyRequest("k", access = "admin", password = "pw").validate())
+        // Minting a credential re-proves identity: a request without a password is not one.
+        assertEquals(listOf("password_required"), CreateApiKeyRequest("k", password = "").validate())
     }
 
     @Test

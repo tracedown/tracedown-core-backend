@@ -1,7 +1,5 @@
-// API keys are DEFERRED: no X-Api-Key verifier exists, so a minted key would
-// authenticate nothing. The create and list routes are disabled (501) so no one
-// is handed a dead credential. This vector pins that deferral — restore the full
-// CRUD lifecycle here once a verifier ships and the routes are re-enabled.
+// API key lifecycle: a user mints a key for themselves, the key authenticates
+// the key-authenticated API and nothing else, and it stops when it is revoked.
 
 // Login
 post("$baseUrl/api/v1/auth/login", {
@@ -10,17 +8,86 @@ post("$baseUrl/api/v1/auth/login", {
 .expect(status: 200)
 .store({ "$$token": this.body.token })
 
-// Create is deferred — must report 501, not mint a key
-post("$baseUrl/api/v1/api-keys", {
+// Minting asks for the password again: a session alone is refused
+post("$baseUrl/api/v1/me/api-keys", {
   headers: { Authorization: "Bearer $$token" },
-  body: json({ name: "Test Key" })
+  body: json({ name: "Test Key", access: "write", password: "not the password" })
 })
-.expect(status: 501)
-.assert({ expect: [this.body.error eq "api_keys_deferred"] })
+.expect(status: 400)
+.assert({ expect: [this.body.error eq "incorrect_password"] })
 
-// List is deferred — must report 501 too
+// Mint a key — the key itself is in this response and no other
+post("$baseUrl/api/v1/me/api-keys", {
+  headers: { Authorization: "Bearer $$token" },
+  body: json({ name: "Test Key", access: "write", password: "$adminPassword" })
+})
+.expect(status: 201)
+.assert({
+  expect: [
+    this.body.name eq "Test Key",
+    this.body.access eq "write",
+    this.body.state eq "active",
+    this.body.key neq null
+  ]
+})
+.store({ "$$keyId": this.body.id, "$$key": this.body.key })
+
+// The user's own list shows it, without the key
+get("$baseUrl/api/v1/me/api-keys", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total eq 1] })
+
+// So does the organization's list
 get("$baseUrl/api/v1/api-keys", {
   headers: { Authorization: "Bearer $$token" }
 })
-.expect(status: 501)
-.assert({ expect: [this.body.error eq "api_keys_deferred"] })
+.expect(status: 200)
+.assert({ expect: [this.body.total eq 1] })
+
+// The key authenticates the key-authenticated API
+get("$baseUrl/api/public/v1/key", {
+  headers: { Authorization: "Bearer $$key" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.id eq "$$keyId", this.body.access eq "write"] })
+
+// A key is not a session
+get("$baseUrl/api/v1/auth/me", {
+  headers: { Authorization: "Bearer $$key" }
+})
+.expect(status: 401)
+.assert({ expect: [this.body.error eq "session_required"] })
+
+// A session is not a key
+get("$baseUrl/api/public/v1/key", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 401)
+.assert({ expect: [this.body.error eq "invalid_api_key"] })
+
+// Revoke
+post("$baseUrl/api/v1/me/api-keys/$$keyId/revoke", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+// A revoked key is refused, and says why
+get("$baseUrl/api/public/v1/key", {
+  headers: { Authorization: "Bearer $$key" }
+})
+.expect(status: 401)
+.assert({ expect: [this.body.error eq "api_key_revoked"] })
+
+// Delete
+delete("$baseUrl/api/v1/me/api-keys/$$keyId", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+
+get("$baseUrl/api/v1/me/api-keys", {
+  headers: { Authorization: "Bearer $$token" }
+})
+.expect(status: 200)
+.assert({ expect: [this.body.total eq 0] })
