@@ -15,6 +15,7 @@ import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.OrgRulePresets
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.Organizations
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.PasswordResetTokens
 import dev.tracedown.common.models.PendingBodyDeletions
 import dev.tracedown.common.models.ProbeResults
@@ -1499,6 +1500,32 @@ class PurgeJobTest {
         transaction {
             assertEquals(0, count(PasswordResetTokens, PasswordResetTokens.id eq expired))
             assertEquals(1, count(PasswordResetTokens, PasswordResetTokens.id eq live))
+        }
+    }
+
+    @Test
+    fun `expired email change requests are deleted, live ones kept`() {
+        val expired = UUID.randomUUID()
+        val live = UUID.randomUUID()
+        transaction {
+            val user = insertUser()
+            listOf(expired to NOW.minusSeconds(60), live to NOW.plusSeconds(3600)).forEach { (id, until) ->
+                EmailChangeRequests.insert {
+                    it[EmailChangeRequests.id] = id
+                    it[userId] = user
+                    it[newEmail] = "$id@t.dev"
+                    it[tokenHash] = id.toString().replace("-", "")
+                    it[expiresAt] = until
+                    it[createdAt] = NOW.minusSeconds(120)
+                }
+            }
+        }
+
+        runBlocking { ExpiredTokenCleanupJob().execute() }
+
+        transaction {
+            assertEquals(0, count(EmailChangeRequests, EmailChangeRequests.id eq expired))
+            assertEquals(1, count(EmailChangeRequests, EmailChangeRequests.id eq live))
         }
     }
 

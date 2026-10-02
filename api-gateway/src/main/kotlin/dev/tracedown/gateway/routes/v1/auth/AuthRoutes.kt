@@ -229,6 +229,7 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
         call.respond(
             ProfileCapabilitiesResponse(
                 allowProfileEdit = canEdit,
+                allowEmailChange = appConfig.platform.allowEmailChange,
                 allowAccountClosure = canClose,
                 // Only the closure section reads these, so nothing is queried
                 // for an install that has closure switched off.

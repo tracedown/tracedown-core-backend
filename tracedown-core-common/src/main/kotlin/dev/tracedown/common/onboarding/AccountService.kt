@@ -1,5 +1,6 @@
 package dev.tracedown.common.onboarding
 
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.Sessions
 import dev.tracedown.common.models.TotpRecoveryCodes
 import dev.tracedown.common.models.Users
@@ -83,6 +84,7 @@ object AccountService {
         }
         TotpRecoveryCodes.deleteWhere { TotpRecoveryCodes.userId eq userId }
         Sessions.deleteWhere { Sessions.userId eq userId }
+        EmailChangeRequests.voidFor(userId)
         userId
     }
 

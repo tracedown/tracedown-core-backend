@@ -24,6 +24,27 @@ data class ChangeEmailRequest(
     }
 }
 
+/** The answer to an email-change request: nothing has changed yet. */
+@Serializable
+data class EmailChangeRequested(
+    /** The address a confirmation link was mailed to. */
+    val newEmail: String,
+    val expiresAt: String,
+)
+
+/** The link mailed to the new address, presented back. */
+@Serializable
+data class ConfirmEmailChangeRequest(val token: String) : Validatable {
+    override fun validate() = buildList {
+        Validators.notBlank("token", token)?.let(::add)
+        Validators.maxLen("token", token, 255)?.let(::add)
+    }
+}
+
+/** The change has been written: the address the account now has. */
+@Serializable
+data class EmailChanged(val email: String)
+
 // --- Personal data export ---
 
 /** The user's profile row, secrets excluded (no password hash, no TOTP secret). */

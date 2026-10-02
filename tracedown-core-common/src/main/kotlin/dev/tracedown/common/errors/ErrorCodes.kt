@@ -107,6 +107,11 @@ object ErrorCodes {
     // ── Profile ──
     const val PROFILE_EDIT_DISABLED = "profile_edit_disabled"
     const val EMAIL_TAKEN = "email_taken"
+    /** The install does not let accounts change their own address. */
+    const val EMAIL_CHANGE_DISABLED = "email_change_disabled"
+
+    /** Asked again too soon, or too many requests have been mailed to that address lately. */
+    const val EMAIL_CHANGE_COOLDOWN = "email_change_cooldown"
 
     // ── Account closure ──
     /** Self-service account closure is switched off on this platform. */

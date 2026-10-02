@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="supported-color-schemes" content="dark">
+  <title>Confirm your new email address</title>
+</head>
+<body style="margin:0;padding:0;background-color:#0e1719;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#0e1719;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="520" cellpadding="0" cellspacing="0" style="background-color:#222729;border:1px solid #3a4143;border-radius:8px;overflow:hidden;">
+          {{brandHeader}}
+          <tr>
+            <td style="padding:32px 40px 0;">
+              <h1 style="margin:0 0 8px;font-size:22px;font-weight:600;color:#f2f5f4;">Confirm your new email address</h1>
+              <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:#9eaeac;">
+                A request was made to use <strong style="color:#f2f5f4;">{{newEmail}}</strong> as the email address of a Tracedown account. If that was you, click the button below to confirm it. This link expires in {{expiryMinutes}} minutes.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:0 40px;">
+              <a href="{{confirmLink}}" style="display:inline-block;padding:12px 28px;background-color:#ff5e5b;color:#ffffff;text-decoration:none;border-radius:6px;font-size:15px;font-weight:500;">Confirm Email Address</a>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 40px 0;">
+              <p style="margin:0;font-size:13px;line-height:1.5;color:#9eaeac;">
+                If the button doesn't work, copy and paste this link into your browser:
+              </p>
+              <p style="margin:4px 0 0;font-size:13px;line-height:1.5;color:#66a8e6;word-break:break-all;">
+                {{confirmLink}}
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px 40px;">
+              <p style="margin:0;font-size:12px;color:#74807e;">
+                If you didn't ask for this, you can ignore this email. Your account keeps the address it has now. Once confirmed, every signed-in session is signed out and you sign in again with the new address.
+              </p>
+            </td>
+          </tr>
+          {{brandFooter}}
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
