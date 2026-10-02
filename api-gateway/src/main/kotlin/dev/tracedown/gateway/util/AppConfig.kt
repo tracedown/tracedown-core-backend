@@ -27,9 +27,11 @@ data class UriConfig(
     val appUrl: String,
     val invite: String,
     val passwordReset: String,
+    val emailChange: String,
 ) {
     fun inviteUrl(token: String): String = "$appUrl$invite/$token"
     fun passwordResetUrl(token: String): String = "$appUrl$passwordReset/$token"
+    fun emailChangeUrl(token: String): String = "$appUrl$emailChange/$token"
 }
 
 data class SeedConfig(
@@ -51,6 +53,7 @@ data class PlatformConfig(
     val defaultGroups: List<DefaultGroupConfig>,
     val trustedDomainMode: Boolean,
     val allowProfileEdit: Boolean,
+    val allowEmailChange: Boolean,
     val allowAccountClosure: Boolean,
     val metricsPublicUrl: String,
     /** Public base URL agents enrol against (`GATEWAY_PUBLIC_URL`); blank when unset. */
@@ -153,6 +156,7 @@ data class AppConfig(
                         appUrl = processUri(config.property("platform.uri.appUrl").getString()),
                         invite = processUri(config.property("platform.uri.invite").getString()),
                         passwordReset = processUri(config.property("platform.uri.passwordReset").getString()),
+                        emailChange = processUri(config.property("platform.uri.emailChange").getString()),
                     ),
                     aesKey = config.property("platform.aesKey").getString(),
                     singleOrgMode = config.property("platform.singleOrgMode").getString().toBoolean(),
@@ -163,6 +167,7 @@ data class AppConfig(
                     defaultGroups = loadDefaultGroups(config),
                     trustedDomainMode = config.property("platform.trustedDomainMode").getString().toBoolean(),
                     allowProfileEdit = config.property("platform.allowProfileEdit").getString().toBoolean(),
+                    allowEmailChange = config.property("platform.allowEmailChange").getString().toBoolean(),
                     allowAccountClosure = config.property("platform.allowAccountClosure").getString().toBoolean(),
                     metricsPublicUrl = config.property("platform.metricsPublicUrl").getString(),
                     publicUrl = config.property("platform.publicUrl").getString(),

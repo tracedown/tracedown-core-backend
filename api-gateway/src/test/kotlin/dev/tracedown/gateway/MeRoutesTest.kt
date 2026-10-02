@@ -4,6 +4,7 @@ import at.favre.lib.crypto.bcrypt.BCrypt
 import com.typesafe.config.ConfigFactory
 import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.OrgAuditLog
+import org.jetbrains.exposed.v1.core.and
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.Organizations
@@ -26,6 +27,9 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import dev.tracedown.common.models.EmailChangeRequests
+import org.junit.jupiter.api.Assertions.assertNull
+import kotlinx.serialization.json.boolean
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.insert
@@ -105,6 +109,9 @@ class MeRoutesTest {
                 // The export endpoint shares the strict auth tier; keep the
                 // suite's repeated calls from tripping it.
                 "rateLimit.enabled" to "false",
+                // Off by default; this suite is about what it does when on.
+                // EmailChangeDisabledTest covers the default.
+                "platform.allowEmailChange" to "true",
             ))
             val mergedConfig = overrides.withFallback(ConfigFactory.load())
 
@@ -406,8 +413,38 @@ class MeRoutesTest {
 
     // ── Email change ──
 
+    /**
+     * The mails the gateway queued, newest FIRST (the publisher pushes to the
+     * head of the list email-service consumes). Each is a JSON job.
+     */
+    private fun queuedMails(): List<JsonObject> {
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        return redis.use { conn ->
+            conn.sync().lrange("email_queue", 0, -1).map { Json.parseToJsonElement(it).jsonObject }
+        }
+    }
+
+    private fun newestMail(to: String, type: String? = null): JsonObject? = queuedMails().firstOrNull {
+        it["to"]?.jsonPrimitive?.content == to && (type == null || it["type"]?.jsonPrimitive?.content == type)
+    }
+
+    /** The confirmation token in the newest change-request mail sent to [address]. */
+    private fun confirmTokenFor(address: String): String {
+        val mail = newestMail(address, "system.email-change")
+            ?: throw AssertionError("no confirmation mail queued for $address")
+        return mail["vars"]!!.jsonObject["confirmLink"]!!.jsonPrimitive.content.substringAfterLast("/confirm-email/")
+    }
+
+    private fun userIdOf(email: String): UUID = transaction { Users.selectAll().where { Users.email eq email }.first()[Users.id] }
+
+    private fun request(token: String, newEmail: String, password: String): Pair<Int, String> =
+        post("/api/v1/me/email", """{"newEmail":"$newEmail","currentPassword":"$password"}""", token)
+
+    private fun confirm(token: String): Pair<Int, String> =
+        post("/api/v1/me/email/confirm", """{"token":"$token"}""")
+
     @Test
-    fun `email change updates the profile and revokes other sessions`() {
+    fun `an email change is written only when the new address confirms it, and then signs every session out`() {
         val otherToken = login(CHANGE_USER_EMAIL, CHANGE_USER_PASSWORD)
         val currentToken = login(CHANGE_USER_EMAIL, CHANGE_USER_PASSWORD)
 
@@ -417,21 +454,52 @@ class MeRoutesTest {
             """{"newEmail":"$newEmail","currentPassword":"$CHANGE_USER_PASSWORD"}""",
             currentToken,
         )
-        assertEquals(200, status, "Change response: $raw")
-        assertEquals(newEmail, json(raw)["email"]!!.jsonPrimitive.content)
+        assertEquals(200, status, "Request response: $raw")
+        assertEquals(newEmail, json(raw)["newEmail"]!!.jsonPrimitive.content)
 
-        // The calling session survives; every other session is revoked.
-        assertEquals(200, get("/api/v1/auth/me", currentToken).first)
+        // Nothing has changed yet: the old address signs in, the new one does not,
+        // and both sessions are still live.
+        assertEquals(CHANGE_USER_EMAIL, json(get("/api/v1/auth/me", currentToken).second)["user"]!!.jsonObject["email"]!!.jsonPrimitive.content)
+        assertEquals(200, get("/api/v1/auth/me", otherToken).first)
+        assertEquals(401, post("/api/v1/auth/login", """{"email":"$newEmail","password":"$CHANGE_USER_PASSWORD"}""").first)
+
+        // The new address got the link — and nothing the account typed, since
+        // the recipient may be a stranger; the old one got a notice with no
+        // link in it.
+        val toNew = newestMail(newEmail)!!
+        assertEquals("system.email-change", toNew["type"]?.jsonPrimitive?.content)
+        assertNull(toNew["vars"]!!.jsonObject["userName"], "no account-chosen text in mail to an unknown address")
+        val toOld = newestMail(CHANGE_USER_EMAIL)!!
+        assertEquals("system.email-change-notice", toOld["type"]?.jsonPrimitive?.content)
+        assertEquals(newEmail, toOld["vars"]!!.jsonObject["newEmail"]!!.jsonPrimitive.content)
+        assertNull(toOld["vars"]!!.jsonObject["confirmLink"], "the old address must not be able to confirm")
+
+        // Following the link writes the change and ends every session.
+        val (confirmStatus, confirmRaw) = confirm(confirmTokenFor(newEmail))
+        assertEquals(200, confirmStatus, "Confirm response: $confirmRaw")
+        assertEquals(newEmail, json(confirmRaw)["email"]!!.jsonPrimitive.content)
+        assertEquals(401, get("/api/v1/auth/me", currentToken).first)
         assertEquals(401, get("/api/v1/auth/me", otherToken).first)
 
-        // The new email is the login identity now.
-        val freshToken = login(newEmail, CHANGE_USER_PASSWORD)
-        assertNotNull(freshToken)
+        // The old address is told it went through; the change is on the record
+        // of the organization the account is in.
+        assertEquals("system.email-changed", newestMail(CHANGE_USER_EMAIL)!!["type"]?.jsonPrimitive?.content)
+        val userId = userIdOf(newEmail)
+        val audited = transaction {
+            OrgAuditLog.selectAll().where { (OrgAuditLog.userId eq userId) and (OrgAuditLog.action eq "update.email") }.count()
+        }
+        assertEquals(1, audited)
+
+        // The new email is the login identity now, the old one is nobody's, and the link is spent.
+        assertNotNull(login(newEmail, CHANGE_USER_PASSWORD))
+        assertEquals(401, post("/api/v1/auth/login", """{"email":"$CHANGE_USER_EMAIL","password":"$CHANGE_USER_PASSWORD"}""").first)
+        assertEquals(400, confirm(confirmTokenFor(newEmail)).first)
     }
 
     @Test
-    fun `email change rejects a wrong password`() {
+    fun `email change rejects a wrong password, and mails nothing`() {
         val token = login(TAKEN_EMAIL, "Taken12345!")
+        val before = queuedMails().size
         val (status, raw) = post(
             "/api/v1/me/email",
             """{"newEmail":"nope@tracedown.dev","currentPassword":"WrongPass123!"}""",
@@ -439,6 +507,7 @@ class MeRoutesTest {
         )
         assertEquals(400, status)
         assertEquals("incorrect_password", json(raw)["error"]!!.jsonPrimitive.content)
+        assertEquals(before, queuedMails().size)
     }
 
     @Test
@@ -452,6 +521,174 @@ class MeRoutesTest {
         )
         assertEquals(400, status)
         assertEquals("email_taken", json(raw)["error"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `an address taken between the request and the link is refused at the link`() {
+        val email = "race-${UUID.randomUUID()}@tracedown.dev"
+        val password = "RaceTest123!"
+        transaction { createUser(email, password) }
+        val token = login(email, password)
+        val wanted = "wanted-${UUID.randomUUID()}@tracedown.dev"
+        assertEquals(200, post("/api/v1/me/email", """{"newEmail":"$wanted","currentPassword":"$password"}""", token).first)
+
+        // Somebody else gets there first.
+        transaction { createUser(wanted, "Other12345!") }
+
+        val (status, raw) = confirm(confirmTokenFor(wanted))
+        assertEquals(400, status)
+        assertEquals("email_taken", json(raw)["error"]!!.jsonPrimitive.content)
+        assertEquals(email, json(get("/api/v1/auth/me", token).second)["user"]!!.jsonObject["email"]!!.jsonPrimitive.content, "unchanged")
+    }
+
+    @Test
+    fun `a second request supersedes the first and is rate limited`() {
+        val email = "again-${UUID.randomUUID()}@tracedown.dev"
+        val password = "AgainTest123!"
+        transaction { createUser(email, password) }
+        val token = login(email, password)
+        val first = "first-${UUID.randomUUID()}@tracedown.dev"
+        assertEquals(200, post("/api/v1/me/email", """{"newEmail":"$first","currentPassword":"$password"}""", token).first)
+        val firstToken = confirmTokenFor(first)
+
+        // A second one straight away is too soon — and says so by name, before
+        // the password is looked at.
+        val second = "second-${UUID.randomUUID()}@tracedown.dev"
+        val (tooSoon, tooSoonRaw) = request(token, second, "not-even-checked")
+        assertEquals(429, tooSoon)
+        assertEquals("email_change_cooldown", json(tooSoonRaw)["error"]!!.jsonPrimitive.content)
+
+        // …so age the first; the second then supersedes it.
+        transaction {
+            EmailChangeRequests.update({ EmailChangeRequests.userId eq Users.selectAll().where { Users.email eq email }.first()[Users.id] }) {
+                it[createdAt] = Instant.now().minusSeconds(120)
+            }
+        }
+        assertEquals(200, post("/api/v1/me/email", """{"newEmail":"$second","currentPassword":"$password"}""", token).first)
+        assertEquals(400, confirm(firstToken).first, "the earlier link is dead")
+        assertEquals(200, confirm(confirmTokenFor(second)).first)
+        assertNotNull(login(second, password))
+    }
+
+    @Test
+    fun `an unknown or expired link changes nothing`() {
+        assertEquals(400, confirm("never-issued").first)
+
+        val email = "late-${UUID.randomUUID()}@tracedown.dev"
+        val password = "LateTest123!"
+        transaction { createUser(email, password) }
+        val token = login(email, password)
+        val wanted = "late-wanted-${UUID.randomUUID()}@tracedown.dev"
+        assertEquals(200, post("/api/v1/me/email", """{"newEmail":"$wanted","currentPassword":"$password"}""", token).first)
+        transaction {
+            EmailChangeRequests.update({ EmailChangeRequests.newEmail eq wanted }) { it[expiresAt] = Instant.now().minusSeconds(1) }
+        }
+
+        val (status, raw) = confirm(confirmTokenFor(wanted))
+        assertEquals(400, status)
+        assertEquals("invalid_token", json(raw)["error"]!!.jsonPrimitive.content)
+        assertEquals(200, get("/api/v1/auth/me", token).first, "the session is untouched")
+    }
+
+    @Test
+    fun `one address is mailed at most three times an hour, whoever asks`() {
+        val wanted = "popular-${UUID.randomUUID()}@tracedown.dev"
+        val password = "Popular123!"
+        val tokens = (1..4).map {
+            val email = "asker-$it-${UUID.randomUUID()}@tracedown.dev"
+            transaction { createUser(email, password) }
+            login(email, password)
+        }
+        tokens.take(3).forEach { assertEquals(200, request(it, wanted, password).first) }
+
+        val (status, raw) = request(tokens[3], wanted, password)
+        assertEquals(429, status)
+        assertEquals("email_change_cooldown", json(raw)["error"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a password change voids the pending request`() {
+        val email = "cancel-${UUID.randomUUID()}@tracedown.dev"
+        val password = "Cancel12345!"
+        transaction { createUser(email, password) }
+        val token = login(email, password)
+        val wanted = "cancel-wanted-${UUID.randomUUID()}@tracedown.dev"
+        assertEquals(200, request(token, wanted, password).first)
+        val link = confirmTokenFor(wanted)
+
+        // The holder reads the notice and does what it says.
+        val (status, raw) = post(
+            "/api/v1/auth/change-password",
+            """{"currentPassword":"$password","newPassword":"Changed12345!"}""",
+            token,
+        )
+        assertEquals(200, status, raw)
+
+        assertEquals(400, confirm(link).first, "the link minted under the old password is dead")
+        assertEquals(email, json(get("/api/v1/auth/me", token).second)["user"]!!.jsonObject["email"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a password reset voids the pending request`() {
+        val email = "reset-${UUID.randomUUID()}@tracedown.dev"
+        val password = "Reset12345!"
+        transaction { createUser(email, password) }
+        val token = login(email, password)
+        val wanted = "reset-wanted-${UUID.randomUUID()}@tracedown.dev"
+        assertEquals(200, request(token, wanted, password).first)
+        val link = confirmTokenFor(wanted)
+
+        assertEquals(200, post("/api/v1/auth/password-reset", """{"email":"$email"}""").first)
+        val resetMail = newestMail(email, "system.password-reset")!!
+        val resetToken = resetMail["vars"]!!.jsonObject["resetLink"]!!.jsonPrimitive.content.substringAfterLast("/")
+        assertEquals(200, post("/api/v1/auth/password-reset/confirm", """{"token":"$resetToken","newPassword":"Reset67890!"}""").first)
+
+        assertEquals(400, confirm(link).first)
+        assertNotNull(login(email, "Reset67890!"), "still the same address")
+    }
+
+    @Test
+    fun `an account switched off or closed after asking cannot be moved by its link`() {
+        val email = "off-${UUID.randomUUID()}@tracedown.dev"
+        val password = "OffTest12345!"
+        val userId = transaction { createUser(email, password) }
+        val token = login(email, password)
+        val wanted = "off-wanted-${UUID.randomUUID()}@tracedown.dev"
+        assertEquals(200, request(token, wanted, password).first)
+        val link = confirmTokenFor(wanted)
+
+        transaction { Users.update({ Users.id eq userId }) { it[isActive] = false } }
+        assertEquals(400, confirm(link).first)
+        assertEquals(email, transaction { Users.selectAll().where { Users.id eq userId }.first()[Users.email] })
+
+        // Closed and reclaimed by a new signup: nothing of the old request survives.
+        transaction {
+            Users.update({ Users.id eq userId }) { it[isActive] = true; it[deleted] = true; it[deletedAt] = Instant.now() }
+            dev.tracedown.common.onboarding.AccountService.reclaimSoftDeleted(email, "Fresh12345!", "fresh")
+        }
+        assertEquals(400, confirm(link).first)
+        assertEquals(0L, transaction { EmailChangeRequests.selectAll().where { EmailChangeRequests.userId eq userId }.count() })
+    }
+
+    @Test
+    fun `an address held by a closed, not yet purged account is taken`() {
+        val closed = "closed-${UUID.randomUUID()}@tracedown.dev"
+        transaction {
+            val id = createUser(closed, "Closed12345!")
+            Users.update({ Users.id eq id }) { it[deleted] = true; it[deletedAt] = Instant.now() }
+        }
+        val token = login(TAKEN_EMAIL, "Taken12345!")
+
+        val (status, raw) = request(token, closed, "Taken12345!")
+        assertEquals(400, status)
+        assertEquals("email_taken", json(raw)["error"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `the profile capabilities say the install allows it`() {
+        val token = login(TAKEN_EMAIL, "Taken12345!")
+        val caps = json(get("/api/v1/auth/profile/capabilities", token).second)
+        assertTrue(caps["allowEmailChange"]!!.jsonPrimitive.boolean)
     }
 
     // ── Account closure gate ──
@@ -507,7 +744,7 @@ class MeRoutesTest {
             """{"newEmail":"totp-changed@tracedown.dev","currentPassword":"$TOTP_CHANGE_USER_PASSWORD","code":"$code"}""",
             token,
         )
-        assertEquals(200, status, "Change response: $raw")
-        assertEquals("totp-changed@tracedown.dev", json(raw)["email"]!!.jsonPrimitive.content)
+        assertEquals(200, status, "Request response: $raw")
+        assertEquals("totp-changed@tracedown.dev", json(raw)["newEmail"]!!.jsonPrimitive.content)
     }
 }
