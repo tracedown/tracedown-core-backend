@@ -1,6 +1,7 @@
 package dev.tracedown.common.onboarding
 
 import dev.tracedown.common.config.DeletionRetention
+import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Sessions
@@ -218,7 +219,7 @@ object AccountLifecycle {
      * collide) but wiping everything of the prior owner. It is reset to exactly
      * the clean stub a first-time invite creates: no password, no 2FA, no
      * preferences, inactive until acceptance. The credential + display name are
-     * set later by the invite-accept flow; the prior owner's 2FA recovery codes
+     * set later by the invite-accept flow; the prior owner's API keys, 2FA recovery codes
      * and any live sessions are hard-deleted here.
      *
      * Runs in the caller's transaction. No-op if the account no longer exists.
@@ -243,7 +244,26 @@ object AccountLifecycle {
             it[purgeAfter] = null
             it[createdAt] = Instant.now()
         }
+        wipePriorHolder(userId)
+    }
+
+    /**
+     * Everything a prior holder of an account id could still be reached by,
+     * or that would show up as the new holder's: recovery codes, sessions, and
+     * API keys — a key acts as the account, so it is the prior holder's too,
+     * and left in place it would appear in the new holder's list and export
+     * and count against their cap. Every path that hands a soft-deleted
+     * account to a new person calls this. Runs in the caller's transaction.
+     */
+    fun wipePriorHolder(userId: UUID) {
         TotpRecoveryCodes.deleteWhere { TotpRecoveryCodes.userId eq userId }
         Sessions.deleteWhere { Sessions.userId eq userId }
+        val now = Instant.now()
+        ApiKeys.update({ (ApiKeys.createdBy eq userId) and (ApiKeys.deleted eq false) }) {
+            it[revoked] = true
+            it[deleted] = true
+            it[deletedAt] = now
+            it[purgeAfter] = DeletionRetention.purgeAfter(now)
+        }
     }
 }

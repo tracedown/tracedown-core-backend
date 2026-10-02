@@ -26,6 +26,8 @@ object OrgAuditLog : Table("org_audit_log") {
     val entityDisplayName = varchar("entity_display_name", 256).nullable()
     val diff = jsonb<JsonElement>("diff", Json.Default).nullable()
     val comment = text("comment").nullable()
+    /** The API key the action came through, when it came through one. Not a foreign key: the entry outlives the key. */
+    val apiKeyId = javaUUID("api_key_id").nullable()
     val createdAt = timestamp("created_at")
 
     override val primaryKey = PrimaryKey(id)

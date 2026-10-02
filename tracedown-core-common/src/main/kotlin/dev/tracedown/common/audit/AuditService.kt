@@ -59,6 +59,9 @@ object AuditService {
             it[OrgAuditLog.entityDisplayName] = entityDisplayName
             it[OrgAuditLog.diff] = diff?.let { d -> Json.parseToJsonElement(d) }
             it[OrgAuditLog.comment] = comment
+            // The actor is always the user; when they acted through an API key,
+            // the key is recorded beside them.
+            it[apiKeyId] = AuditActor.currentApiKeyId()
             it[createdAt] = Instant.now()
         }
     }

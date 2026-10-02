@@ -81,8 +81,7 @@ object AccountService {
             it[purgeAfter] = null
             it[createdAt] = Instant.now()              // fresh purge-grace window
         }
-        TotpRecoveryCodes.deleteWhere { TotpRecoveryCodes.userId eq userId }
-        Sessions.deleteWhere { Sessions.userId eq userId }
+        AccountLifecycle.wipePriorHolder(userId)
         userId
     }
 

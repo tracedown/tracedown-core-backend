@@ -6,6 +6,7 @@ import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.ResourcePermissions
 import dev.tracedown.common.models.Sessions
 import dev.tracedown.common.models.Users
+import dev.tracedown.gateway.controllers.apikeys.ApiKeyController
 import kotlinx.serialization.json.JsonObject
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -30,15 +31,18 @@ import java.util.UUID
  * stored anywhere. The re-invite branch calls this too, which costs nothing and
  * covers rows soft-deleted before this rule existed.
  *
- * Four things carry access, and all four go:
+ * Five things carry access, and all five go:
  *  - the org section columns (plus the open extension-section map),
  *  - group memberships,
  *  - direct resource grants (they key on this row's id with no FK cascade, so
  *    they would otherwise linger forever — the purge job never clears them),
- *  - **any live session still scoped to this organization** (see [unbindSessions]).
+ *  - **any live session still scoped to this organization** (see [unbindSessions]),
+ *  - the member's API keys in this organization. They act as the member, so
+ *    they are already unusable once the membership is gone; revoking them is
+ *    what stops a re-invite handing the old credentials back.
  *
  * The cached permission blob is dropped with them; it is derived state and would
- * otherwise be the fourth copy of the same authority.
+ * otherwise be one more copy of the same authority.
  */
 internal object MembershipAccess {
 
@@ -65,7 +69,10 @@ internal object MembershipAccess {
             it[permissionCache] = null
         }
 
-        if (userId != null) unbindSessions(orgId, userId)
+        if (userId != null) {
+            unbindSessions(orgId, userId)
+            ApiKeyController.revokeAllFor(orgId, userId)
+        }
     }
 
     /**
