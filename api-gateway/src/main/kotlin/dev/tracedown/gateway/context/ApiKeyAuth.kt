@@ -136,6 +136,22 @@ internal object ApiKeyAuth {
         )
     }
 
+    /**
+     * Refuses a request to the key-authenticated API that carries no key at
+     * all — no `Authorization` header, or a blank bearer — and counts it
+     * against its address exactly as a token that names no key is counted. A
+     * flood without credentials costs no lookup either way, but uncounted it
+     * would never meet the address's limit; counted, it meets
+     * `too_many_unknown_keys` as a flood of made-up keys does. Throws
+     * [refusal] while the address is within its limit.
+     */
+    fun refuseWithoutKey(call: ApplicationCall, refusal: UnauthorizedException): Nothing {
+        val clientIp = call.clientIp()
+        ApiRateLimit.unknownTokens(clientIp)?.takeIf { !it.allowed }?.let { refuseAddress(call, it) }
+        ApiRateLimit.recordUnknownToken(clientIp)
+        throw refusal
+    }
+
     private fun refuseAddress(call: ApplicationCall, spent: RateLimiter.RateLimitResult): Nothing {
         // Retry-After alone: the X-RateLimit headers describe a key's budget,
         // and this refusal is not about the key.

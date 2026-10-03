@@ -7,7 +7,6 @@ import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 
 /**
- * @OpenAPITag Key
  * The calling API key.
  */
 fun Route.keyRoutes() {

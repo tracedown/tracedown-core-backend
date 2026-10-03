@@ -1,48 +1,51 @@
 package dev.tracedown.gateway.controllers.orgs
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.buildJsonObject
-import dev.tracedown.common.realtime.RealtimePublisher
-
 import dev.tracedown.common.audit.AuditService
-import dev.tracedown.common.auth.AccessLevel
 import dev.tracedown.common.audit.auditDiff
+import dev.tracedown.common.auth.AccessLevel
 import dev.tracedown.common.auth.PermissionCacheService
+import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
+import dev.tracedown.common.models.OrgGroups
+import dev.tracedown.common.models.OrgUserGroups
+import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.OutboxEmit
+import dev.tracedown.common.models.Users
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.common.pfs.toPage
-import dev.tracedown.common.models.OrgGroups
-import dev.tracedown.common.models.OrgUserGroups
-import dev.tracedown.common.models.OrgUsers
-import dev.tracedown.common.models.Users
+import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.gateway.data.orgs.GroupMember
 import dev.tracedown.gateway.data.orgs.GroupSummary
+import dev.tracedown.gateway.data.orgs.PublicGroupSummary
 import dev.tracedown.gateway.data.orgs.UpdateGroupRequest
-import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
-import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.GrantPolicy
+import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.orgGroupSections
 import dev.tracedown.gateway.util.requireGrantable
 import dev.tracedown.gateway.util.requireGroupGrantable
 import dev.tracedown.gateway.util.requireOrgPolicyWrite
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
+import java.util.UUID
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.count
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
-import java.util.UUID
 
 object GroupController {
 
@@ -87,8 +90,39 @@ object GroupController {
 
             val query = OrgGroups.selectAll()
                 .where { OrgGroups.organizationId eq orgId }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(pfs, listOf(OrgGroups.name to SortOrder.ASC, OrgGroups.id to SortOrder.ASC))
             val items = pagedQuery.map { row -> groupSummaryFromRow(row) }
+            Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /**
+     * The organization's groups as a directory: id, name and size, so a caller
+     * can find the id it grants access to — nothing of the organization
+     * permissions a group carries. Same `users` read as [listGroups].
+     */
+    fun groupDirectory(orgId: UUID, requestingUserId: UUID, pfs: PfsParams): Page<PublicGroupSummary> {
+        return transaction {
+            requireOrgRead(orgId, requestingUserId) { it.users }
+
+            val query = OrgGroups.select(OrgGroups.id, OrgGroups.name)
+                .where { OrgGroups.organizationId eq orgId }
+            val (pagedQuery, total) = query.applyPfs(pfs, listOf(OrgGroups.name to SortOrder.ASC, OrgGroups.id to SortOrder.ASC))
+            val rows = pagedQuery.toList()
+            // Every group's size in one query, not one per group.
+            val members = OrgUserGroups.orgUserId.count()
+            val counts = if (rows.isEmpty()) emptyMap() else OrgUserGroups
+                .select(OrgUserGroups.orgGroupId, members)
+                .where { OrgUserGroups.orgGroupId inList rows.map { it[OrgGroups.id] } }
+                .groupBy(OrgUserGroups.orgGroupId)
+                .associate { it[OrgUserGroups.orgGroupId] to it[members].toInt() }
+            val items = rows.map { row ->
+                PublicGroupSummary(
+                    id = row[OrgGroups.id].toString(),
+                    name = row[OrgGroups.name],
+                    memberCount = counts[row[OrgGroups.id]] ?: 0,
+                )
+            }
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }

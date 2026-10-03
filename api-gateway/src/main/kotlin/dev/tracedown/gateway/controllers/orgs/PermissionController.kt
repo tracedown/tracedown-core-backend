@@ -1,30 +1,27 @@
 package dev.tracedown.gateway.controllers.orgs
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.buildJsonObject
-import dev.tracedown.common.config.DeletionRetention
-import dev.tracedown.common.realtime.RealtimePublisher
-
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.OrgPermissions
 import dev.tracedown.common.auth.PermissionCacheService
+import dev.tracedown.common.config.DeletionRetention
+import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.OrgGroups
 import dev.tracedown.common.models.OrgUserGroups
-import dev.tracedown.common.onboarding.AccountLifecycle
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.ResourcePermissions
 import dev.tracedown.common.models.Users
+import dev.tracedown.common.onboarding.AccountLifecycle
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.common.pfs.applyPfs
+import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.gateway.data.orgs.OrgSectionPermissions
 import dev.tracedown.gateway.data.orgs.OrgUserSummary
 import dev.tracedown.gateway.data.orgs.PermissionSet
+import dev.tracedown.gateway.data.orgs.PublicMemberSummary
 import dev.tracedown.gateway.data.orgs.ResourceGrant
 import dev.tracedown.gateway.data.orgs.UpdatePermissionsRequest
-import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
@@ -33,7 +30,13 @@ import dev.tracedown.gateway.util.orgUserSections
 import dev.tracedown.gateway.util.requireGrantable
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
+import java.time.Instant
+import java.util.UUID
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
@@ -43,12 +46,13 @@ import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
-import java.time.Instant
-import java.util.UUID
 
 object PermissionController {
 
     private val validResourceTypes = setOf("workspace", "project", "service")
+
+    /** The order members are listed in when the caller asks for none: by name, then by account. */
+    private val MEMBER_ORDER = listOf(Users.displayName to SortOrder.ASC, Users.id to SortOrder.ASC)
 
     /** Lists active organization members with their section levels. Requires users.read. */
     fun listUsers(orgId: UUID, requestingUserId: UUID, pfs: PfsParams): Page<OrgUserSummary> {
@@ -70,7 +74,7 @@ object PermissionController {
                     (OrgUsers.deleted eq false)
                 }
 
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(pfs, MEMBER_ORDER)
             val rows = pagedQuery.toList()
 
             val orgUserIds = rows.map { it[OrgUsers.id] }
@@ -103,6 +107,36 @@ object PermissionController {
                 )
             }
 
+            Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /**
+     * The organization's members as a directory: who each one is and whether
+     * they are enabled, so a caller can find the id it grants access to —
+     * nothing of the permissions they hold. Every member but those still
+     * invited, disabled ones included. Same `users` read as [listUsers].
+     */
+    fun memberDirectory(orgId: UUID, requestingUserId: UUID, pfs: PfsParams): Page<PublicMemberSummary> {
+        return transaction {
+            requireOrgRead(orgId, requestingUserId) { it.users }
+            val query = OrgUsers
+                .join(Users, JoinType.INNER, OrgUsers.userId, Users.id)
+                .selectAll()
+                .where {
+                    (OrgUsers.organizationId eq orgId) and
+                    (OrgUsers.status neq "invited") and
+                    (OrgUsers.deleted eq false)
+                }
+            val (pagedQuery, total) = query.applyPfs(pfs, MEMBER_ORDER)
+            val items = pagedQuery.map { row ->
+                PublicMemberSummary(
+                    userId = row[OrgUsers.userId].toString(),
+                    displayName = row[Users.displayName],
+                    email = row[Users.email],
+                    isActive = row[OrgUsers.isActive],
+                )
+            }
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }

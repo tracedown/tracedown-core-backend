@@ -263,7 +263,8 @@ object AccountLifecycle {
             it[revoked] = true
             it[deleted] = true
             it[deletedAt] = now
-            it[purgeAfter] = DeletionRetention.purgeAfter(now)
+            // Never later than a purge date a key already has.
+            it[purgeAfter] = DeletionRetention.earliestPurge(ApiKeys.purgeAfter, DeletionRetention.purgeAfter(now))
         }
     }
 }

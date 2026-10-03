@@ -12,12 +12,27 @@ import java.util.UUID
  * Applies full PFS pipeline: filters → count → sort → paginate.
  * Returns the paginated query and the total count (before pagination).
  */
-fun Query.applyPfs(params: PfsParams): Pair<Query, Long> {
+fun Query.applyPfs(params: PfsParams): Pair<Query, Long> = applyPfs(params, emptyList())
+
+/**
+ * As [applyPfs], ordering by [defaultOrder] when [params] carry no sorters —
+ * so a list asked for without an order still comes back in the same order
+ * every time, and its pages neither repeat nor skip rows. End it with a
+ * unique column (the id) so ties cannot reorder.
+ */
+fun Query.applyPfs(params: PfsParams, defaultOrder: List<Pair<Expression<*>, SortOrder>>): Pair<Query, Long> {
     applyFilters(params)
     val total = this.count()
     applySorters(params)
+    applyDefaultOrder(params, defaultOrder)
     this.limit(params.limit).offset(params.offset)
     return this to total
+}
+
+/** Orders by [order] when [params] carry no sorters; see [applyPfs]. Mutates in place. */
+fun Query.applyDefaultOrder(params: PfsParams, order: List<Pair<Expression<*>, SortOrder>>): Query {
+    if (params.sorters.isEmpty() && order.isNotEmpty()) this.orderBy(*order.toTypedArray())
+    return this
 }
 
 /** Applies PFS filters to the query. Mutates in place. */
@@ -54,7 +69,7 @@ fun Query.applySorters(params: PfsParams): Query {
  */
 fun <T> List<T>.toPage(params: PfsParams): Page<T> {
     val total = this.size.toLong()
-    val start = params.offset.toInt().coerceAtMost(this.size)
+    val start = params.offset.coerceAtMost(this.size.toLong()).toInt()
     val end = (start + params.limit).coerceAtMost(this.size)
     val items = if (start < this.size) this.subList(start, end) else emptyList()
     return Page(items = items, total = total, page = params.page, pageSize = params.pageSize)

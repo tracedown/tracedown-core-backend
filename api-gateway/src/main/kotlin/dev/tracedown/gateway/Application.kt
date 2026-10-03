@@ -19,11 +19,13 @@ import dev.tracedown.gateway.cli.RewrapBodyStores
 import dev.tracedown.gateway.cli.RewrapOrgKeys
 import dev.tracedown.gateway.jobs.SecretReencryption
 import dev.tracedown.common.agents.DegradationRule
+import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.onboarding.OrgService
 import dev.tracedown.gateway.controllers.services.ServiceController
 import dev.tracedown.gateway.controllers.workspaces.WorkspaceController
 import dev.tracedown.gateway.routes.pingRoute
 import dev.tracedown.gateway.routes.publicapi.PublicApi
+import dev.tracedown.gateway.routes.publicapi.publicApiDescriptionRoute
 import dev.tracedown.gateway.routes.publicapi.publicApiRoutes
 import dev.tracedown.gateway.controllers.apikeys.ApiKeyController
 import dev.tracedown.gateway.util.ApiNamespace
@@ -80,6 +82,7 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.createApplicationPlugin
 import io.ktor.server.application.install
+import io.ktor.server.http.HttpRequestLifecycle
 import io.ktor.server.netty.EngineMain
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
@@ -106,6 +109,9 @@ import java.time.Instant
 import java.util.UUID
 
 private val log = LoggerFactory.getLogger("dev.tracedown.gateway.Application")
+
+/** What `Retry-After` says on a 503 `body_store_unavailable`. */
+private const val BODY_RETRY_AFTER_SECONDS = 10
 
 fun main(args: Array<String>) {
     if (AgentBootstrap.handle(args)) return
@@ -443,6 +449,12 @@ fun Application.module() {
         }
     }
 
+    // A client that closes its connection cancels its call, so a body read
+    // nobody is waiting for leaves the gate instead of finishing for nobody.
+    install(HttpRequestLifecycle) {
+        cancelCallOnClose = true
+    }
+
     install(StatusPages) {
         // A failed request validation is a 400 carrying the first error code, to
         // match the { "error": "<code>" } shape controllers already use.
@@ -466,6 +478,11 @@ fun Application.module() {
             // Most codes stand alone; the few that cannot carry `details` with
             // the specifics the client needs to say what is in the way.
             val details = cause.details
+            // A store that did not answer, or a full read gate, is worth
+            // asking again — after a pause, not at once.
+            if (cause.code == ErrorCodes.BODY_STORE_UNAVAILABLE) {
+                call.response.headers.append(HttpHeaders.RetryAfter, BODY_RETRY_AFTER_SECONDS.toString())
+            }
             if (details == null) {
                 call.respond(cause.status, mapOf("error" to cause.code))
             } else {
@@ -479,6 +496,14 @@ fun Application.module() {
         // request, not a server error — surface the neutral code.
         exception<dev.tracedown.common.pfs.PfsValidationException> { call, cause ->
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to cause.code))
+        }
+        // A request in the key-authenticated API that no route answers gets
+        // that API's error shape rather than an empty 404 (PublicApi rewrites
+        // the router's bare 404/405 the same way). The dashboard's is untouched.
+        unhandled { call ->
+            PublicApi.unmatched(call.request.local.uri, HttpStatusCode.NotFound)?.let { (status, code) ->
+                call.respond(status, mapOf("error" to code))
+            }
         }
         exception<Throwable> { call, cause ->
             log.error("Unhandled exception", cause)
@@ -578,7 +603,9 @@ fun Application.module() {
         systemAlertRoutes()
         notificationTemplateRoutes()
         apiKeyRoutes()
-        publicApiRoutes()
+        // The key-authenticated API, and its description beside it — outside
+        // its namespace, so a client can read it without a key.
+        publicApiDescriptionRoute(publicApiRoutes())
         resultRoutes()
         dashboardMetricsRoutes()
         usageRoutes()

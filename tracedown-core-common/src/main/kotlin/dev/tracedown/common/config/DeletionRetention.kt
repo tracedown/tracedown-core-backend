@@ -1,5 +1,11 @@
 package dev.tracedown.common.config
 
+import org.jetbrains.exposed.v1.core.Column
+import org.jetbrains.exposed.v1.core.CustomFunction
+import org.jetbrains.exposed.v1.core.Expression
+import org.jetbrains.exposed.v1.core.coalesce
+import org.jetbrains.exposed.v1.javatime.JavaInstantColumnType
+import org.jetbrains.exposed.v1.javatime.timestampLiteral
 import java.time.Instant
 
 /**
@@ -68,4 +74,18 @@ object DeletionRetention {
      */
     fun purgeAfter(deletedAt: Instant, extraGraceSeconds: Long = 0L): Instant =
         deletedAt.plusSeconds(maxOf(seconds(), extraGraceSeconds))
+
+    /**
+     * The value to write into a `purge_after` [column] when a row is deleted
+     * again, or deleted along with something else: [candidate], unless the
+     * row already has an earlier date — `LEAST(COALESCE(purge_after, c), c)`,
+     * in the same statement as the update, so no other writer can slip in
+     * between a read and the write. A delete never moves a row's purge LATER;
+     * a row an operator (or an earlier delete) set to go sooner still goes
+     * then.
+     */
+    fun earliestPurge(column: Column<Instant?>, candidate: Instant): Expression<Instant?> {
+        val at = timestampLiteral(candidate)
+        return CustomFunction("LEAST", JavaInstantColumnType(), coalesce(column, at), at)
+    }
 }

@@ -58,8 +58,18 @@ object CallAuthenticator {
     }
 
     private fun authenticate(call: ApplicationCall): ResolvedCaller {
+        // Classified on the canonical path, so an equivalent spelling of a path
+        // cannot move a request into the other namespace. A path that will not
+        // canonicalize belongs to neither.
+        val path = PathCanonicalizer.canonicalize(call.request.local.uri)
+        val public = path != null && ApiNamespace.isPublic(path)
+
         val header = call.request.headers["Authorization"]
-            ?: throw UnauthorizedException(ErrorCodes.MISSING_AUTH_HEADER)
+            ?: if (public) {
+                ApiKeyAuth.refuseWithoutKey(call, UnauthorizedException(ErrorCodes.MISSING_AUTH_HEADER))
+            } else {
+                throw UnauthorizedException(ErrorCodes.MISSING_AUTH_HEADER)
+            }
 
         val token = if (header.startsWith("Bearer ", ignoreCase = true)) {
             header.substring(7)
@@ -67,15 +77,14 @@ object CallAuthenticator {
             header
         }
 
-        if (token.isBlank()) throw UnauthorizedException()
+        if (token.isBlank()) {
+            if (public) ApiKeyAuth.refuseWithoutKey(call, UnauthorizedException())
+            throw UnauthorizedException()
+        }
 
-        // Classified on the canonical path, so an equivalent spelling of a path
-        // cannot move a request into the other namespace. A path that will not
-        // canonicalize belongs to neither.
-        val path = PathCanonicalizer.canonicalize(call.request.local.uri)
-            ?: throw UnauthorizedException()
+        if (path == null) throw UnauthorizedException()
 
-        return if (ApiNamespace.isPublic(path)) {
+        return if (public) {
             ApiKeyAuth.authenticate(call, token)
         } else {
             authenticateSession(token)

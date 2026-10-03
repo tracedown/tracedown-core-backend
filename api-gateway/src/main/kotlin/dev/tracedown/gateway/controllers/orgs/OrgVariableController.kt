@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.controllers.orgs
 
+import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.models.OrgVariables
@@ -25,6 +26,7 @@ import dev.tracedown.gateway.util.VariableRevealPolicy
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -46,10 +48,12 @@ object OrgVariableController {
 
             val query = OrgVariables.selectAll()
                 .where { (OrgVariables.organizationId eq orgId) and (OrgVariables.deleted eq false) }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(
+                pfs, listOf(OrgVariables.createdAt to SortOrder.ASC, OrgVariables.id to SortOrder.ASC),
+            )
             val items = pagedQuery.map { row ->
-                val masked = if (row[OrgVariables.secret]) "••••••••" else {
-                    if (row[OrgVariables.encrypted]) "••••••••" else row[OrgVariables.value]
+                val masked = if (row[OrgVariables.secret]) VariableCrypto.MASK else {
+                    if (row[OrgVariables.encrypted]) VariableCrypto.MASK else row[OrgVariables.value]
                 }
                 VariableSummary(
                     id = row[OrgVariables.id].toString(),
@@ -58,6 +62,7 @@ object OrgVariableController {
                     type = variableTypeName(row[OrgVariables.secret], row[OrgVariables.encrypted]),
                     createdAt = row[OrgVariables.createdAt].toString(),
                     updatedAt = row[OrgVariables.updatedAt].toString(),
+                    masked = row[OrgVariables.secret] || row[OrgVariables.encrypted],
                 )
             }
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
@@ -116,6 +121,7 @@ object OrgVariableController {
                 "resource.variable.created", "variable", id,
                 buildJsonObject { put("id", id.toString()); put("orgId", orgId.toString()); put("scope", "org"); put("parentId", orgId.toString()) },
             )
+            AuditService.log(orgId, userId, "create.variable", "variable", id.toString(), entityDisplayName = request.key, comment = "org $orgId")
             variableSummary(id)
         }
     }
@@ -190,6 +196,7 @@ object OrgVariableController {
                 "resource.variable.updated", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "org"); put("parentId", orgId.toString()) },
             )
+            AuditService.log(orgId, userId, "update.variable", "variable", varId.toString(), entityDisplayName = row[OrgVariables.key], comment = "org $orgId")
             variableSummary(varId)
         }
     }
@@ -199,6 +206,9 @@ object OrgVariableController {
         transaction {
             requireOrgWrite(orgId, userId) { it.settings }
 
+            val key = OrgVariables.selectAll()
+                .where { (OrgVariables.id eq varId) and (OrgVariables.organizationId eq orgId) and (OrgVariables.deleted eq false) }
+                .firstOrNull()?.get(OrgVariables.key)
             val now = Instant.now()
             val updated = OrgVariables.update({
                 (OrgVariables.id eq varId) and
@@ -214,6 +224,7 @@ object OrgVariableController {
                 "resource.variable.deleted", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "org"); put("parentId", orgId.toString()) },
             )
+            AuditService.log(orgId, userId, "delete.variable", "variable", varId.toString(), entityDisplayName = key, comment = "org $orgId")
         }
     }
 
@@ -221,7 +232,7 @@ object OrgVariableController {
         val row = OrgVariables.selectAll()
             .where { OrgVariables.id eq id }
             .first()
-        val masked = if (row[OrgVariables.secret] || row[OrgVariables.encrypted]) "••••••••" else row[OrgVariables.value]
+        val masked = if (row[OrgVariables.secret] || row[OrgVariables.encrypted]) VariableCrypto.MASK else row[OrgVariables.value]
         return VariableSummary(
             id = row[OrgVariables.id].toString(),
             key = row[OrgVariables.key],
@@ -229,6 +240,7 @@ object OrgVariableController {
             type = variableTypeName(row[OrgVariables.secret], row[OrgVariables.encrypted]),
             createdAt = row[OrgVariables.createdAt].toString(),
             updatedAt = row[OrgVariables.updatedAt].toString(),
+            masked = row[OrgVariables.secret] || row[OrgVariables.encrypted],
         )
     }
 }

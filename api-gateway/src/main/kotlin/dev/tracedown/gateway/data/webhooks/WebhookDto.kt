@@ -87,3 +87,17 @@ data class WebhookBindingSummary(
     val enabled: Boolean,
     val createdAt: String,
 )
+
+/**
+ * A webhook as the key-authenticated API lists it: enough to recognise it and
+ * bind it to a resource, and nothing of where it sends or what — the URL, body
+ * template and configuration may carry tokens, and are never in it.
+ */
+@Serializable
+data class PublicWebhookSummary(
+    val id: String,
+    val name: String,
+    val label: String?,
+    val method: String,
+    val createdAt: String,
+)

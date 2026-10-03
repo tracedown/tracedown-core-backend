@@ -1,73 +1,84 @@
 package dev.tracedown.gateway.controllers.services
 
-import dev.tracedown.common.config.DeletionRetention
-import dev.tracedown.common.interceptors.Injectable
-import dev.tracedown.common.interceptors.InterceptorContext
-import dev.tracedown.common.interceptors.Interceptors
+import dev.tracedown.common.agents.AgentVisibility
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
-import dev.tracedown.common.util.LineDiff
 import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWriteResource
-import dev.tracedown.gateway.util.ForbiddenException
-import dev.tracedown.gateway.util.VariableRevealPolicy
+import dev.tracedown.common.config.DeletionRetention
+import dev.tracedown.common.domain.DomainPolicy
+import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.interceptors.Injectable
+import dev.tracedown.common.interceptors.InterceptorContext
+import dev.tracedown.common.interceptors.Interceptors
+import dev.tracedown.common.models.OrgVariables
+import dev.tracedown.common.models.OutboxEmit
+import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
+import dev.tracedown.common.models.ProjectVariables
+import dev.tracedown.common.models.Projects
+import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ServiceVariables
+import dev.tracedown.common.models.Services
+import dev.tracedown.common.models.WorkspaceVariables
+import dev.tracedown.common.pfs.Page
+import dev.tracedown.common.pfs.PfsParams
+import dev.tracedown.common.pfs.applyDefaultOrder
+import dev.tracedown.common.pfs.applyFilters
+import dev.tracedown.common.pfs.applyPfs
+import dev.tracedown.common.pfs.applySorters
+import dev.tracedown.common.pfs.toPage
+import dev.tracedown.common.realtime.RealtimePublisher
+import dev.tracedown.common.util.LineDiff
+import dev.tracedown.common.variables.SystemVariableSeeder
+import dev.tracedown.common.variables.SystemVariables
+import dev.tracedown.common.variables.VariableLimits
+import dev.tracedown.gateway.controllers.metrics.DashboardMetricsController
+import dev.tracedown.gateway.data.CreateVariableRequest
+import dev.tracedown.gateway.data.UpdateVariableRequest
+import dev.tracedown.gateway.data.VariableSummary
+import dev.tracedown.gateway.data.parseVariableType
+import dev.tracedown.gateway.data.services.CreateServiceRequest
+import dev.tracedown.gateway.data.services.FailedAssertion
+import dev.tracedown.gateway.data.services.LastFailureInfo
+import dev.tracedown.gateway.data.services.SKIPPED_DETAIL_LIMIT
+import dev.tracedown.gateway.data.services.ScopedToggleResult
+import dev.tracedown.gateway.data.services.ScriptValidationError
+import dev.tracedown.gateway.data.services.ServiceSnapshot
+import dev.tracedown.gateway.data.services.ServiceSummary
+import dev.tracedown.gateway.data.services.SkippedService
+import dev.tracedown.gateway.data.services.ToggleServiceRequest
+import dev.tracedown.gateway.data.services.UpdateScriptRequest
+import dev.tracedown.gateway.data.services.UpdateServiceRequest
+import dev.tracedown.gateway.data.variableTypeName
+import dev.tracedown.gateway.util.ApiException
+import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.ConflictException
+import dev.tracedown.gateway.util.ForbiddenException
+import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.ResourceResolver
+import dev.tracedown.gateway.util.ScheduleNudge
+import dev.tracedown.gateway.util.ServiceContext
+import dev.tracedown.gateway.util.VariableCrypto
+import dev.tracedown.gateway.util.VariableRevealPolicy
+import dev.tracedown.gateway.util.fieldError
+import dev.tracedown.gateway.util.requireCachedPermissions
+import io.ktor.http.HttpStatusCode
+import java.time.Instant
+import java.time.temporal.ChronoUnit
+import java.util.UUID
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import dev.tracedown.common.models.ProbeAgents
-import dev.tracedown.common.models.ServiceAllowedAgents
-import org.jetbrains.exposed.v1.core.JoinType
-import dev.tracedown.common.domain.DomainPolicy
-import dev.tracedown.common.models.OrgVariables
-import dev.tracedown.common.models.OutboxEmit
-import dev.tracedown.common.models.WorkspaceVariables
-import dev.tracedown.common.models.ProjectVariables
-import dev.tracedown.common.models.Projects
-import dev.tracedown.common.models.Services
-import dev.tracedown.common.pfs.Page
-import dev.tracedown.common.pfs.PfsParams
-import dev.tracedown.common.pfs.applyFilters
-import dev.tracedown.common.pfs.applyPfs
-import dev.tracedown.common.pfs.applySorters
-import dev.tracedown.common.pfs.toPage
-import dev.tracedown.gateway.data.CreateVariableRequest
-import dev.tracedown.gateway.data.UpdateVariableRequest
-import dev.tracedown.gateway.data.VariableSummary
-import dev.tracedown.gateway.data.parseVariableType
-import dev.tracedown.gateway.controllers.metrics.DashboardMetricsController
-import dev.tracedown.gateway.data.services.CreateServiceRequest
-import dev.tracedown.gateway.data.services.ServiceSnapshot
-import dev.tracedown.gateway.data.services.FailedAssertion
-import dev.tracedown.gateway.data.services.LastFailureInfo
-import dev.tracedown.gateway.data.services.ScriptValidationError
-import dev.tracedown.gateway.data.services.ServiceSummary
-import dev.tracedown.gateway.data.services.ScopedToggleResult
-import dev.tracedown.gateway.data.services.SKIPPED_DETAIL_LIMIT
-import dev.tracedown.gateway.data.services.SkippedService
-import dev.tracedown.gateway.data.services.ToggleServiceRequest
-import dev.tracedown.gateway.data.services.UpdateScriptRequest
-import dev.tracedown.gateway.data.services.UpdateServiceRequest
-import dev.tracedown.gateway.data.variableTypeName
-import dev.tracedown.common.errors.ErrorCodes
-import dev.tracedown.common.variables.VariableLimits
-import dev.tracedown.common.variables.SystemVariables
-import dev.tracedown.gateway.util.BadRequestException
-import dev.tracedown.common.variables.SystemVariableSeeder
-import dev.tracedown.gateway.util.ConflictException
-import dev.tracedown.gateway.util.NotFoundException
-import dev.tracedown.gateway.util.ResourceResolver
-import dev.tracedown.gateway.util.ScheduleNudge
-import dev.tracedown.common.realtime.RealtimePublisher
-import dev.tracedown.gateway.util.ServiceContext
-import dev.tracedown.gateway.util.VariableCrypto
-import dev.tracedown.gateway.util.requireCachedPermissions
 import org.dmfs.rfc5545.recur.RecurrenceRule
+import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
@@ -77,8 +88,6 @@ import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
-import java.time.Instant
-import java.util.UUID
 
 object ServiceController {
 
@@ -119,6 +128,21 @@ object ServiceController {
      * scheduler when it receives the `probe:trigger` message.
      */
     fun triggerRun(orgId: UUID, serviceId: UUID, userId: UUID) {
+        triggerRun(orgId, serviceId, userId, refuseUnrunnable = false)
+    }
+
+    /**
+     * As [triggerRun]; with [refuseUnrunnable], a service the scheduler would
+     * not run is refused here instead of being queued for nothing: 409
+     * `script_missing` when it has no script, 409 `service_inactive` when it
+     * is switched off. Checked after the caller's access, so the answer never
+     * says anything about a service they may not run. Returns when the run
+     * was asked for.
+     */
+    fun triggerRun(orgId: UUID, serviceId: UUID, userId: UUID, refuseUnrunnable: Boolean): Instant {
+        // To the second: run start times are stored that way, and a `since`
+        // with a fraction would miss a run started in the same second.
+        val requestedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS)
         transaction {
             val ctx = ResourceResolver.resolveService(serviceId, orgId)
             val cached = requireCachedPermissions(orgId, userId)
@@ -128,9 +152,15 @@ object ServiceController {
                 .where { (Services.id eq serviceId) and (Services.deleted eq false) }
                 .firstOrNull() ?: throw NotFoundException()
 
+            if (refuseUnrunnable) {
+                if (svcRow[Services.script].isBlank()) throw ConflictException(ErrorCodes.SCRIPT_MISSING)
+                if (!svcRow[Services.isActive]) throw ConflictException(ErrorCodes.SERVICE_INACTIVE)
+            }
+
             AuditService.log(orgId, userId, "run.service", "service", serviceId.toString(), entityDisplayName = svcRow[Services.name])
         }
         publishTriggerRun(serviceId)
+        return requestedAt
     }
 
     /** Combined detail + recent probe points for the service live channel. */
@@ -143,9 +173,56 @@ object ServiceController {
     /** Creates a service inside a project. Requires write access to the project. */
     @Injectable("service.create")
     fun create(orgId: UUID, projectId: UUID, request: CreateServiceRequest, userId: UUID): ServiceSummary {
-        if (request.name.isBlank()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
-        if (request.name.length > 128) throw BadRequestException(ErrorCodes.FIELD_TOO_LONG)
+        if (request.name.isBlank()) throw fieldError("name", ErrorCodes.FIELD_REQUIRED)
+        if (request.name.length > 128) throw fieldError("name", ErrorCodes.FIELD_TOO_LONG)
+        // A script and an enabled state, when the create carries them, meet the
+        // checks a script save and an enable meet — refused before anything is
+        // written when they can be decided without the service.
+        if (request.script != null && request.script.isNotBlank()) {
+            validateScript(request.script).takeIf { it.isNotEmpty() }?.let { throw scriptRefused(it) }
+        }
+        if (request.isActive == true && request.script.isNullOrBlank()) {
+            throw fieldError("script", ErrorCodes.FIELD_REQUIRED)
+        }
 
+        // One transaction: the row, the script save and the switch commit
+        // together or not at all, so a refusal that only the saved service can
+        // decide (the unverified-domain policy, a host's enable gate) leaves
+        // nothing behind — no row, no audit entry, no outbox event. The script
+        // is saved, and the service switched, through the functions their own
+        // endpoints use; the nudge and the live updates go out once, after.
+        val (summary, workspaceId) = transaction {
+            val (created, workspaceId) = createRow(orgId, projectId, request, userId)
+            var summary = created
+            val id = UUID.fromString(created.id)
+            if (!request.script.isNullOrBlank()) {
+                summary = updateRow(
+                    orgId, id, UpdateServiceRequest(script = request.script, version = created.version), userId,
+                    // Switched on as a first save switches it on, unless the
+                    // create says otherwise — then not even for a moment.
+                    autoEnable = request.isActive != false,
+                ).first
+            }
+            if (request.isActive == true && !summary.isActive) {
+                summary = toggleRow(orgId, id, ToggleServiceRequest(true), userId)
+            }
+            summary to workspaceId
+        }
+        publishNudge(UUID.fromString(summary.id))
+        RealtimePublisher.publish("project:$projectId", orgId, "service.created",
+            buildJsonObject { put("serviceId", summary.id) })
+        // The workspace view shows per-project service counts — nudge it too.
+        RealtimePublisher.publish("workspace:$workspaceId", orgId, "project.updated",
+            buildJsonObject { put("projectId", projectId.toString()) })
+        return summary
+    }
+
+    /**
+     * Inserts the service row, inside the caller's transaction or a new one,
+     * with nothing sent outside the database. Returns the new service and its
+     * workspace.
+     */
+    private fun createRow(orgId: UUID, projectId: UUID, request: CreateServiceRequest, userId: UUID): Pair<ServiceSummary, UUID> {
         // Transaction-scoped: a registered before-hook can count existing
         // services and block atomically with the insert below.
         return Interceptors.injectableInTx(
@@ -186,16 +263,7 @@ object ServiceController {
                 "resource.service.created", "service", id,
                 buildJsonObject { put("id", id.toString()); put("orgId", orgId.toString()); put("parentId", projectId.toString()) },
             )
-
-            // The workspace view shows per-project service counts — nudge it too.
-            RealtimePublisher.publish("workspace:${pCtx.workspaceId}", orgId, "project.updated",
-                buildJsonObject { put("projectId", projectId.toString()) })
-
-            serviceSummary(id)
-        }.also {
-            publishNudge(UUID.fromString(it.id))
-            RealtimePublisher.publish("project:$projectId", orgId, "service.created",
-                buildJsonObject { put("serviceId", it.id) })
+            serviceSummary(id) to pCtx.workspaceId
         }
     }
 
@@ -217,6 +285,7 @@ object ServiceController {
                 .where { (Services.projectId eq projectId) and (Services.deleted eq false) }
             query.applyFilters(pfs)
             query.applySorters(pfs)
+            query.applyDefaultOrder(pfs, listOf(Services.createdAt to SortOrder.ASC, Services.id to SortOrder.ASC))
             query
                 .filter { canAccessResource(cached, "service", it[Services.id], parentChain) }
                 .map { serviceSummaryFromRow(it) }
@@ -299,14 +368,33 @@ object ServiceController {
      * `isActive` of the returned [ServiceSummary].
      */
     fun update(orgId: UUID, serviceId: UUID, request: UpdateServiceRequest, userId: UUID): ServiceSummary {
+        val (summary, projectId) = updateRow(orgId, serviceId, request, userId, autoEnable = true)
+        publishNudge(serviceId)
+        RealtimePublisher.publish("project:$projectId", orgId, "service.updated",
+            buildJsonObject { put("serviceId", serviceId.toString()) })
+        return summary
+    }
+
+    /**
+     * [update]'s work, inside the caller's transaction or a new one, with
+     * nothing sent outside the database. [autoEnable] false keeps a first save
+     * from switching the service on. Returns the service and its project.
+     */
+    private fun updateRow(
+        orgId: UUID,
+        serviceId: UUID,
+        request: UpdateServiceRequest,
+        userId: UUID,
+        autoEnable: Boolean,
+    ): Pair<ServiceSummary, UUID> {
         // A script write must say what it is replacing. Rejected before the
         // transaction: it is a malformed request, not a conflict.
         if (request.script != null && request.version == null) {
-            throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
+            throw fieldError("version", ErrorCodes.FIELD_REQUIRED)
         }
         // Parsing is pure and can be slow — keep it off the transaction.
-        if (request.script != null && validateScript(request.script).isNotEmpty()) {
-            throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        if (request.script != null) {
+            validateScript(request.script).takeIf { it.isNotEmpty() }?.let { throw scriptRefused(it) }
         }
 
         return transaction {
@@ -427,13 +515,13 @@ object ServiceController {
             // that is present and valid. A save carrying one has already been
             // parsed above, so only a config-only first save pays for the parse,
             // and only once in a service's life.
-            val autoEnable = currentVersion == 1 &&
+            val enableNow = autoEnable &&
+                currentVersion == 1 &&
                 !old[Services.isActive] &&
                 effectiveScript.isNotBlank() &&
                 (request.script != null || validateScript(effectiveScript).isEmpty())
 
             Services.update({ (Services.id eq serviceId) and (Services.projectId eq ctx.projectId) }) {
-                if (autoEnable) it[isActive] = true
                 request.name?.let { v -> it[name] = v }
                 request.label?.let { v -> it[label] = v }
                 request.schedule?.let { v -> it[schedule] = v }
@@ -467,14 +555,34 @@ object ServiceController {
                 )
             }
 
-            // Its own entry, under the same action the toggle endpoint writes:
+            // Switched on through the same hook the toggle endpoint runs, so a
+            // host that gates enabling sees this enable too. Its refusal keeps
+            // the save and leaves the service off — the save was asked for, the
+            // enable was not. Its own audit entry, under the toggle's action:
             // "who switched this on" has one answer wherever it was switched on.
-            if (autoEnable) {
-                AuditService.log(
-                    orgId, userId, "enable.service", "service", serviceId.toString(),
-                    entityDisplayName = old[Services.name],
-                    diff = auditDiff(Triple("isActive", false, true)),
-                )
+            if (enableNow) {
+                try {
+                    Interceptors.injectable(
+                        "service.toggle",
+                        InterceptorContext(
+                            orgId = orgId, userId = userId, workspaceId = ctx.workspaceId,
+                            projectId = ctx.projectId, serviceId = serviceId,
+                            extra = mutableMapOf("isActive" to true),
+                        ),
+                    ) {
+                        Services.update({ (Services.id eq serviceId) and (Services.projectId eq ctx.projectId) }) {
+                            it[isActive] = true
+                        }
+                        AuditService.log(
+                            orgId, userId, "enable.service", "service", serviceId.toString(),
+                            entityDisplayName = old[Services.name],
+                            diff = auditDiff(Triple("isActive", false, true)),
+                        )
+                        serviceSummary(serviceId)
+                    }
+                } catch (refused: ApiException) {
+                    log.info("service {} saved but not switched on: {}", serviceId, refused.code)
+                }
             }
 
             // Only when the save actually carried configuration. A script-only
@@ -507,11 +615,6 @@ object ServiceController {
                 buildJsonObject { put("id", serviceId.toString()); put("orgId", orgId.toString()); put("parentId", ctx.projectId.toString()) },
             )
             serviceSummary(serviceId) to ctx.projectId
-        }.let { (summary, projectId) ->
-            publishNudge(serviceId)
-            RealtimePublisher.publish("project:$projectId", orgId, "service.updated",
-                buildJsonObject { put("serviceId", serviceId.toString()) })
-            summary
         }
     }
 
@@ -575,6 +678,15 @@ object ServiceController {
      */
     @Injectable("service.toggle")
     fun toggle(orgId: UUID, serviceId: UUID, request: ToggleServiceRequest, userId: UUID): ServiceSummary {
+        val summary = toggleRow(orgId, serviceId, request, userId)
+        publishNudge(serviceId)
+        RealtimePublisher.publish("project:${summary.projectId}", orgId, "service.updated",
+            buildJsonObject { put("serviceId", serviceId.toString()) })
+        return summary
+    }
+
+    /** [toggle]'s work, inside the caller's transaction or a new one, with nothing sent outside the database. */
+    private fun toggleRow(orgId: UUID, serviceId: UUID, request: ToggleServiceRequest, userId: UUID): ServiceSummary {
         val ctx = ResourceResolver.resolveService(serviceId, orgId)
         return Interceptors.injectableInTx(
             "service.toggle",
@@ -595,13 +707,10 @@ object ServiceController {
 
                 val script = service[Services.script]
                 if (script.isBlank()) {
-                    throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
+                    throw fieldError("script", ErrorCodes.FIELD_REQUIRED)
                 }
 
-                val errors = validateScript(script)
-                if (errors.isNotEmpty()) {
-                    throw BadRequestException(ErrorCodes.FIELD_INVALID)
-                }
+                validateScript(script).takeIf { it.isNotEmpty() }?.let { throw scriptRefused(it) }
             }
 
             Services.update({ (Services.id eq serviceId) and (Services.projectId eq ctx.projectId) }) {
@@ -623,10 +732,6 @@ object ServiceController {
                 buildJsonObject { put("id", serviceId.toString()); put("orgId", orgId.toString()); put("parentId", ctx.projectId.toString()) },
             )
             serviceSummary(serviceId)
-        }.also {
-            publishNudge(serviceId)
-            RealtimePublisher.publish("project:${ctx.projectId}", orgId, "service.updated",
-                buildJsonObject { put("serviceId", serviceId.toString()) })
         }
     }
 
@@ -843,6 +948,26 @@ object ServiceController {
         request.probeMode != null || request.queuePolicy != null ||
         request.serviceWindow != null || request.saveResponseBodies != null
 
+    /**
+     * The refusal of a script that does not validate: 400 `field_invalid` on
+     * `script`, with every error the validator reported in `details.errors`
+     * (`code`, `callIndex`, `field`, `detail`) and the first one's detail in
+     * `details.reason` — so a caller can show what is wrong, not only that
+     * something is.
+     */
+    private fun scriptRefused(errors: List<ScriptValidationError>): ApiException =
+        fieldError("script") {
+            put("errors", JsonArray(errors.map { error ->
+                buildJsonObject {
+                    put("code", error.code)
+                    error.callIndex?.let { put("callIndex", it) }
+                    error.field?.let { put("field", it) }
+                    error.detail?.let { put("detail", it) }
+                }
+            }))
+            (errors.first().detail ?: errors.first().code).let { put("reason", it) }
+        }
+
     private fun validateScript(script: String): List<ScriptValidationError> {
         return try {
             val ast = dev.lacelang.validator.parse(script)
@@ -968,11 +1093,26 @@ object ServiceController {
             requireServiceWriteAccess(ctx.serviceId, ctx.projectId, ctx.workspaceId, cached)
 
             val agentIds = if (slugs.isEmpty()) emptyList() else {
-                val rows = ProbeAgents.selectAll()
-                    .where { (ProbeAgents.slug inList slugs) and (ProbeAgents.deleted eq false) }
+                // Only agents the caller could pick: active, not deleted, and
+                // visible to them under the deployment's agent visibility. One
+                // they cannot see is unknown to them, exactly like one that
+                // does not exist.
+                val found = ProbeAgents.selectAll()
+                    .where { (ProbeAgents.slug inList slugs) and (ProbeAgents.deleted eq false) and (ProbeAgents.isActive eq true) }
                     .map { it[ProbeAgents.id] to it[ProbeAgents.slug] }
+                val visible = AgentVisibility.visible(orgId, userId, found.map { it.second })
+                val rows = found.filter { it.second in visible }
                 if (rows.size != slugs.distinct().size) {
-                    throw BadRequestException(ErrorCodes.FIELD_INVALID)
+                    // Name the slugs that are not agents, so the caller does not
+                    // have to find them one at a time.
+                    val known = rows.map { it.second }.toSet()
+                    throw ApiException(
+                        HttpStatusCode.BadRequest, ErrorCodes.FIELD_INVALID,
+                        details = buildJsonObject {
+                            put("field", "slugs")
+                            put("unknown", JsonArray(slugs.distinct().filter { it !in known }.map { JsonPrimitive(it) }))
+                        },
+                    )
                 }
                 rows.map { it.first }
             }
@@ -1022,7 +1162,9 @@ object ServiceController {
 
             val query = ServiceVariables.selectAll()
                 .where { (ServiceVariables.serviceId eq serviceId) and (ServiceVariables.deleted eq false) }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(
+                pfs, listOf(ServiceVariables.createdAt to SortOrder.ASC, ServiceVariables.id to SortOrder.ASC),
+            )
             Page(items = pagedQuery.map { variableSummaryFromRow(it) }, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }
@@ -1117,6 +1259,7 @@ object ServiceController {
                 "resource.variable.created", "variable", id,
                 buildJsonObject { put("id", id.toString()); put("orgId", orgId.toString()); put("scope", "service"); put("parentId", serviceId.toString()) },
             )
+            AuditService.log(orgId, userId, "create.variable", "variable", id.toString(), entityDisplayName = key, comment = "service $serviceId")
             RealtimePublisher.publish("service:$serviceId", orgId, "variable.changed", buildJsonObject { put("resourceType", "services"); put("resourceId", serviceId.toString()) })
             variableSummary(id)
         }
@@ -1200,6 +1343,7 @@ object ServiceController {
                 "resource.variable.updated", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "service"); put("parentId", serviceId.toString()) },
             )
+            AuditService.log(orgId, userId, "update.variable", "variable", varId.toString(), entityDisplayName = row[ServiceVariables.key], comment = "service $serviceId")
             RealtimePublisher.publish("service:$serviceId", orgId, "variable.changed", buildJsonObject { put("resourceType", "services"); put("resourceId", serviceId.toString()) })
             variableSummary(varId)
         }
@@ -1234,6 +1378,7 @@ object ServiceController {
                 "resource.variable.deleted", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "service"); put("parentId", serviceId.toString()) },
             )
+            AuditService.log(orgId, userId, "delete.variable", "variable", varId.toString(), entityDisplayName = row[ServiceVariables.key], comment = "service $serviceId")
             RealtimePublisher.publish("service:$serviceId", orgId, "variable.changed", buildJsonObject { put("resourceType", "services"); put("resourceId", serviceId.toString()) })
         }
     }
@@ -1323,5 +1468,6 @@ object ServiceController {
         systemType = row[ServiceVariables.systemType],
         createdAt = row[ServiceVariables.createdAt].toString(),
         updatedAt = row[ServiceVariables.updatedAt].toString(),
+        masked = VariableCrypto.isMasked(row[ServiceVariables.secret], row[ServiceVariables.encrypted], reveal),
     )
 }

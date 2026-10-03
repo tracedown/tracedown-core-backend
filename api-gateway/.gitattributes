@@ -1,0 +1,4 @@
+# The key-authenticated API's v1 baseline. The contract test parses it and
+# normalises line endings itself; keeping it LF in the repository keeps the
+# diffs of the (append-only) baseline readable on every platform.
+src/test/resources/public-api-v1.*.txt text eol=lf

@@ -2,6 +2,7 @@ package dev.tracedown.gateway.data.apikeys
 
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
+import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 
 /** The two levels a key can be issued at, as they appear on the wire. */
@@ -64,6 +65,7 @@ data class ApiKeyInfo(
     val id: String,
     val name: String,
     val prefix: String?,
+    @JsonSchema.Enum("read", "write")
     val access: String,
     val expiresAt: String?,
     val organization: Organization,

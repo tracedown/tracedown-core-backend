@@ -939,6 +939,90 @@ class ApiKeyAuthTest {
     }
 
     @Test
+    fun `a mint racing the member's removal either waits for it or is revoked by it`() {
+        val owner = newOwner()
+        val member = newMember(owner.orgId)
+        val session = login(member)
+        val membershipId = transaction {
+            OrgUsers.selectAll().where { (OrgUsers.organizationId eq member.orgId) and (OrgUsers.userId eq member.userId) }
+                .single()[OrgUsers.id]
+        }
+
+        // The removal, as the dashboard runs it, held open: the membership is
+        // marked gone and stripped (MembershipAccess.revokeAll) but not yet
+        // committed, so its row locks are held.
+        val holding = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val pool = Executors.newFixedThreadPool(2)
+        val remover = pool.submit {
+            transaction {
+                OrgUsers.update({ OrgUsers.id eq membershipId }) {
+                    it[deleted] = true
+                }
+                dev.tracedown.gateway.controllers.orgs.MembershipAccess.revokeAll(member.orgId, membershipId)
+                holding.countDown()
+                assertTrue(release.await(10, java.util.concurrent.TimeUnit.SECONDS), "The mint never reached the lock")
+            }
+        }
+        try {
+            assertTrue(holding.await(10, java.util.concurrent.TimeUnit.SECONDS), "The removal never started")
+            val mint = pool.submit(Callable { post("/api/v1/me/api-keys", mintBody("raced"), session) })
+            // Released only once the mint is waiting on a row lock the removal holds.
+            val deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos()
+            while (System.nanoTime() < deadline) {
+                val waiting = transaction {
+                    exec("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'") { rs -> rs.next(); rs.getInt(1) } ?: 0
+                }
+                if (waiting > 0) break
+                Thread.sleep(20)
+            }
+            release.countDown()
+            remover.get(10, java.util.concurrent.TimeUnit.SECONDS)
+            assertRefused(403, "not_org_member", mint.get(10, java.util.concurrent.TimeUnit.SECONDS))
+        } finally {
+            release.countDown()
+            pool.shutdown()
+        }
+        val live = transaction {
+            ApiKeys.selectAll().where { (ApiKeys.createdBy eq member.userId) and (ApiKeys.revoked eq false) }.count()
+        }
+        assertEquals(0, live, "No live key may outlive a removal it raced")
+    }
+
+    @Test
+    fun `deleting a key never moves its purge date later`() {
+        val previous = dev.tracedown.common.config.DeletionRetention.days()
+        dev.tracedown.common.config.DeletionRetention.init(30)
+        try {
+            val owner = newOwner()
+            val session = login(owner)
+            val early = createKey(session, name = "already due").str("id")
+            val fresh = createKey(session, name = "fresh").str("id")
+            val soon = Instant.now().plusSeconds(86_400).truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+            transaction { ApiKeys.update({ ApiKeys.id eq UUID.fromString(early) }) { it[purgeAfter] = soon } }
+
+            assertEquals(200, delete("/api/v1/me/api-keys/$early", session).first)
+            assertEquals(200, delete("/api/v1/me/api-keys/$fresh", session).first)
+
+            assertEquals(soon, keyRow(early)[ApiKeys.purgeAfter], "An earlier purge date is kept")
+            val retained = keyRow(fresh)[ApiKeys.purgeAfter]!!
+            assertTrue(
+                Duration.between(Instant.now().plus(Duration.ofDays(30)), retained).abs() < Duration.ofMinutes(5),
+                "A key with no purge date gets the retention: $retained",
+            )
+
+            // The same for the keys a new holder of the account sweeps away.
+            val kept = createKey(session, name = "swept").str("id")
+            transaction { ApiKeys.update({ ApiKeys.id eq UUID.fromString(kept) }) { it[purgeAfter] = soon } }
+            transaction { AccountLifecycle.wipePriorHolder(owner.userId) }
+            assertTrue(keyRow(kept)[ApiKeys.deleted])
+            assertEquals(soon, keyRow(kept)[ApiKeys.purgeAfter])
+        } finally {
+            dev.tracedown.common.config.DeletionRetention.init(previous)
+        }
+    }
+
+    @Test
     fun `the cap, the list and the removal each see every organization a user is in`() {
         val home = newOwner()
         val session = login(home)
@@ -1321,6 +1405,25 @@ class ApiKeyAuthTest {
         assertRefused(429, "too_many_unknown_keys", get("/api/public/v1/key", revokedLater.str("key")))
         // …and from anywhere else the unseen key is fine.
         assertEquals(200, get("/api/public/v1/key", neverUsed, headers = elsewhere).first)
+    }
+
+    @Test
+    fun `requests with no key at all are counted against their address too`() {
+        // Half with no header, half with a blank bearer: neither names a key,
+        // and neither may be sent without limit.
+        val statuses = (1..FAILURE_BUDGET).map { n ->
+            if (n % 2 == 0) {
+                val response = get("/api/public/v1/key")
+                if (response.first == 401) assertEquals("missing_auth_header", json(response.second).str("error"))
+                response.first
+            } else {
+                send("GET", "/api/public/v1/key", headers = mapOf("Authorization" to "Bearer  ")).first
+            }
+        }
+        assertEquals(List(FAILURE_BUDGET) { 401 }, statuses)
+        assertRefused(429, "too_many_unknown_keys", get("/api/public/v1/key"))
+        // The dashboard's API is not this budget's business.
+        assertRefused(401, "missing_auth_header", get("/api/v1/auth/me"))
     }
 
     @Test

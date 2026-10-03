@@ -175,5 +175,6 @@ object VariableHierarchyController {
         systemType = systemType,
         createdAt = createdAt,
         updatedAt = updatedAt,
+        masked = VariableCrypto.isMasked(secret, encrypted, false),
     )
 }

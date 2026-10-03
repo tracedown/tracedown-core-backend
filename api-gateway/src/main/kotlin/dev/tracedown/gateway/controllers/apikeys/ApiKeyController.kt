@@ -14,6 +14,7 @@ import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
 import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.Organizations
+import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
@@ -128,9 +129,25 @@ object ApiKeyController {
             // would count from the snapshot it took before it started waiting.
             // NO KEY UPDATE: enough to make mints take turns, without holding up
             // every insert elsewhere that merely references this user.
-            Users.selectAll().where { Users.id eq userId }
+            // The membership row first, shared: a removal UPDATEs it, so a
+            // removal under way makes this wait for its outcome, and one that
+            // starts after this waits for the key to be committed — and then
+            // revokes it with the rest (MembershipAccess.revokeAll). Taken in
+            // the order a removal takes them (membership, then account), so the
+            // two cannot deadlock.
+            OrgUsers.selectAll()
+                .where { (OrgUsers.organizationId eq orgId) and (OrgUsers.userId eq userId) }
+                .forUpdate(ForUpdateOption.PostgreSQL.ForShare).toList()
+            val user = Users.selectAll().where { Users.id eq userId }
                 .forUpdate(ForUpdateOption.PostgreSQL.ForNoKeyUpdate).firstOrNull()
                 ?: throw NotFoundException()
+            // Asked again now that the row is held. The check above ran before
+            // the lock; a mint that waited on it behind an erasure, a
+            // deactivation or a removal would otherwise write a key for an
+            // account that is no longer there — dead, but never purged with it.
+            // READ COMMITTED: these reads see what the other side committed.
+            if (user[Users.deleted] || !user[Users.isActive]) throw ForbiddenException(ErrorCodes.NOT_ORG_MEMBER)
+            resolveCachedPermissions(orgId, userId) ?: throw ForbiddenException(ErrorCodes.NOT_ORG_MEMBER)
             if (heldBy(userId) >= maxPerUser) throw BadRequestException(ErrorCodes.API_KEY_LIMIT_REACHED)
 
             val id = UUID.randomUUID()
@@ -319,7 +336,9 @@ object ApiKeyController {
             it[revoked] = true
             it[deleted] = true
             it[deletedAt] = now
-            it[purgeAfter] = DeletionRetention.purgeAfter(now)
+            // Never later than a purge date the row already has: a delete must
+            // not extend how long something already due to go is kept.
+            it[purgeAfter] = DeletionRetention.earliestPurge(ApiKeys.purgeAfter, DeletionRetention.purgeAfter(now))
         }
     }
 

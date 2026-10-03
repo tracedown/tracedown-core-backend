@@ -54,7 +54,7 @@ object WebhookVariableController {
                 .orderBy(WebhookVariables.key)
                 .map { row ->
                     val masked = if (row[WebhookVariables.secret] || row[WebhookVariables.encrypted]) {
-                        "••••••••"
+                        VariableCrypto.MASK
                     } else {
                         row[WebhookVariables.value]
                     }
@@ -65,6 +65,7 @@ object WebhookVariableController {
                         type = variableTypeName(row[WebhookVariables.secret], row[WebhookVariables.encrypted]),
                         createdAt = row[WebhookVariables.createdAt].toString(),
                         updatedAt = row[WebhookVariables.updatedAt].toString(),
+                        masked = row[WebhookVariables.secret] || row[WebhookVariables.encrypted],
                     )
                 }
         }
@@ -243,7 +244,7 @@ object WebhookVariableController {
         val row = WebhookVariables.selectAll()
             .where { WebhookVariables.id eq id }
             .first()
-        val masked = if (row[WebhookVariables.secret] || row[WebhookVariables.encrypted]) "••••••••" else row[WebhookVariables.value]
+        val masked = if (row[WebhookVariables.secret] || row[WebhookVariables.encrypted]) VariableCrypto.MASK else row[WebhookVariables.value]
         return VariableSummary(
             id = row[WebhookVariables.id].toString(),
             key = row[WebhookVariables.key],
@@ -251,6 +252,7 @@ object WebhookVariableController {
             type = variableTypeName(row[WebhookVariables.secret], row[WebhookVariables.encrypted]),
             createdAt = row[WebhookVariables.createdAt].toString(),
             updatedAt = row[WebhookVariables.updatedAt].toString(),
+            masked = row[WebhookVariables.secret] || row[WebhookVariables.encrypted],
         )
     }
 }

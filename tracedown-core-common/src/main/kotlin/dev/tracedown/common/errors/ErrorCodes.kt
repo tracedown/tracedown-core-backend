@@ -136,7 +136,21 @@ object ErrorCodes {
      */
     const val ACCOUNT_OWNS_ORGANIZATIONS = "account_owns_organizations"
 
+    // ── Runs ──
+    /** A run was asked for a service that is switched off. */
+    const val SERVICE_INACTIVE = "service_inactive"
+    /** A run was asked for a service that has no script to run. */
+    const val SCRIPT_MISSING = "script_missing"
+
+    // ── Webhook bindings ──
+    /** The webhook is already bound to that resource. */
+    const val BINDING_EXISTS = "binding_exists"
+
     // ── General ──
     const val INTERNAL_ERROR = "internal_error"
     const val NOT_SUPPORTED = "not_supported"
+    /** No route answers that method on that path (the route exists for other methods). */
+    const val METHOD_NOT_ALLOWED = "method_not_allowed"
+    /** A path that does not reduce to one canonical form — dot segments, encoded separators. */
+    const val INVALID_PATH = "invalid_path"
 }

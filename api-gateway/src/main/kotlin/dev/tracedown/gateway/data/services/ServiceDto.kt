@@ -3,17 +3,32 @@ package dev.tracedown.gateway.data.services
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
 import dev.tracedown.gateway.data.metrics.ServiceMetricsDto
+import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 
 @Serializable
 data class CreateServiceRequest(
     val projectId: String,
+    @JsonSchema.MaxLength(128)
     val name: String,
+    @JsonSchema.MaxLength(32)
     val label: String? = null,
+    @JsonSchema.MaxLength(16)
+    @JsonSchema.Description("A five-field cron expression; `*/5 * * * *` when left out.")
     val schedule: String? = null,
     val saveResponseBodies: Boolean? = null,
+    /**
+     * The service's Lace script. Validated as a script save is; saving one
+     * switches the service on, as the first script save does, unless
+     * [isActive] says otherwise.
+     */
+    @JsonSchema.MaxLength(65536)
+    val script: String? = null,
+    /** Whether the service starts switched on. True needs a [script]. */
+    val isActive: Boolean? = null,
 ) : Validatable {
     override fun validate() = buildList {
+        Validators.maxLen("script", script, 65536)?.let(::add)
         Validators.notBlank("projectId", projectId)?.let(::add)
         Validators.uuid("projectId", projectId)?.let(::add)
         Validators.notBlank("name", name)?.let(::add)
@@ -25,11 +40,19 @@ data class CreateServiceRequest(
 
 @Serializable
 data class UpdateServiceRequest(
+    @JsonSchema.MaxLength(128)
     val name: String? = null,
+    @JsonSchema.MaxLength(32)
     val label: String? = null,
+    @JsonSchema.MaxLength(16)
+    @JsonSchema.Description("A five-field cron expression.")
     val schedule: String? = null,
+    @JsonSchema.Description("`consecutive`, `simultaneous` or `random`: how the service's agents take turns.")
     val probeMode: String? = null,
+    @JsonSchema.Description("`skip` or `enqueue_once`: what a run does while the previous one is still going.")
     val queuePolicy: String? = null,
+    @JsonSchema.MaxLength(256)
+    @JsonSchema.Description("A maintenance window, `RRULE/minutes/Zone`: an RFC 5545 rule, 1–1440 minutes, an IANA zone. Empty clears it.")
     val serviceWindow: String? = null,
     val saveResponseBodies: Boolean? = null,
     /**
@@ -70,6 +93,7 @@ data class UpdateServiceRequest(
  */
 @Serializable
 data class UpdateScriptRequest(
+    @JsonSchema.MaxLength(65536)
     val script: String,
     val version: Int,
 ) : Validatable {
@@ -86,6 +110,13 @@ data class ToggleServiceRequest(
     val isActive: Boolean,
 )
 
+/** A run that was asked for: [requestedAt] is when, as an ISO-8601 instant. */
+@Serializable
+data class RunRequested(
+    val ok: Boolean = true,
+    val requestedAt: String,
+)
+
 /**
  * One service a scoped toggle did not act on, and why.
  *
@@ -98,6 +129,7 @@ data class SkippedService(
     val serviceId: String,
     val name: String,
     /** `forbidden`, `script_missing` or `script_invalid`. */
+    @JsonSchema.Enum("forbidden", "script_missing", "script_invalid")
     val reason: String,
 )
 
@@ -164,9 +196,13 @@ data class ServiceSummary(
     val name: String,
     val label: String?,
     val script: String,
+    @JsonSchema.Description("A five-field cron expression.")
     val schedule: String,
+    @JsonSchema.Enum("consecutive", "simultaneous", "random")
     val probeMode: String,
+    @JsonSchema.Enum("skip", "enqueue_once")
     val queuePolicy: String,
+    @JsonSchema.Description("A maintenance window, `RRULE/minutes/Zone`; null when there is none.")
     val serviceWindow: String?,
     /** When false, runs are dispatched with body saving off — no stored body to inspect. */
     val saveResponseBodies: Boolean,
@@ -180,6 +216,7 @@ data class ServiceSummary(
      */
     val unverifiedTargets: List<String> = emptyList(),
     val isActive: Boolean,
+    @JsonSchema.Description("`success`, `failure`, `timeout`, `skipped` or `error`; null before the first run.")
     val lastStatus: String?,
     val lastStatusSince: String?,
     val version: Int,
@@ -190,10 +227,14 @@ data class ServiceSummary(
 
 @Serializable
 data class ProbePoint(
+    @JsonSchema.Enum("success", "failure", "timeout", "skipped", "error")
     val status: String,
     val avgResponseMs: Int,
     val callCount: Int,
     val failedCalls: Int,
+    /** When the run started, in epoch seconds. */
+    @JsonSchema.Format("int64")
+    @JsonSchema.Description("When the run started, in epoch seconds.")
     val timestamp: Long,
 )
 

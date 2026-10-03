@@ -1,0 +1,526 @@
+# Entry points
+gateway.data.apikeys.ApiKeyInfo = dev.tracedown.gateway.data.apikeys.ApiKeyInfo
+common.pfs.Page<gateway.data.workspaces.WorkspaceSummary> = dev.tracedown.common.pfs.Page
+gateway.data.workspaces.CreateWorkspaceRequest = dev.tracedown.gateway.data.workspaces.CreateWorkspaceRequest
+gateway.data.workspaces.WorkspaceSummary = dev.tracedown.gateway.data.workspaces.WorkspaceSummary
+gateway.data.workspaces.UpdateWorkspaceRequest = dev.tracedown.gateway.data.workspaces.UpdateWorkspaceRequest
+kotlin.collections.Map<kotlin.String, kotlin.Boolean> = Map<kotlin.String, kotlin.Boolean>
+gateway.data.services.ToggleServiceRequest = dev.tracedown.gateway.data.services.ToggleServiceRequest
+gateway.data.services.ScopedToggleResult = dev.tracedown.gateway.data.services.ScopedToggleResult
+common.pfs.Page<gateway.data.projects.ProjectSummary> = dev.tracedown.common.pfs.Page
+gateway.data.projects.CreateProjectRequest = dev.tracedown.gateway.data.projects.CreateProjectRequest
+gateway.data.projects.ProjectSummary = dev.tracedown.gateway.data.projects.ProjectSummary
+gateway.data.projects.UpdateProjectRequest = dev.tracedown.gateway.data.projects.UpdateProjectRequest
+common.pfs.Page<gateway.data.services.ServiceSummary> = dev.tracedown.common.pfs.Page
+gateway.data.services.CreateServiceRequest = dev.tracedown.gateway.data.services.CreateServiceRequest
+gateway.data.services.ServiceSummary = dev.tracedown.gateway.data.services.ServiceSummary
+gateway.data.services.UpdateServiceRequest = dev.tracedown.gateway.data.services.UpdateServiceRequest
+gateway.data.services.UpdateScriptRequest = dev.tracedown.gateway.data.services.UpdateScriptRequest
+gateway.data.services.ServiceSnapshot = dev.tracedown.gateway.data.services.ServiceSnapshot
+gateway.data.services.RunRequested = dev.tracedown.gateway.data.services.RunRequested
+kotlin.collections.List<kotlin.String> = List<kotlin.String>
+gateway.data.services.SetAllowedAgentsRequest = dev.tracedown.gateway.data.services.SetAllowedAgentsRequest
+kotlin.collections.List<gateway.data.agents.PublicAgentSummary> = List<dev.tracedown.gateway.data.agents.PublicAgentSummary>
+common.pfs.Page<gateway.data.results.ProbeResultSummary> = dev.tracedown.common.pfs.Page
+gateway.data.results.ProbeResultDetail = dev.tracedown.gateway.data.results.ProbeResultDetail
+gateway.data.results.StepBodyContent = dev.tracedown.gateway.data.results.StepBodyContent
+gateway.data.metrics.ServiceMetricsDto = dev.tracedown.gateway.data.metrics.ServiceMetricsDto
+kotlin.collections.List<gateway.data.metrics.HourlyBucket> = List<dev.tracedown.gateway.data.metrics.HourlyBucket>
+gateway.data.metrics.ServiceStatisticsDto = dev.tracedown.gateway.data.metrics.ServiceStatisticsDto
+gateway.data.metrics.EndpointSeriesDto = dev.tracedown.gateway.data.metrics.EndpointSeriesDto
+gateway.data.metrics.AssertionFailuresDto = dev.tracedown.gateway.data.metrics.AssertionFailuresDto
+gateway.data.metrics.FailureHeatmapDto = dev.tracedown.gateway.data.metrics.FailureHeatmapDto
+common.pfs.Page<gateway.data.silences.SilenceSummary> = dev.tracedown.common.pfs.Page
+gateway.data.silences.CreateSilenceRequest = dev.tracedown.gateway.data.silences.CreateSilenceRequest
+gateway.data.silences.SilenceSummary = dev.tracedown.gateway.data.silences.SilenceSummary
+gateway.data.silences.UpdateSilenceRequest = dev.tracedown.gateway.data.silences.UpdateSilenceRequest
+kotlin.collections.List<gateway.data.orgs.ResourceAccessEntry> = List<dev.tracedown.gateway.data.orgs.ResourceAccessEntry>
+gateway.data.orgs.UpsertAccessRequest = dev.tracedown.gateway.data.orgs.UpsertAccessRequest
+common.pfs.Page<gateway.data.orgs.PublicMemberSummary> = dev.tracedown.common.pfs.Page
+common.pfs.Page<gateway.data.orgs.PublicGroupSummary> = dev.tracedown.common.pfs.Page
+common.pfs.Page<gateway.data.webhooks.PublicWebhookSummary> = dev.tracedown.common.pfs.Page
+common.pfs.Page<gateway.data.webhooks.WebhookBindingSummary> = dev.tracedown.common.pfs.Page
+gateway.data.webhooks.WebhookBindingRequest = dev.tracedown.gateway.data.webhooks.WebhookBindingRequest
+gateway.data.webhooks.WebhookBindingSummary = dev.tracedown.gateway.data.webhooks.WebhookBindingSummary
+common.pfs.Page<gateway.data.VariableSummary> = dev.tracedown.common.pfs.Page
+gateway.data.CreateVariableRequest = dev.tracedown.gateway.data.CreateVariableRequest
+gateway.data.VariableSummary = dev.tracedown.gateway.data.VariableSummary
+gateway.data.UpdateVariableRequest = dev.tracedown.gateway.data.UpdateVariableRequest
+gateway.data.VariableHierarchyResponse = dev.tracedown.gateway.data.VariableHierarchyResponse
+gateway.data.publicapi.PublicApiError = dev.tracedown.gateway.data.publicapi.PublicApiError
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.VariableSummary>
+  items: List<dev.tracedown.gateway.data.VariableSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.orgs.PublicGroupSummary>
+  items: List<dev.tracedown.gateway.data.orgs.PublicGroupSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.orgs.PublicMemberSummary>
+  items: List<dev.tracedown.gateway.data.orgs.PublicMemberSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.projects.ProjectSummary>
+  items: List<dev.tracedown.gateway.data.projects.ProjectSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.results.ProbeResultSummary>
+  items: List<dev.tracedown.gateway.data.results.ProbeResultSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.services.ServiceSummary>
+  items: List<dev.tracedown.gateway.data.services.ServiceSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.silences.SilenceSummary>
+  items: List<dev.tracedown.gateway.data.silences.SilenceSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.webhooks.PublicWebhookSummary>
+  items: List<dev.tracedown.gateway.data.webhooks.PublicWebhookSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.webhooks.WebhookBindingSummary>
+  items: List<dev.tracedown.gateway.data.webhooks.WebhookBindingSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.workspaces.WorkspaceSummary>
+  items: List<dev.tracedown.gateway.data.workspaces.WorkspaceSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.gateway.data.CreateVariableRequest
+  key: kotlin.String
+  value: kotlin.String
+  type: kotlin.String optional
+
+dev.tracedown.gateway.data.LockedVariable
+  key: kotlin.String
+  value: kotlin.String
+  description: kotlin.String
+
+dev.tracedown.gateway.data.UpdateVariableRequest
+  value: kotlin.String
+
+dev.tracedown.gateway.data.VariableHierarchyResponse
+  scopes: List<dev.tracedown.gateway.data.VariableScope>
+
+dev.tracedown.gateway.data.VariableScope
+  scope: kotlin.String
+  prefix: kotlin.String
+  resourceId: kotlin.String
+  resourceName: kotlin.String
+  editable: kotlin.Boolean
+  variables: List<dev.tracedown.gateway.data.VariableSummary>
+  locked: List<dev.tracedown.gateway.data.LockedVariable>
+
+dev.tracedown.gateway.data.VariableSummary
+  id: kotlin.String
+  key: kotlin.String
+  value: kotlin.String
+  type: kotlin.String
+  systemType: kotlin.String? optional
+  createdAt: kotlin.String
+  updatedAt: kotlin.String
+  masked: kotlin.Boolean optional
+
+dev.tracedown.gateway.data.agents.PublicAgentSummary
+  slug: kotlin.String
+  label: kotlin.String
+
+dev.tracedown.gateway.data.apikeys.ApiKeyInfo
+  id: kotlin.String
+  name: kotlin.String
+  prefix: kotlin.String?
+  access: kotlin.String
+  expiresAt: kotlin.String?
+  organization: dev.tracedown.gateway.data.apikeys.ApiKeyInfo.Organization
+  user: dev.tracedown.gateway.data.apikeys.ApiKeyInfo.User
+
+dev.tracedown.gateway.data.apikeys.ApiKeyInfo.Organization
+  id: kotlin.String
+  name: kotlin.String
+
+dev.tracedown.gateway.data.apikeys.ApiKeyInfo.User
+  id: kotlin.String
+  email: kotlin.String
+
+dev.tracedown.gateway.data.metrics.AssertionFailureStat
+  endpointKey: kotlin.String
+  method: kotlin.String
+  template: kotlin.String
+  assertionMethod: kotlin.String?
+  scope: kotlin.String?
+  op: kotlin.String?
+  expected: kotlin.String?
+  kind: kotlin.String?
+  expression: kotlin.String?
+  failures: kotlin.Long
+  evaluations: kotlin.Long
+  failureRatePct: kotlin.Double
+  lastFailedAt: kotlin.String
+
+dev.tracedown.gateway.data.metrics.AssertionFailuresDto
+  window: kotlin.String
+  since: kotlin.String
+  until: kotlin.String
+  truncated: kotlin.Boolean
+  assertions: List<dev.tracedown.gateway.data.metrics.AssertionFailureStat>
+
+dev.tracedown.gateway.data.metrics.EndpointCodeCount
+  code: kotlin.Int
+  count: kotlin.Long
+
+dev.tracedown.gateway.data.metrics.EndpointSeries
+  key: kotlin.String
+  method: kotlin.String
+  template: kotlin.String
+  points: List<dev.tracedown.gateway.data.metrics.EndpointSeriesPoint>
+
+dev.tracedown.gateway.data.metrics.EndpointSeriesDto
+  window: kotlin.String
+  bucketType: kotlin.String
+  buckets: List<kotlin.String>
+  all: List<dev.tracedown.gateway.data.metrics.EndpointSeriesPoint>
+  endpoints: List<dev.tracedown.gateway.data.metrics.EndpointSeries>
+  endpointsTruncated: kotlin.Boolean optional
+
+dev.tracedown.gateway.data.metrics.EndpointSeriesPoint
+  bucketStart: kotlin.String
+  calls: kotlin.Long
+  phases: dev.tracedown.gateway.data.metrics.PhaseTimings?
+  avgSizeBytes: kotlin.Long?
+
+dev.tracedown.gateway.data.metrics.EndpointStat
+  key: kotlin.String
+  method: kotlin.String
+  template: kotlin.String
+  exampleUrl: kotlin.String?
+  calls: kotlin.Long
+  codes: List<dev.tracedown.gateway.data.metrics.EndpointCodeCount>
+  phases: dev.tracedown.gateway.data.metrics.PhaseTimings?
+  previousPhases: dev.tracedown.gateway.data.metrics.PhaseTimings?
+  avgSizeBytes: kotlin.Long?
+
+dev.tracedown.gateway.data.metrics.FailureHeatmapDto
+  days: kotlin.Int
+  timezone: kotlin.String
+  since: kotlin.String
+  until: kotlin.String
+  coveredFrom: kotlin.String?
+  coveredTo: kotlin.String?
+  totalRuns: kotlin.Long
+  totalFailedRuns: kotlin.Long
+  cells: List<dev.tracedown.gateway.data.metrics.HeatmapCell>
+
+dev.tracedown.gateway.data.metrics.HeatmapCell
+  weekday: kotlin.Int
+  hour: kotlin.Int
+  runs: kotlin.Long
+  failedRuns: kotlin.Long
+
+dev.tracedown.gateway.data.metrics.HourlyBucket
+  hour: kotlin.String
+  total: kotlin.Long
+  success: kotlin.Long
+  failure: kotlin.Long
+  timeout: kotlin.Long
+  sumMs: kotlin.Long
+  callCount: kotlin.Long optional
+
+dev.tracedown.gateway.data.metrics.MetricsCounters
+  probesTotal: kotlin.Long
+  probesSuccess: kotlin.Long
+  probesFailure: kotlin.Long
+  probesTimeout: kotlin.Long
+
+dev.tracedown.gateway.data.metrics.MetricsState
+  lastStatus: kotlin.String?
+  lastConsecutive: kotlin.Long
+  lastResponseMs: kotlin.Long
+  lastRunAt: kotlin.Long?
+
+dev.tracedown.gateway.data.metrics.PhaseTimings
+  dnsMs: kotlin.Int
+  connectMs: kotlin.Int
+  tlsMs: kotlin.Int
+  ttfbMs: kotlin.Int
+  transferMs: kotlin.Int
+  responseMs: kotlin.Int
+
+dev.tracedown.gateway.data.metrics.RegionSeries
+  agentId: kotlin.Long
+  agentLabel: kotlin.String
+  buckets: List<dev.tracedown.gateway.data.metrics.StatBucket>
+
+dev.tracedown.gateway.data.metrics.ResponsePercentiles
+  p50: kotlin.Long
+  p95: kotlin.Long
+  p99: kotlin.Long
+
+dev.tracedown.gateway.data.metrics.ServiceMetricsDto
+  counters: dev.tracedown.gateway.data.metrics.MetricsCounters
+  state: dev.tracedown.gateway.data.metrics.MetricsState
+  percentiles: dev.tracedown.gateway.data.metrics.ResponsePercentiles? optional
+  projectCount: kotlin.Int? optional
+  serviceCount: kotlin.Int? optional
+
+dev.tracedown.gateway.data.metrics.ServiceStatisticsDto
+  window: kotlin.String
+  bucketType: kotlin.String
+  overall: List<dev.tracedown.gateway.data.metrics.StatBucket>
+  regions: List<dev.tracedown.gateway.data.metrics.RegionSeries>
+  endpoints: List<dev.tracedown.gateway.data.metrics.EndpointStat> optional
+  endpointsTruncated: kotlin.Boolean optional
+
+dev.tracedown.gateway.data.metrics.StatBucket
+  bucketStart: kotlin.String
+  p50Ms: kotlin.Int?
+  p95Ms: kotlin.Int?
+  p99Ms: kotlin.Int?
+  uptimePct: kotlin.Double?
+  errorRatePct: kotlin.Double?
+  probeCount: kotlin.Int
+
+dev.tracedown.gateway.data.orgs.PublicGroupSummary
+  id: kotlin.String
+  name: kotlin.String
+  memberCount: kotlin.Int
+
+dev.tracedown.gateway.data.orgs.PublicMemberSummary
+  userId: kotlin.String
+  displayName: kotlin.String
+  email: kotlin.String
+  isActive: kotlin.Boolean
+
+dev.tracedown.gateway.data.orgs.ResourceAccessEntry
+  principalType: kotlin.String
+  principalId: kotlin.String
+  name: kotlin.String
+  email: kotlin.String? optional
+  permissions: kotlin.Short
+
+dev.tracedown.gateway.data.orgs.UpsertAccessRequest
+  principalType: kotlin.String
+  principalId: kotlin.String
+  permissions: kotlin.Short
+
+dev.tracedown.gateway.data.projects.CreateProjectRequest
+  workspaceId: kotlin.String
+  name: kotlin.String
+
+dev.tracedown.gateway.data.projects.ProjectSummary
+  id: kotlin.String
+  workspaceId: kotlin.String
+  name: kotlin.String
+  createdAt: kotlin.String
+  metrics: dev.tracedown.gateway.data.metrics.ServiceMetricsDto? optional
+  serviceCount: kotlin.Int optional
+
+dev.tracedown.gateway.data.projects.UpdateProjectRequest
+  name: kotlin.String? optional
+
+dev.tracedown.gateway.data.publicapi.PublicApiError
+  error: kotlin.String
+  details: JsonObject? optional
+
+dev.tracedown.gateway.data.results.ProbeResultDetail
+  id: kotlin.String
+  serviceId: kotlin.String
+  status: kotlin.String
+  runDurationMs: kotlin.Int
+  startedAt: kotlin.String
+  probeAgentId: kotlin.Long? optional
+  rawResult: JsonElement
+  steps: List<dev.tracedown.gateway.data.results.ProbeStepSummary>
+  agentSlug: kotlin.String? optional
+
+dev.tracedown.gateway.data.results.ProbeResultSummary
+  id: kotlin.String
+  status: kotlin.String
+  runDurationMs: kotlin.Int
+  totalResponseMs: kotlin.Int
+  startedAt: kotlin.String
+  agentSlug: kotlin.String? optional
+
+dev.tracedown.gateway.data.results.ProbeStepSummary
+  id: kotlin.String
+  stepNum: kotlin.Short
+  requestUrl: kotlin.String
+  statusCode: kotlin.Short?
+  responseTimeMs: kotlin.Int?
+  dnsMs: kotlin.Int?
+  connectMs: kotlin.Int?
+  tlsMs: kotlin.Int?
+  ttfbMs: kotlin.Int?
+  transferMs: kotlin.Int?
+  responseSizeBytes: kotlin.Int?
+  error: kotlin.String?
+  assertionResults: JsonArray?
+  headers: JsonObject?
+  hasBody: kotlin.Boolean
+  bodyNotStoredReason: kotlin.String?
+
+dev.tracedown.gateway.data.results.StepBodyContent
+  content: kotlin.String
+  contentType: kotlin.String? optional
+  encoding: kotlin.String? optional
+
+dev.tracedown.gateway.data.services.CreateServiceRequest
+  projectId: kotlin.String
+  name: kotlin.String
+  label: kotlin.String? optional
+  schedule: kotlin.String? optional
+  saveResponseBodies: kotlin.Boolean? optional
+  script: kotlin.String? optional
+  isActive: kotlin.Boolean? optional
+
+dev.tracedown.gateway.data.services.FailedAssertion
+  scope: kotlin.String
+  expected: kotlin.String?
+  actual: kotlin.String?
+
+dev.tracedown.gateway.data.services.LastFailureInfo
+  assertions: List<dev.tracedown.gateway.data.services.FailedAssertion>
+
+dev.tracedown.gateway.data.services.ProbePoint
+  status: kotlin.String
+  avgResponseMs: kotlin.Int
+  callCount: kotlin.Int
+  failedCalls: kotlin.Int
+  timestamp: kotlin.Long
+
+dev.tracedown.gateway.data.services.RunRequested
+  ok: kotlin.Boolean optional
+  requestedAt: kotlin.String
+
+dev.tracedown.gateway.data.services.ScopedToggleResult
+  matched: kotlin.Int
+  changed: kotlin.Int
+  unchanged: kotlin.Int
+  skipped: List<dev.tracedown.gateway.data.services.SkippedService>
+  skippedTotal: kotlin.Int
+  skippedByReason: Map<kotlin.String, kotlin.Int>
+
+dev.tracedown.gateway.data.services.ServiceSnapshot
+  service: dev.tracedown.gateway.data.services.ServiceSummary
+  recentProbes: List<dev.tracedown.gateway.data.services.ProbePoint>
+
+dev.tracedown.gateway.data.services.ServiceSummary
+  id: kotlin.String
+  projectId: kotlin.String
+  name: kotlin.String
+  label: kotlin.String?
+  script: kotlin.String
+  schedule: kotlin.String
+  probeMode: kotlin.String
+  queuePolicy: kotlin.String
+  serviceWindow: kotlin.String?
+  saveResponseBodies: kotlin.Boolean
+  unverifiedTargets: List<kotlin.String> optional
+  isActive: kotlin.Boolean
+  lastStatus: kotlin.String?
+  lastStatusSince: kotlin.String?
+  version: kotlin.Int
+  createdAt: kotlin.String
+  metrics: dev.tracedown.gateway.data.metrics.ServiceMetricsDto? optional
+  lastFailure: dev.tracedown.gateway.data.services.LastFailureInfo? optional
+
+dev.tracedown.gateway.data.services.SetAllowedAgentsRequest
+  slugs: List<kotlin.String>
+
+dev.tracedown.gateway.data.services.SkippedService
+  serviceId: kotlin.String
+  name: kotlin.String
+  reason: kotlin.String
+
+dev.tracedown.gateway.data.services.ToggleServiceRequest
+  isActive: kotlin.Boolean
+
+dev.tracedown.gateway.data.services.UpdateScriptRequest
+  script: kotlin.String
+  version: kotlin.Int
+
+dev.tracedown.gateway.data.services.UpdateServiceRequest
+  name: kotlin.String? optional
+  label: kotlin.String? optional
+  schedule: kotlin.String? optional
+  probeMode: kotlin.String? optional
+  queuePolicy: kotlin.String? optional
+  serviceWindow: kotlin.String? optional
+  saveResponseBodies: kotlin.Boolean? optional
+  script: kotlin.String? optional
+  version: kotlin.Int? optional
+
+dev.tracedown.gateway.data.silences.CreateSilenceRequest
+  channel: kotlin.String
+  workspaceId: kotlin.String? optional
+  projectId: kotlin.String? optional
+  serviceId: kotlin.String? optional
+  config: kotlin.String? optional
+  quietHours: kotlin.String? optional
+
+dev.tracedown.gateway.data.silences.SilenceSummary
+  id: kotlin.String
+  orgUserId: kotlin.String
+  workspaceId: kotlin.String?
+  projectId: kotlin.String?
+  serviceId: kotlin.String?
+  channel: kotlin.String
+  config: kotlin.String?
+  quietHours: kotlin.String?
+  resourceName: kotlin.String? optional
+
+dev.tracedown.gateway.data.silences.UpdateSilenceRequest
+  channel: kotlin.String? optional
+  config: kotlin.String? optional
+  quietHours: kotlin.String? optional
+
+dev.tracedown.gateway.data.webhooks.PublicWebhookSummary
+  id: kotlin.String
+  name: kotlin.String
+  label: kotlin.String?
+  method: kotlin.String
+  createdAt: kotlin.String
+
+dev.tracedown.gateway.data.webhooks.WebhookBindingRequest
+  webhookId: kotlin.String
+  enabled: kotlin.Boolean optional
+
+dev.tracedown.gateway.data.webhooks.WebhookBindingSummary
+  id: kotlin.String
+  webhookId: kotlin.String
+  webhookName: kotlin.String
+  enabled: kotlin.Boolean
+  createdAt: kotlin.String
+
+dev.tracedown.gateway.data.workspaces.CreateWorkspaceRequest
+  name: kotlin.String
+
+dev.tracedown.gateway.data.workspaces.UpdateWorkspaceRequest
+  name: kotlin.String? optional
+
+dev.tracedown.gateway.data.workspaces.WorkspaceSummary
+  id: kotlin.String
+  name: kotlin.String
+  createdAt: kotlin.String

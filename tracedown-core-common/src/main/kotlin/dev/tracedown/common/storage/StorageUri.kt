@@ -25,10 +25,24 @@ sealed class StorageUri {
             uri.startsWith(S3_SCHEME) -> {
                 val rest = uri.removePrefix(S3_SCHEME)
                 val slashIdx = rest.indexOf('/')
-                if (slashIdx < 1) throw IllegalArgumentException("Invalid S3 URI (missing key): $uri")
+                if (slashIdx < 1) throw StorageUriException("Invalid S3 URI (missing key): $uri")
                 S3(bucket = rest.substring(0, slashIdx), key = rest.substring(slashIdx + 1))
             }
-            else -> throw IllegalArgumentException("Unknown storage URI scheme: $uri")
+            else -> throw StorageUriException("Unknown storage URI scheme: $uri")
         }
     }
 }
+
+/**
+ * A recorded storage location that is not a storage URI at all — an unknown
+ * scheme, or an `s3://` URI without a key. Nothing at that location can ever
+ * be read, so it is a permanent condition, not a failure worth retrying.
+ */
+class StorageUriException(message: String) : IllegalArgumentException(message)
+
+/**
+ * A storage URI of a kind this client has no store for — an `s3://` location
+ * where no object store is configured. As permanent as [StorageUriException]
+ * for this deployment.
+ */
+class StorageUnconfiguredException(message: String) : IllegalStateException(message)

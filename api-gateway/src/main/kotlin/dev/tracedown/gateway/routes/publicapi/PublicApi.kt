@@ -3,8 +3,19 @@ package dev.tracedown.gateway.routes.publicapi
 import dev.tracedown.common.audit.AuditActor
 import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.net.PathCanonicalizer
 import dev.tracedown.gateway.context.Credential
+import dev.tracedown.gateway.routes.publicapi.v1.accessRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.directoryRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.keyRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.metricsRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.projectRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.resultRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.serviceRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.silenceRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.variableRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.webhookRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.workspaceRoutes
 import dev.tracedown.gateway.routes.v1.auth.requireAuth
 import dev.tracedown.gateway.util.ApiNamespace
 import dev.tracedown.gateway.util.BadRequestException
@@ -19,9 +30,23 @@ import io.ktor.server.application.call
 import io.ktor.server.application.createApplicationPlugin
 import io.ktor.server.application.install
 import io.ktor.server.request.httpMethod
+import io.ktor.server.routing.HttpMethodRouteSelector
 import io.ktor.server.routing.Route
+import io.ktor.server.routing.RoutingNode
+import io.ktor.server.routing.getAllRoutes
+import io.ktor.server.routing.openapi.describe
+import io.ktor.http.ContentType
+import io.ktor.http.Headers
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.http.content.HttpStatusCodeContent
+import io.ktor.http.content.OutgoingContent
+import io.ktor.http.content.TextContent
+import io.ktor.server.application.hooks.ResponseBodyReadyForSend
+import io.ktor.server.plugins.mutableOriginConnectionPoint
+import dev.tracedown.gateway.routes.publicapi.v1.agentRoutes
 import io.ktor.server.routing.route
 import io.ktor.util.AttributeKey
+import io.ktor.utils.io.ExperimentalKtorApi
 import kotlinx.coroutines.withContext
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
@@ -105,22 +130,31 @@ object PublicApi {
 
     const val V1 = "$ROOT/v1"
 
-    private val extensions = CopyOnWriteArrayList<Route.() -> Unit>()
+    /**
+     * Where [V1]'s description (OpenAPI) is served — outside [ROOT] on
+     * purpose, so it needs no key: nothing in the namespace is open.
+     */
+    const val DESCRIPTION_PATH = "/api/openapi/public/v1.json"
+
+    /** Host route blocks, each with the tag its endpoints carry in the description. */
+    private val extensions = CopyOnWriteArrayList<Pair<String, Route.() -> Unit>>()
     private val guards = CopyOnWriteArrayList<suspend (ApiCaller, ApplicationCall) -> Unit>()
 
     private var mounted = false
 
     /**
      * Mounts additional routes inside [V1]. Paths are relative to it, and the
-     * caller is available as [apiCaller].
+     * caller is available as [apiCaller]. In the API's description the
+     * endpoints are listed under [tag]; a host that wants more there (a
+     * summary, an operation id) describes its routes itself.
      *
      * Must be called before the gateway module builds its routing; afterwards
      * the routes would never be mounted, so that is an error rather than a
      * silent no-op.
      */
-    fun routes(block: Route.() -> Unit) = synchronized(this) {
+    fun routes(tag: String = "Extensions", block: Route.() -> Unit) = synchronized(this) {
         check(!mounted) { "PublicApi.routes must be registered before the gateway module is installed" }
-        extensions += block
+        extensions += tag to block
     }
 
     /**
@@ -143,13 +177,60 @@ object PublicApi {
         mounted = false
     }
 
-    /** The routes this module provides, with whatever a host registered. */
-    internal fun mount(parent: Route) = synchronized(this) {
-        parent.route(V1) {
-            keyRoutes()
-            extensions.forEach { it() }
+    /**
+     * The routes this module provides, with whatever a host registered.
+     * Returns the [V1] subtree, which is what the API's description is
+     * generated from.
+     *
+     * Every endpoint this module mounts is described from its entry in
+     * [PublicApiOperations] — and one without an entry stops the gateway from
+     * starting, so the description can never miss a route. A host's endpoints
+     * carry the tag they were registered with.
+     */
+    @OptIn(ExperimentalKtorApi::class)
+    internal fun mount(parent: Route): RoutingNode = synchronized(this) {
+        val v1 = parent.route(V1) {} as RoutingNode
+        v1.keyRoutes()
+        v1.workspaceRoutes()
+        v1.projectRoutes()
+        v1.serviceRoutes()
+        v1.agentRoutes()
+        v1.variableRoutes()
+        v1.resultRoutes()
+        v1.metricsRoutes()
+        v1.silenceRoutes()
+        v1.accessRoutes()
+        v1.directoryRoutes()
+        v1.webhookRoutes()
+        for (route in v1.endpoints()) {
+            val (method, path) = route
+            val operation = PublicApiOperations.find(method, path)
+                ?: error("${method.value} $V1$path has no entry in PublicApiOperations")
+            route.node.describe { describe(operation) }
+        }
+        for ((tag, block) in extensions) {
+            val before = v1.endpoints().map { it.node }.toSet()
+            v1.block()
+            v1.endpoints().filter { it.node !in before }.forEach { it.node.describe { tag(tag) } }
+        }
+        mountedPaths.clear()
+        v1.endpoints().forEach { endpoint ->
+            val pattern = (V1 + endpoint.path).split('/').joinToString("/") { segment ->
+                if (segment.startsWith("{") && segment.endsWith("}")) "[^/]+" else Regex.escape(segment)
+            }
+            mountedPaths += endpoint.method to Regex(pattern)
         }
         mounted = true
+        v1
+    }
+
+    /** An endpoint under [V1]: its method, its path relative to [V1], and its handler's node. */
+    private data class Endpoint(val method: HttpMethod, val path: String, val node: RoutingNode)
+
+    private fun RoutingNode.endpoints(): List<Endpoint> = getAllRoutes().mapNotNull { node ->
+        val method = (node.selector as? HttpMethodRouteSelector)?.method ?: return@mapNotNull null
+        val path = node.parent?.toString()?.removePrefix(V1) ?: return@mapNotNull null
+        Endpoint(method, path, node)
     }
 
     /**
@@ -163,13 +244,28 @@ object PublicApi {
      */
     internal fun install(application: Application) {
         application.install(Enforcement)
+        application.install(Responses)
     }
 
     private val Enforcement = createApplicationPlugin("PublicApiEnforcement") {
         on(AroundCall) { call, proceed ->
-            if (!ApiNamespace.isPublicUri(call.request.local.uri)) {
+            val uri = call.request.local.uri
+            if (!ApiNamespace.isPublicUri(uri)) {
+                // A path that names the namespace but will not reduce to one
+                // canonical form is in no namespace at all — refused here, not
+                // left to whatever the router makes of it.
+                if (ApiNamespace.claimsPublicUri(uri)) throw BadRequestException(ErrorCodes.INVALID_PATH)
                 withContext(AuditActor.asContextElement(null)) { proceed() }
                 return@on
+            }
+            // HEAD on a read is served as the read, without its body — the read
+            // cap admits it, so the routes answer it too. A route that answers
+            // HEAD itself keeps it.
+            if (call.request.local.method == HttpMethod.Head &&
+                !isMountedPath(uri, HttpMethod.Head) && isMountedPath(uri, HttpMethod.Get)
+            ) {
+                call.mutableOriginConnectionPoint.method = HttpMethod.Get
+                call.attributes.put(headRequest, Unit)
             }
             val caller = admit(call)
             // A guard that answered for itself has ended the call.
@@ -181,6 +277,66 @@ object PublicApi {
             // not a coroutine launched from the call, which starts outside.
             withContext(AuditActor.asContextElement(caller.keyId)) { proceed() }
         }
+    }
+
+    /** Every endpoint mounted under [V1]: its method, and a pattern its paths match (`{x}` is one segment). */
+    private val mountedPaths = CopyOnWriteArrayList<Pair<HttpMethod, Regex>>()
+
+    /** Whether [rawUri] names a path mounted under [V1] — for [method], or for any method when it is null. */
+    internal fun isMountedPath(rawUri: String, method: HttpMethod? = null): Boolean {
+        val path = PathCanonicalizer.canonicalize(rawUri) ?: return false
+        return mountedPaths.any { (m, pattern) -> (method == null || m == method) && pattern.matches(path) }
+    }
+
+    /**
+     * The namespace's answer for a request no handler answered — what the
+     * router or the engine would send as a bare status: 405
+     * `method_not_allowed` for a mounted path asked with a method it does not
+     * take (the router says 404 for both), 404 `not_found` otherwise. Null
+     * outside the namespace, or for a status that is not one of those.
+     */
+    internal fun unmatched(rawUri: String, status: HttpStatusCode): Pair<HttpStatusCode, String>? {
+        if (!ApiNamespace.isPublicUri(rawUri)) return null
+        return when {
+            status == HttpStatusCode.MethodNotAllowed ||
+                (status == HttpStatusCode.NotFound && isMountedPath(rawUri)) ->
+                HttpStatusCode.MethodNotAllowed to ErrorCodes.METHOD_NOT_ALLOWED
+            status == HttpStatusCode.NotFound -> HttpStatusCode.NotFound to ErrorCodes.NOT_FOUND
+            else -> null
+        }
+    }
+
+    /** Marks a HEAD request being answered as its GET. */
+    private val headRequest = AttributeKey<Unit>("PublicApiHead")
+
+    /**
+     * The namespace's answers on their way out. The router's own refusals — a
+     * bare 404 for a path no route matches, a bare 405 for a method a route
+     * does not take — are given the API's error shape, `{"error": code}`; a
+     * handler's 404 already carries its own code and is left alone. A HEAD
+     * answer is sent without the body its GET would have had.
+     */
+    private val Responses = createApplicationPlugin("PublicApiResponses") {
+        on(ResponseBodyReadyForSend) { call, content ->
+            if (!ApiNamespace.isPublicUri(call.request.local.uri)) return@on
+            var answer = content
+            if (content is HttpStatusCodeContent) {
+                unmatched(call.request.local.uri, content.status)?.let { (status, code) ->
+                    answer = TextContent("""{"error":"$code"}""", ContentType.Application.Json, status)
+                }
+            }
+            if (call.attributes.contains(headRequest)) answer = HeadOnly(answer)
+            if (answer !== content) transformBodyTo(answer)
+        }
+    }
+
+    /** [original]'s status and headers, and no body. */
+    private class HeadOnly(private val original: OutgoingContent) : OutgoingContent.NoContent() {
+        override val status: HttpStatusCode? get() = original.status
+        override val contentType: ContentType? get() = original.contentType
+        override val contentLength: Long? get() = original.contentLength
+        override val headers: Headers get() = original.headers
+        override fun <T : Any> getProperty(key: AttributeKey<T>): T? = original.getProperty(key)
     }
 
     /** Runs a handler around the remainder of the call's pipeline. */
@@ -218,5 +374,8 @@ object PublicApi {
     private val READ_METHODS = setOf(HttpMethod.Get, HttpMethod.Head)
 }
 
-/** Mounts the key-authenticated API's routes, with whatever a host has registered into it. */
-fun Route.publicApiRoutes() = PublicApi.mount(this)
+/**
+ * Mounts the key-authenticated API's routes, with whatever a host has
+ * registered into it, and returns the subtree they were mounted in.
+ */
+fun Route.publicApiRoutes(): RoutingNode = PublicApi.mount(this)

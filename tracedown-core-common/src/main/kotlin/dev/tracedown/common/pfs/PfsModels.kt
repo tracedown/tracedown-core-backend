@@ -37,7 +37,9 @@ data class PfsParams(
     // Offset must stride by the same clamped size as limit, or pages past the
     // cap silently skip rows (limit 100 rows, offset advancing by the raw size).
     val limit: Int get() = pageSize.coerceIn(1, 100)
-    val offset: Long get() = ((page - 1).coerceAtLeast(0) * limit).toLong()
+    // In Long before the multiplication: a large page number times the page
+    // size overflows an Int into a negative offset.
+    val offset: Long get() = (page - 1).coerceAtLeast(0).toLong() * limit
 }
 
 @Serializable

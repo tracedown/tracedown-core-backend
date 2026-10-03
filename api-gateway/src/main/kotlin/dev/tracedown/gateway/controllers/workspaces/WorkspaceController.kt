@@ -27,6 +27,7 @@ import dev.tracedown.gateway.data.workspaces.UpdateWorkspaceRequest
 import dev.tracedown.gateway.data.workspaces.WorkspaceSummary
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
+import dev.tracedown.common.pfs.applyDefaultOrder
 import dev.tracedown.common.pfs.applyFilters
 import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.common.pfs.applySorters
@@ -45,6 +46,7 @@ import dev.tracedown.gateway.util.VariableCrypto
 import dev.tracedown.gateway.util.requireCachedPermissions
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -111,6 +113,7 @@ object WorkspaceController {
                 .where { (Workspaces.organizationId eq orgId) and (Workspaces.deleted eq false) }
             query.applyFilters(pfs)
             query.applySorters(pfs)
+            query.applyDefaultOrder(pfs, listOf(Workspaces.createdAt to SortOrder.ASC, Workspaces.id to SortOrder.ASC))
             query
                 .filter { canAccessResource(cached, "workspace", it[Workspaces.id]) }
                 .map { workspaceSummaryFromRow(it) }
@@ -211,7 +214,9 @@ object WorkspaceController {
 
             val query = WorkspaceVariables.selectAll()
                 .where { (WorkspaceVariables.workspaceId eq workspaceId) and (WorkspaceVariables.deleted eq false) }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(
+                pfs, listOf(WorkspaceVariables.createdAt to SortOrder.ASC, WorkspaceVariables.id to SortOrder.ASC),
+            )
             Page(items = pagedQuery.map { variableSummaryFromRow(it) }, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }
@@ -307,6 +312,7 @@ object WorkspaceController {
                 "resource.variable.created", "variable", id,
                 buildJsonObject { put("id", id.toString()); put("orgId", orgId.toString()); put("scope", "workspace"); put("parentId", workspaceId.toString()) },
             )
+            AuditService.log(orgId, userId, "create.variable", "variable", id.toString(), entityDisplayName = key, comment = "workspace $workspaceId")
             RealtimePublisher.publish("workspace:$workspaceId", orgId, "variable.changed", buildJsonObject { put("resourceType", "workspaces"); put("resourceId", workspaceId.toString()) })
             variableSummary(id)
         }
@@ -347,6 +353,7 @@ object WorkspaceController {
                 "resource.variable.updated", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "workspace"); put("parentId", workspaceId.toString()) },
             )
+            AuditService.log(orgId, userId, "update.variable", "variable", varId.toString(), entityDisplayName = row[WorkspaceVariables.key], comment = "workspace $workspaceId")
             RealtimePublisher.publish("workspace:$workspaceId", orgId, "variable.changed", buildJsonObject { put("resourceType", "workspaces"); put("resourceId", workspaceId.toString()) })
             variableSummary(varId)
         }
@@ -380,6 +387,7 @@ object WorkspaceController {
                 "resource.variable.deleted", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "workspace"); put("parentId", workspaceId.toString()) },
             )
+            AuditService.log(orgId, userId, "delete.variable", "variable", varId.toString(), entityDisplayName = row[WorkspaceVariables.key], comment = "workspace $workspaceId")
             RealtimePublisher.publish("workspace:$workspaceId", orgId, "variable.changed", buildJsonObject { put("resourceType", "workspaces"); put("resourceId", workspaceId.toString()) })
         }
     }
@@ -450,5 +458,6 @@ object WorkspaceController {
         systemType = row[WorkspaceVariables.systemType],
         createdAt = row[WorkspaceVariables.createdAt].toString(),
         updatedAt = row[WorkspaceVariables.updatedAt].toString(),
+        masked = VariableCrypto.isMasked(row[WorkspaceVariables.secret], row[WorkspaceVariables.encrypted], reveal),
     )
 }
