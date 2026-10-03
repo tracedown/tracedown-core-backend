@@ -2,6 +2,8 @@ package dev.tracedown.gateway.controllers.me
 
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.auth.canWrite
+import dev.tracedown.gateway.data.apikeys.ApiKeyAccess
 import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.NotificationSilences
@@ -287,6 +289,7 @@ object UserDataController {
                     entityDisplayName = row[OrgAuditLog.entityDisplayName],
                     diff = row[OrgAuditLog.diff],
                     comment = row[OrgAuditLog.comment],
+                    apiKeyId = row[OrgAuditLog.apiKeyId]?.toString(),
                     createdAt = row[OrgAuditLog.createdAt].toString(),
                 )
             }
@@ -339,6 +342,8 @@ object UserDataController {
                 ExportApiKey(
                     organizationId = row[ApiKeys.organizationId].toString(),
                     name = row[ApiKeys.name],
+                    prefix = row[ApiKeys.keyPrefix],
+                    access = if (row[ApiKeys.access].canWrite()) ApiKeyAccess.WRITE else ApiKeyAccess.READ,
                     lastUsedAt = row[ApiKeys.lastUsedAt]?.toString(),
                     expiresAt = row[ApiKeys.expiresAt]?.toString(),
                     revoked = row[ApiKeys.revoked],

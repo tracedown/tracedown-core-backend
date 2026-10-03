@@ -63,6 +63,36 @@ class RateLimiterTest {
     }
 
     @Test
+    fun `the configured defaults and the window floor`() {
+        val defaults = RateLimitConfig.load(io.ktor.server.config.MapApplicationConfig())
+        assertEquals(TierConfig(maxRequests = 300, windowSeconds = 60), defaults.api)
+        assertEquals(TierConfig(maxRequests = 30, windowSeconds = 60), defaults.apiFailure)
+
+        // The window is a divisor: a zero from a mistyped variable is a limit
+        // of one second, not an arithmetic error on every request.
+        val floored = RateLimitConfig.load(
+            io.ktor.server.config.MapApplicationConfig(
+                "rateLimit.api.windowSeconds" to "0",
+                "rateLimit.apiFailure.windowSeconds" to "-5",
+            ),
+        )
+        assertEquals(1L, floored.api.windowSeconds)
+        assertEquals(1L, floored.apiFailure.windowSeconds)
+    }
+
+    @Test
+    fun `the key tiers fail open when redis is down`() {
+        val limiter = RateLimiter(redis = { throw RuntimeException("redis down") }, config = config)
+        assertTrue(limiter.check("digest", RateLimiter.Tier.API).allowed)
+        assertTrue(limiter.check("203.0.113.9", RateLimiter.Tier.API_FAILURE).allowed)
+        // Looking is as forgiving as counting, and a mark that cannot be read is not there.
+        assertTrue(limiter.peek("203.0.113.9", RateLimiter.Tier.API_FAILURE).allowed)
+        assertFalse(limiter.remembered("good:digest"))
+        limiter.remember("good:digest", 60)
+        limiter.forget("good:digest")
+    }
+
+    @Test
     fun `general tier fails open when redis is down`() {
         val limiter = RateLimiter(redis = { throw RuntimeException("redis down") }, config = config)
         val result = limiter.check("203.0.113.9", RateLimiter.Tier.GENERAL)

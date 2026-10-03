@@ -21,6 +21,24 @@ object ErrorCodes {
     const val SETUP_TOKEN_EXPIRED = "setup_token_expired"
     const val INVALID_SETUP_TOKEN = "invalid_setup_token"
 
+    // ── API keys ──
+    /** No such key — also the answer to anything that is not a key at all. */
+    const val INVALID_API_KEY = "invalid_api_key"
+    const val API_KEY_EXPIRED = "api_key_expired"
+    const val API_KEY_REVOKED = "api_key_revoked"
+    /** The user the key acts as is gone, deactivated, or no longer a member of the key's organization. */
+    const val API_KEY_OWNER_INACTIVE = "api_key_owner_inactive"
+    /** A read-only key was used for something that changes state. */
+    const val API_KEY_READ_ONLY = "api_key_read_only"
+    /** The address has sent more tokens that name no key than the operator allows; a known key is unaffected. */
+    const val TOO_MANY_UNKNOWN_KEYS = "too_many_unknown_keys"
+    /** The user already holds as many keys as the operator allows. */
+    const val API_KEY_LIMIT_REACHED = "api_key_limit_reached"
+    /** The key's user must enrol a second factor before anything may act as them — the key included. */
+    const val TOTP_ENROLLMENT_REQUIRED = "totp_enrollment_required"
+    /** An API key was presented where only a signed-in session is accepted. */
+    const val SESSION_REQUIRED = "session_required"
+
     // ── Invites ──
     const val INVALID_INVITE_TOKEN = "invalid_invite_token"
     const val INVITE_EXPIRED = "invite_expired"
@@ -118,7 +136,21 @@ object ErrorCodes {
      */
     const val ACCOUNT_OWNS_ORGANIZATIONS = "account_owns_organizations"
 
+    // ── Runs ──
+    /** A run was asked for a service that is switched off. */
+    const val SERVICE_INACTIVE = "service_inactive"
+    /** A run was asked for a service that has no script to run. */
+    const val SCRIPT_MISSING = "script_missing"
+
+    // ── Webhook bindings ──
+    /** The webhook is already bound to that resource. */
+    const val BINDING_EXISTS = "binding_exists"
+
     // ── General ──
     const val INTERNAL_ERROR = "internal_error"
     const val NOT_SUPPORTED = "not_supported"
+    /** No route answers that method on that path (the route exists for other methods). */
+    const val METHOD_NOT_ALLOWED = "method_not_allowed"
+    /** A path that does not reduce to one canonical form — dot segments, encoded separators. */
+    const val INVALID_PATH = "invalid_path"
 }

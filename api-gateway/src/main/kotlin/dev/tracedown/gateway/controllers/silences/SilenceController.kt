@@ -22,6 +22,7 @@ import dev.tracedown.gateway.util.requireCachedPermissions
 import org.dmfs.rfc5545.recur.RecurrenceRule
 import org.jetbrains.exposed.v1.core.JoinType
 import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
@@ -81,7 +82,8 @@ object SilenceController {
             val query = NotificationSilences.selectAll()
                 .where { NotificationSilences.orgUserId eq orgUserId }
 
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            // A silence has neither a name nor a creation time: its id is the order.
+            val (pagedQuery, total) = query.applyPfs(pfs, listOf(NotificationSilences.id to SortOrder.ASC))
             val items = pagedQuery.map { silenceSummaryFromRow(orgId, it) }
 
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)

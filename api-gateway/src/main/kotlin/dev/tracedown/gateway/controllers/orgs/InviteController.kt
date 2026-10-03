@@ -6,6 +6,7 @@ import dev.tracedown.common.realtime.RealtimePublisher
 
 import dev.tracedown.common.onboarding.PasswordHasher
 import dev.tracedown.common.audit.AuditService
+import dev.tracedown.gateway.controllers.apikeys.ApiKeyController
 import dev.tracedown.common.auth.PermissionCacheService
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
@@ -351,6 +352,11 @@ object InviteController {
                 }
             }
             val orgUserId = invite[OrgUsers.id]
+            // A membership that starts here starts without keys. Removal
+            // revokes a member's keys, but a mint that raced the removal can
+            // leave one unrevoked, and once the old membership row is purged a
+            // re-invite is a fresh row that nothing else would reach.
+            ApiKeyController.revokeAllFor(orgId, userId, reason = "Membership restarted")
             OrgUsers.update({ OrgUsers.id eq orgUserId }) {
                 it[status] = "active"
                 it[isActive] = true

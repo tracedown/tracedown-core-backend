@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.data.metrics
 
+import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -22,9 +23,13 @@ data class MetricsCounters(
 
 @Serializable
 data class MetricsState(
+    @JsonSchema.Description("`success`, `failure`, `timeout`, `skipped` or `error`; null before the first run.")
     val lastStatus: String?,
     val lastConsecutive: Long,
     val lastResponseMs: Long,
+    /** When the service last ran, in epoch seconds. */
+    @JsonSchema.Format("int64")
+    @JsonSchema.Description("When the service last ran, in epoch seconds.")
     val lastRunAt: Long?,
 )
 
@@ -37,6 +42,7 @@ data class ResponsePercentiles(
 
 @Serializable
 data class HourlyBucket(
+    @JsonSchema.Description("The UTC hour the bucket covers, `yyyyMMddHH`.")
     val hour: String,
     val total: Long,
     val success: Long,

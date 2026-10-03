@@ -31,6 +31,12 @@ class PathCanonicalizerTest {
     }
 
     @Test
+    fun `rejects an encoded slash, which is one segment to a router and two here`() {
+        assertNull(PathCanonicalizer.canonicalize("/api/public%2Fv1/key"))
+        assertNull(PathCanonicalizer.canonicalize("/api/v1%2f..%2f..%2Fpublic/key"))
+    }
+
+    @Test
     fun `rejects a malformed percent-escape`() {
         assertNull(PathCanonicalizer.canonicalize("/api/%zz/login"))
         assertNull(PathCanonicalizer.canonicalize("/api/%2"))

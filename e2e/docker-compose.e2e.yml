@@ -46,6 +46,9 @@ services:
       - ../api-gateway/build/install/api-gateway:/app
       # Filesystem body stores live here, shared with the ingestor.
       - tracedown-stores:/data/stores
+      # The default store: what the agent writes, the ingestor relocates and
+      # the gateway reads back, at the same path in all three.
+      - tracedown-bodies:/data/bodies
     command: /app/bin/api-gateway
     ports:
       - "18080:8080"
@@ -59,6 +62,7 @@ services:
       PLATFORM_AES_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       BODY_STORE_AES_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
       BODY_STORE_FILESYSTEM_BASES: /data/stores
+      STORAGE_FILESYSTEM_ROOT: /data/bodies
       # The suite's object store is an S3-compatible server on this network, over http.
       BODY_STORE_PRIVATE_ENDPOINTS: "true"
       SINGLE_ORG_MODE: "true"
@@ -110,6 +114,9 @@ services:
       - ../result-ingestor/build/install/result-ingestor:/app
       # The same store directories the gateway reads in_place bodies from.
       - tracedown-stores:/data/stores
+      # The default store, shared with the agent (which writes there) and the
+      # gateway (which reads): relocation moves a body within this one root.
+      - tracedown-bodies:/data/bodies
     command: /app/bin/result-ingestor
     environment:
       DATABASE_URL: jdbc:postgresql://postgres:5432/tracedown
@@ -120,6 +127,7 @@ services:
       BODY_STORE_AES_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
       BODY_STORE_FILESYSTEM_BASES: /data/stores
       BODY_STORE_PRIVATE_ENDPOINTS: "true"
+      STORAGE_FILESYSTEM_ROOT: /data/bodies
       PORT: 8082
     depends_on:
       gateway:
@@ -218,12 +226,17 @@ services:
     # verification against a name the certificate does not carry. Without this
     # the container's FQDN is its container id and nothing can reach the agent.
     hostname: e2e-agent
+    volumes:
+      # Where the agent writes bodies, the same volume and path the ingestor
+      # relocates them within — a body written anywhere else could not be
+      # taken over, and the run would record it as not stored.
+      - tracedown-bodies:/data/bodies
     environment:
       PROBE_AGENT_BOOTSTRAP_TOKEN: "${AGENT_BOOTSTRAP_TOKEN}"
       PROBE_AGENT_SCHEDULER_URL: http://gateway:8080
       PROBE_AGENT_PORT: "8443"
       PROBE_AGENT_STORAGE_BACKEND: filesystem
-      PROBE_AGENT_STORAGE_DIR: /tmp/bodies
+      PROBE_AGENT_STORAGE_DIR: /data/bodies
     depends_on:
       gateway:
         condition: service_healthy
@@ -249,3 +262,6 @@ volumes:
   # lives (BODY_STORE_FILESYSTEM_BASES). The worker does not need it — it never
   # deletes from a store.
   tracedown-stores:
+  # The default body store's filesystem root (STORAGE_FILESYSTEM_ROOT), shared
+  # by the agent, the ingestor and the gateway at the same path.
+  tracedown-bodies:

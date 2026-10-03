@@ -146,3 +146,16 @@ data class OrgUserSummary(
 data class ToggleOrgUserRequest(
     val isActive: Boolean,
 )
+
+/**
+ * A member as the key-authenticated API lists them: who they are, so a client
+ * can grant them access — not what they may do in the organization.
+ */
+@Serializable
+data class PublicMemberSummary(
+    val userId: String,
+    val displayName: String,
+    val email: String,
+    /** False while the member is disabled: they keep their grants but cannot sign in. */
+    val isActive: Boolean,
+)

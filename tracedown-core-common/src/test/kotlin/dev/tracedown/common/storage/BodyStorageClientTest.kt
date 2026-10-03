@@ -145,6 +145,18 @@ class BodyStorageClientTest {
     }
 
     @Test
+    fun `sizeOf reports a confined file's size, nothing for a missing one, and refuses outside the root`(@TempDir root: Path) {
+        val client = confinedTo(root)
+        val big = root.resolve("sized.bin")
+        java.io.RandomAccessFile(big.toFile(), "rw").use { it.setLength(5_000) }
+
+        assertEquals(5_000L, client.sizeOf("file://$big"))
+        assertEquals(null, client.sizeOf("file://${root.resolve("absent.bin")}"))
+        assertThrows(StorageConfinementException::class.java) { client.sizeOf("file:///etc/passwd") }
+        assertThrows(IllegalArgumentException::class.java) { client.sizeOf("ftp://somewhere/else") }
+    }
+
+    @Test
     fun `readBody refuses an over-size body rather than buffering it`(@TempDir root: Path) {
         val client = confinedTo(root)
         val big = root.resolve("big.bin")

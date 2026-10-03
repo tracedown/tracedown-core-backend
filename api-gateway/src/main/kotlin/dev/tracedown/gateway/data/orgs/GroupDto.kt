@@ -65,3 +65,14 @@ data class SyncMembersRequest(val userIds: List<String>) : Validatable {
         Validators.each(userIds) { Validators.uuid("userId", it) }?.let(::add)
     }
 }
+
+/**
+ * A group as the key-authenticated API lists it: enough to grant it access to
+ * a resource, and nothing of the organization permissions it carries.
+ */
+@Serializable
+data class PublicGroupSummary(
+    val id: String,
+    val name: String,
+    val memberCount: Int,
+)

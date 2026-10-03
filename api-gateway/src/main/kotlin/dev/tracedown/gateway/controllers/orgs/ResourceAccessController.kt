@@ -3,6 +3,7 @@ package dev.tracedown.gateway.controllers.orgs
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.PermissionCacheService
+import dev.tracedown.common.auth.canAccessResource
 import dev.tracedown.common.auth.canWriteResource
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.OrgGroups
@@ -10,13 +11,15 @@ import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.ResourcePermissions
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.realtime.RealtimePublisher
-import dev.tracedown.gateway.util.ResourceResolver
 import dev.tracedown.gateway.data.orgs.ResourceAccessEntry
 import dev.tracedown.gateway.data.orgs.UpsertAccessRequest
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.ResourceResolver
+import dev.tracedown.gateway.util.fieldError
 import dev.tracedown.gateway.util.parseUuid
 import dev.tracedown.gateway.util.requireCachedPermissions
+import java.util.UUID
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.jetbrains.exposed.v1.core.JoinType
@@ -28,7 +31,6 @@ import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import java.util.UUID
 
 /**
  * Resource-scoped access management: who (users/groups) holds a grant on a
@@ -54,8 +56,20 @@ object ResourceAccessController {
                 val ctx = ResourceResolver.resolveService(resourceId, orgId)
                 listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
             }
-            else -> throw BadRequestException(ErrorCodes.FIELD_INVALID)
+            else -> throw fieldError("resourceType")
         }
+
+    /**
+     * Read access to the resource — what the caller needs to see it at all.
+     * One the caller cannot see is answered as one that does not exist.
+     */
+    internal fun requireResourceRead(orgId: UUID, userId: UUID, resourceType: String, resourceId: UUID) {
+        val chain = parentChain(resourceType, resourceId, orgId)
+        val cached = requireCachedPermissions(orgId, userId)
+        if (!canAccessResource(cached, resourceType, resourceId, chain)) {
+            throw NotFoundException()
+        }
+    }
 
     /**
      * Write access to the resource itself — the right to hand out access to it.
@@ -113,12 +127,14 @@ object ResourceAccessController {
                     )
                 }
 
-            groups.sortedBy { it.name } + users.sortedBy { it.name }
+            // Groups first, then users; each by name, ties by id so the order never moves.
+            groups.sortedWith(compareBy({ it.name }, { it.principalId })) +
+                users.sortedWith(compareBy({ it.name }, { it.principalId }))
         }
     }
 
     fun upsert(orgId: UUID, resourceType: String, resourceId: UUID, request: UpsertAccessRequest, requestingUserId: UUID) {
-        if (request.permissions !in 1..2) throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        if (request.permissions !in 1..2) throw fieldError("permissions")
         transaction {
             requireResourceWrite(orgId, requestingUserId, resourceType, resourceId)
             val (storedType, storedId) = resolvePrincipal(orgId, request.principalType, request.principalId)
@@ -187,7 +203,11 @@ object ResourceAccessController {
 
     /** Maps the API's user/group ids onto stored principal rows. */
     private fun resolvePrincipal(orgId: UUID, principalType: String, principalId: String): Pair<String, UUID> {
-        val id = parseUuid(principalId, "principal ID")
+        val id = try {
+            UUID.fromString(principalId)
+        } catch (_: IllegalArgumentException) {
+            throw fieldError("principalId", ErrorCodes.INVALID_UUID)
+        }
         return when (principalType) {
             "user" -> {
                 val orgUser = OrgUsers.selectAll()
@@ -205,7 +225,7 @@ object ResourceAccessController {
                     .firstOrNull() ?: throw NotFoundException()
                 "org_group" to id
             }
-            else -> throw BadRequestException(ErrorCodes.FIELD_INVALID)
+            else -> throw fieldError("principalType")
         }
     }
 
