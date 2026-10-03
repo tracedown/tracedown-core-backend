@@ -17,6 +17,7 @@ import kotlinx.serialization.descriptors.StructureKind
 import kotlinx.serialization.descriptors.elementDescriptors
 import kotlinx.serialization.serializer
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.BeforeEach
@@ -220,6 +221,13 @@ class PublicApiContractTest {
             return written
         }
 
+        /**
+         * The baseline route lines [current] no longer has exactly: a route
+         * that went, or one whose operation id, status, query parameters or
+         * types changed. A route [current] adds is no change.
+         */
+        fun routeChanges(baseline: List<String>, current: List<String>): List<String> = baseline - current.toSet()
+
         /** Every way [current] moves away from [baseline] (see the class KDoc), as readable lines. */
         fun breaks(baseline: Map<String, Shape>, current: Map<String, Shape>, requestClasses: Set<String>): List<String> {
             val out = mutableListOf<String>()
@@ -268,9 +276,7 @@ class PublicApiContractTest {
         val written = writeCurrent(ROUTES_FILE, current.joinToString("\n", postfix = "\n"))
         val pinned = baseline(ROUTES_FILE).replace("\r\n", "\n").lines().filter { it.isNotBlank() }
         assertTrue(pinned.isNotEmpty(), "The routes baseline is empty")
-        // Every baseline line must still be there exactly: a route that went,
-        // or one whose operation id, status, parameters or types changed.
-        val changed = pinned - current.toSet()
+        val changed = routeChanges(pinned, current)
         assertTrue(changed.isEmpty(), "Baseline routes gone or changed:\n${changed.joinToString("\n")}\n$DELIBERATE (Current routes: $written)")
     }
 
@@ -293,6 +299,23 @@ class PublicApiContractTest {
         for ((name, sample) in SAMPLES) {
             val (encode, golden) = sample
             kotlin.test.assertEquals(golden, encode(), "The serialized shape of $name changed. $DELIBERATE")
+        }
+    }
+
+    @Test
+    fun `the route check refuses a removed or changed route and passes an added one`() {
+        val line = "GET /api/public/v1/things listThings 200 [page pageSize] -> - / Page<Thing>"
+        val baseline = listOf(line)
+        assertEquals(emptyList<String>(), routeChanges(baseline, listOf(line, "POST /api/public/v1/things createThing 200 [] -> New / Thing")))
+        assertEquals(baseline, routeChanges(baseline, emptyList()), "a removed route")
+        for (changed in listOf(
+            line.replace("listThings", "getThings"),
+            line.replace(" 200 ", " 202 "),
+            line.replace("[page pageSize]", "[page pageSize kind!]"),
+            line.replace("Page<Thing>", "List<Thing>"),
+            line.replace("-> -", "-> Filter"),
+        )) {
+            assertEquals(baseline, routeChanges(baseline, listOf(changed)), "changed: $changed")
         }
     }
 

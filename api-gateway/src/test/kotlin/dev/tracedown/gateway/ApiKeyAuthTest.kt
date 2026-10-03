@@ -939,7 +939,7 @@ class ApiKeyAuthTest {
     }
 
     @Test
-    fun `a mint racing the member's removal either waits for it or is revoked by it`() {
+    fun `a mint that waited on a removal is refused by the check it makes under the lock`() {
         val owner = newOwner()
         val member = newMember(owner.orgId)
         val session = login(member)
@@ -948,9 +948,11 @@ class ApiKeyAuthTest {
                 .single()[OrgUsers.id]
         }
 
-        // The removal, as the dashboard runs it, held open: the membership is
-        // marked gone and stripped (MembershipAccess.revokeAll) but not yet
-        // committed, so its row locks are held.
+        // Only the membership row: marked gone and stripped of its levels, and
+        // held uncommitted. Nothing touches the account, so the mint passes
+        // every check it makes before locking, blocks on the membership row
+        // (`FOR SHARE`), and only the check it makes once it holds the lock
+        // can refuse it.
         val holding = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
         val pool = Executors.newFixedThreadPool(2)
@@ -958,8 +960,15 @@ class ApiKeyAuthTest {
             transaction {
                 OrgUsers.update({ OrgUsers.id eq membershipId }) {
                     it[deleted] = true
+                    it[orgUserList] = 0
+                    it[orgSettings] = 0
+                    it[orgDomains] = 0
+                    it[orgWebhooks] = 0
+                    it[orgNotifications] = 0
+                    it[orgAdmin] = 0
+                    it[orgWorkspaces] = 0
+                    it[permissionCache] = null
                 }
-                dev.tracedown.gateway.controllers.orgs.MembershipAccess.revokeAll(member.orgId, membershipId)
                 holding.countDown()
                 assertTrue(release.await(10, java.util.concurrent.TimeUnit.SECONDS), "The mint never reached the lock")
             }
@@ -967,26 +976,31 @@ class ApiKeyAuthTest {
         try {
             assertTrue(holding.await(10, java.util.concurrent.TimeUnit.SECONDS), "The removal never started")
             val mint = pool.submit(Callable { post("/api/v1/me/api-keys", mintBody("raced"), session) })
-            // Released only once the mint is waiting on a row lock the removal holds.
+            // Released only once the mint is waiting on the membership row.
+            var blockedOn: String? = null
             val deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos()
-            while (System.nanoTime() < deadline) {
-                val waiting = transaction {
-                    exec("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'") { rs -> rs.next(); rs.getInt(1) } ?: 0
+            while (System.nanoTime() < deadline && blockedOn == null) {
+                blockedOn = transaction {
+                    exec("SELECT query FROM pg_stat_activity WHERE wait_event_type = 'Lock'") { rs ->
+                        if (rs.next()) rs.getString(1) else null
+                    }
                 }
-                if (waiting > 0) break
-                Thread.sleep(20)
+                if (blockedOn == null) Thread.sleep(20)
             }
             release.countDown()
             remover.get(10, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull(blockedOn, "The mint never waited on a lock")
+            assertTrue(
+                "org_users" in blockedOn!!.lowercase() && "for share" in blockedOn.lowercase(),
+                "The mint should wait on the membership row: $blockedOn",
+            )
             assertRefused(403, "not_org_member", mint.get(10, java.util.concurrent.TimeUnit.SECONDS))
         } finally {
             release.countDown()
             pool.shutdown()
         }
-        val live = transaction {
-            ApiKeys.selectAll().where { (ApiKeys.createdBy eq member.userId) and (ApiKeys.revoked eq false) }.count()
-        }
-        assertEquals(0, live, "No live key may outlive a removal it raced")
+        val written = transaction { ApiKeys.selectAll().where { ApiKeys.createdBy eq member.userId }.count() }
+        assertEquals(0, written, "No key may be written for a membership that ended while the mint waited")
     }
 
     @Test
@@ -1009,6 +1023,18 @@ class ApiKeyAuthTest {
             assertTrue(
                 Duration.between(Instant.now().plus(Duration.ofDays(30)), retained).abs() < Duration.ofMinutes(5),
                 "A key with no purge date gets the retention: $retained",
+            )
+
+            // A later purge date is brought forward to the retention.
+            val late = createKey(session, name = "due late").str("id")
+            transaction {
+                ApiKeys.update({ ApiKeys.id eq UUID.fromString(late) }) { it[purgeAfter] = Instant.now().plus(Duration.ofDays(90)) }
+            }
+            assertEquals(200, delete("/api/v1/me/api-keys/$late", session).first)
+            val brought = keyRow(late)[ApiKeys.purgeAfter]!!
+            assertTrue(
+                Duration.between(Instant.now().plus(Duration.ofDays(30)), brought).abs() < Duration.ofMinutes(5),
+                "A later purge date becomes the retention: $brought",
             )
 
             // The same for the keys a new holder of the account sweeps away.

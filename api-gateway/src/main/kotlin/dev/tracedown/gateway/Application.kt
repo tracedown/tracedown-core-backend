@@ -497,14 +497,6 @@ fun Application.module() {
         exception<dev.tracedown.common.pfs.PfsValidationException> { call, cause ->
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to cause.code))
         }
-        // A request in the key-authenticated API that no route answers gets
-        // that API's error shape rather than an empty 404 (PublicApi rewrites
-        // the router's bare 404/405 the same way). The dashboard's is untouched.
-        unhandled { call ->
-            PublicApi.unmatched(call.request.local.uri, HttpStatusCode.NotFound)?.let { (status, code) ->
-                call.respond(status, mapOf("error" to code))
-            }
-        }
         exception<Throwable> { call, cause ->
             log.error("Unhandled exception", cause)
             // Report the unhandled error to any registered observer (default no-op).

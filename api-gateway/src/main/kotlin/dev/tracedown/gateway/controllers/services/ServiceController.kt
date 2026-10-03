@@ -86,6 +86,7 @@ import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 
@@ -561,6 +562,12 @@ object ServiceController {
             // enable was not. Its own audit entry, under the toggle's action:
             // "who switched this on" has one answer wherever it was switched on.
             if (enableNow) {
+                // A savepoint, so a refusal from either side of the hook —
+                // a before-hook, or an after-hook that throws once the switch
+                // and its audit entry are written — undoes the enable and only
+                // the enable.
+                val connection = TransactionManager.current().connection
+                val beforeEnable = connection.setSavepoint("before_enable")
                 try {
                     Interceptors.injectable(
                         "service.toggle",
@@ -580,7 +587,9 @@ object ServiceController {
                         )
                         serviceSummary(serviceId)
                     }
+                    connection.releaseSavepoint(beforeEnable)
                 } catch (refused: ApiException) {
+                    connection.rollback(beforeEnable)
                     log.info("service {} saved but not switched on: {}", serviceId, refused.code)
                 }
             }

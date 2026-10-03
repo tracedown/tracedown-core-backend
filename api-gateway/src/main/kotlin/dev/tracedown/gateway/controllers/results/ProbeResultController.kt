@@ -5,6 +5,9 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
+import dev.tracedown.common.pfs.Page
+import dev.tracedown.common.pfs.PfsParams
+import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.common.storage.BodyStorageClient
 import dev.tracedown.common.storage.BodyStore
 import dev.tracedown.common.storage.BodyStoreRegistry
@@ -12,37 +15,34 @@ import dev.tracedown.common.storage.BodyStoreSecretException
 import dev.tracedown.common.storage.BodyStoreService
 import dev.tracedown.common.storage.BodyTooLargeException
 import dev.tracedown.common.storage.StorageConfinementException
+import dev.tracedown.common.storage.StorageUnconfiguredException
+import dev.tracedown.common.storage.StorageUri
+import dev.tracedown.common.storage.StorageUriException
 import dev.tracedown.common.storage.StoreEndpointGuard
-import dev.tracedown.gateway.util.ApiException
-import io.ktor.http.HttpStatusCode
-import org.slf4j.LoggerFactory
-import dev.tracedown.common.pfs.Page
-import dev.tracedown.common.pfs.PfsParams
-import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.gateway.data.results.ProbeResultDetail
 import dev.tracedown.gateway.data.results.ProbeResultSummary
 import dev.tracedown.gateway.data.results.ProbeStepSummary
+import dev.tracedown.gateway.data.results.ResultPageAt
+import dev.tracedown.gateway.data.results.StepBodyContent
+import dev.tracedown.gateway.util.ApiException
 import dev.tracedown.gateway.util.GoneException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
 import dev.tracedown.gateway.util.requireCachedPermissions
-import org.jetbrains.exposed.v1.core.JoinType
-import org.jetbrains.exposed.v1.core.SortOrder
-import org.jetbrains.exposed.v1.core.and
-import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.jdbc.select
-import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.ApplicationCall
+import io.ktor.server.response.respond
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.time.Instant
 import java.time.temporal.ChronoUnit
-import org.jetbrains.exposed.v1.core.greater
-import org.jetbrains.exposed.v1.core.greaterEq
-import org.jetbrains.exposed.v1.jdbc.andWhere
-import dev.tracedown.gateway.data.results.ResultPageAt
-import dev.tracedown.common.storage.StorageUnconfiguredException
-import dev.tracedown.common.storage.StorageUri
-import dev.tracedown.common.storage.StorageUriException
-import dev.tracedown.gateway.data.results.StepBodyContent
+import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Semaphore
@@ -53,15 +53,17 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import kotlin.time.Duration.Companion.seconds
-import java.nio.ByteBuffer
-import java.nio.charset.CodingErrorAction
-import java.util.Base64
-import java.util.UUID
-import java.util.concurrent.atomic.AtomicInteger
+import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.SortOrder
+import org.jetbrains.exposed.v1.core.and
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.greater
+import org.jetbrains.exposed.v1.core.greaterEq
+import org.jetbrains.exposed.v1.jdbc.andWhere
+import org.jetbrains.exposed.v1.jdbc.select
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.slf4j.LoggerFactory
 
 /**
  * Queries probe results for a service.
@@ -333,6 +335,23 @@ object ProbeResultController {
     }
 
     /**
+     * Answers [call] with a step's body for the key-authenticated API — the
+     * body as [StepBodyContent], or 204 when none was stored — from inside the
+     * read gate ([readStepBody]). Taking the call is the point: the answer
+     * cannot be sent from anywhere but inside the gate.
+     */
+    suspend fun respondStepBody(call: ApplicationCall, orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID) {
+        readStepBody(orgId, serviceId, resultId, stepId, userId) { body ->
+            insideGateProbe?.invoke()
+            if (body == null) call.respond(HttpStatusCode.NoContent, "") else call.respond(body)
+        }
+    }
+
+    /** Called inside the gate just before a key-authenticated body is answered. For tests. */
+    @Volatile
+    internal var insideGateProbe: (() -> Unit)? = null
+
+    /**
      * Authorizes the read of a step's body and returns where it is kept: the
      * recorded URI (null when none was stored) and the body store holding it
      * (null for the default store).
@@ -559,10 +578,10 @@ object ProbeResultController {
      * key-authenticated reads ([PUBLIC_READ_RESERVATION]) or four dashboard
      * reads of a 32 MiB body.
      */
-    private const val CONCURRENT_BODY_BYTES: Long = 128L * 1024 * 1024
+    internal const val CONCURRENT_BODY_BYTES: Long = 128L * 1024 * 1024
 
     /** The byte budget is kept in units of this size. */
-    private const val BODY_BYTE_UNIT: Long = 1024L * 1024
+    internal const val BODY_BYTE_UNIT: Long = 1024L * 1024
 
     /** How long a read waits to get into the gate before it answers 503. */
     val BODY_READ_WAIT = 10.seconds

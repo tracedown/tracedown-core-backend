@@ -1,6 +1,9 @@
 package dev.tracedown.gateway
 
 import at.favre.lib.crypto.bcrypt.BCrypt
+import io.ktor.server.response.respond
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.routing.get
 import kotlin.time.Duration.Companion.seconds
 import org.junit.jupiter.api.assertThrows
 import dev.tracedown.gateway.util.ApiException
@@ -164,6 +167,14 @@ class ApiKeyResourcesTest {
 
             // Nothing a previous suite registered into the tree.
             PublicApi.clearAll()
+            // A host route that answers a bare status, the way a router does —
+            // what the namespace's response shaping alone has to turn into its
+            // error shape.
+            PublicApi.routes(tag = "Test") {
+                get("/test/bare/{code}") {
+                    call.respond(HttpStatusCode.fromValue(call.parameters["code"]!!.toInt()))
+                }
+            }
 
             storageRoot = Files.createTempDirectory("public-api-bodies").toRealPath()
             storeBase = Files.createTempDirectory("public-api-stores").toRealPath()
@@ -401,7 +412,7 @@ class ApiKeyResourcesTest {
                 // A ProbeResult as an agent sends it, storage location included.
                 it[rawResult] = Json.parseToJsonElement(
                     """{"outcome":"success","calls":[{"request":{"url":"https://example.com/health","method":"GET"},""" +
-                        """"response":{"status":200,"bodyPath":"/agent/bodies/$stepId.json"}}]}""",
+                        """"response":{"status":200,"bodyPath":"/agent/bodies/$stepId.json","bodyUri":"s3://bucket/$stepId.json"}}]}""",
                 ).jsonObject
             }
             ProbeSteps.insert {
@@ -673,6 +684,7 @@ class ApiKeyResourcesTest {
                 assertEquals(1, e!!.jsonObject["steps"]!!.jsonArray.size)
                 val response = e.jsonObject["rawResult"]!!.jsonObject["calls"]!!.jsonArray.single().jsonObject["response"]!!.jsonObject
                 assertTrue("bodyPath" in response && response["bodyPath"] is JsonNull, "A storage location reached the public detail: $e")
+                assertTrue("bodyUri" in response && response["bodyUri"] is JsonNull, "A storage location reached the public detail: $e")
             },
             twinView = withoutLocators),
         Case("GET", "/services/{id}/results/{resultId}/steps/{stepId}/body",
@@ -844,7 +856,8 @@ class ApiKeyResourcesTest {
     @Test
     fun `every public route has a case`() {
         val root = server.application.pluginOrNull(RoutingRoot)!!
-        val mounted = PublicApiContractTest.publicRoutes(root)
+        // This module's routes; the suite's own host route is not one of them.
+        val mounted = PublicApiContractTest.publicRoutes(root).filterNot { "/test/" in it }
         val covered = cases.map { "${it.method} ${PublicApi.V1}${it.route}" }.sorted()
         assertEquals(mounted, covered)
     }
@@ -984,7 +997,8 @@ class ApiKeyResourcesTest {
         val (bigStatus, bigRaw) = send(address, "GET", bodyPath(fx, stepAt(fx, "file://$big")), fx.readKey)
         assertEquals(413, bigStatus, bigRaw)
         assertEquals("body_too_large", errorOf(bigRaw))
-        assertEquals(ProbeResultController.PUBLIC_BODY_INLINE_MAX, obj(bigRaw)["details"]!!.jsonObject.str("maxBytes").toLong())
+        // 4 MiB, written out: the cap is part of the contract.
+        assertEquals(4194304L, obj(bigRaw)["details"]!!.jsonObject.str("maxBytes").toLong())
 
         // Exactly at the cap is served.
         val atCap = dir.resolve("cap-${UUID.randomUUID()}.txt")
@@ -1262,18 +1276,46 @@ class ApiKeyResourcesTest {
         assertEquals(405, method, methodRaw)
         assertEquals("method_not_allowed", errorOf(methodRaw))
 
-        val head = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/workspaces").head()
-            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.readKey}").build()
-        client.newCall(head).execute().use {
-            assertEquals(200, it.code)
-            assertEquals(0, it.body.bytes().size)
-        }
+        // HEAD, on the wire: the GET's status and headers, and no body at all.
+        val get = rawRequest("GET", "${PublicApi.V1}/workspaces", fx.readKey, address)
+        val head = rawRequest("HEAD", "${PublicApi.V1}/workspaces", fx.readKey, address)
+        assertEquals(200, head.status, head.body)
+        assertEquals(get.headers["content-type"], head.headers["content-type"])
+        assertEquals(get.headers["content-length"], head.headers["content-length"], "HEAD announces the GET's length")
+        assertEquals("", head.body, "HEAD sends no body")
+
+        // A bare status from a handler, shaped by the namespace's response
+        // plugin alone — nothing else shapes it.
+        val (bare, bareRaw) = send(address, "GET", "${PublicApi.V1}/test/bare/405", fx.readKey)
+        assertEquals(405, bare, bareRaw)
+        assertEquals("method_not_allowed", errorOf(bareRaw), bareRaw)
 
         // Paths that do not reduce to one canonical form, sent as written.
         for (path in listOf("${PublicApi.V1}/%2e/workspaces", "/api/public/../public/v1/workspaces", "/api/x/%2e%2e/public/v1/key")) {
             val (status, raw) = rawGet(path, fx.readKey, address)
             assertEquals(400, status, "$path: $raw")
             assertTrue("invalid_path" in raw, "$path: $raw")
+        }
+    }
+
+    private data class RawResponse(val status: Int, val headers: Map<String, String>, val body: String)
+
+    /** Sends [method] on [path] exactly as given and reads the wire — no client normalizing or skipping anything. */
+    private fun rawRequest(method: String, path: String, token: String, address: String): RawResponse {
+        java.net.Socket("localhost", serverPort).use { socket ->
+            socket.soTimeout = 10_000
+            socket.getOutputStream().apply {
+                write(
+                    ("$method $path HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer $token\r\n" +
+                        "X-Forwarded-For: $address\r\nConnection: close\r\n\r\n").toByteArray(),
+                )
+                flush()
+            }
+            val text = socket.getInputStream().readBytes().toString(Charsets.UTF_8)
+            val head = text.substringBefore("\r\n\r\n")
+            val headers = head.lines().drop(1).filter { ':' in it }
+                .associate { it.substringBefore(':').trim().lowercase() to it.substringAfter(':').trim() }
+            return RawResponse(head.substringAfter(' ').substringBefore(' ').toInt(), headers, text.substringAfter("\r\n\r\n"))
         }
     }
 
@@ -1804,8 +1846,13 @@ class ApiKeyResourcesTest {
                     // six key-authenticated reads would not fit in it.
                     val entered = java.util.concurrent.CountDownLatch(6)
                     val open = java.util.concurrent.CountDownLatch(1)
-                    ProbeResultController.storeClient = {
-                        stubClient(size = 1, actual = 1) {
+                    val d = orgs[3]
+                    val (dStore, dStep) = storeStep(d)
+                    ProbeResultController.storeClient = { store ->
+                        // The seventh read's store would answer at once — so
+                        // a refusal can only be the gate's.
+                        if (store.id == dStore) stubClient(size = 1, actual = 1)
+                        else stubClient(size = 1, actual = 1) {
                             entered.countDown()
                             open.await()
                             throw IllegalStateException("released")
@@ -1822,10 +1869,12 @@ class ApiKeyResourcesTest {
                     }
                     assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS), "Six reads should be inside their stores")
                     assertEquals(0, ProbeResultController.gateState(orgs[3].owner.orgId).storeReads)
-                    // A seventh body-store read waits for a place and is refused…
-                    val d = orgs[3]
-                    val (_, dStep) = storeStep(d)
+                    // A seventh body-store read waits for a place and is refused
+                    // within the wait, recording nothing against its store…
+                    val started = System.nanoTime()
                     expectStatusAsync(503) { ProbeResultController.readStepBody(d.owner.orgId, d.service, d.result, dStep, d.owner.userId) { } }
+                    assertTrue(Duration.ofNanos(System.nanoTime() - started) < Duration.ofSeconds(5), "Refused within the wait")
+                    assertNull(transaction { BodyStores.selectAll().where { BodyStores.id eq dStore }.single()[BodyStores.lastFailureCode] })
                     // …while a default-store read still gets one of the two kept for it.
                     ProbeResultController.readStepBody(d.owner.orgId, d.service, d.result, d.step, d.owner.userId) { assertNotNull(it) }
                     open.countDown()
@@ -1906,6 +1955,185 @@ class ApiKeyResourcesTest {
         assertTrue(details["errors"]!!.jsonArray.isNotEmpty(), raw)
     }
 
+    // ── Mutation follow-ups ──
+
+    @Test
+    fun `an enable refused after it was written is undone`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        Interceptors.after("service.toggle") { ctx, result ->
+            val name = Services.selectAll().where { Services.id eq ctx.serviceId!! }.single()[Services.name]
+            if (name.startsWith("After-gated")) throw ForbiddenException("enable_refused_after")
+            result
+        }
+        try {
+            val name = "After-gated ${UUID.randomUUID().toString().take(6)}"
+            val created = ServiceController.create(fx.owner.orgId, fx.project, CreateServiceRequest(projectId = fx.project.toString(), name = name), fx.owner.userId)
+            val (status, raw) = send(
+                address, "PATCH", "$v1/services/${created.id}/script", fx.ownerSession,
+                """{"script":"get(\"https://example.com\").expect(status: 200)","version":1}""",
+            )
+            assertEquals(200, status, raw)
+            assertEquals("false", obj(raw).str("isActive"), "The refused enable must not stand")
+            transaction {
+                assertFalse(Services.selectAll().where { Services.id eq UUID.fromString(created.id) }.single()[Services.isActive])
+                assertEquals(
+                    0,
+                    OrgAuditLog.selectAll().where { (OrgAuditLog.entityDisplayName eq name) and (OrgAuditLog.action eq "enable.service") }.count(),
+                    "No enable.service entry for an enable that did not happen",
+                )
+            }
+        } finally {
+            Interceptors.clearAll()
+        }
+    }
+
+    @Test
+    fun `a public read holds its whole reservation, and five fit`() {
+        val fx = fixtures(nextAddress())
+        val o = fx.owner
+        assertEquals(4L * 1024 * 1024, ProbeResultController.PUBLIC_BODY_INLINE_MAX)
+        assertTrue(5 * ProbeResultController.PUBLIC_READ_RESERVATION <= ProbeResultController.CONCURRENT_BODY_BYTES)
+        withGate {
+            ProbeResultController.init(stubClient(size = 1, actual = 1))
+            val units = (ProbeResultController.PUBLIC_READ_RESERVATION / ProbeResultController.BODY_BYTE_UNIT).toInt()
+            assertEquals(24, units)
+            runBlocking {
+                ProbeResultController.readStepBody(o.orgId, fx.service, fx.result, fx.step, o.userId) {
+                    val inside = ProbeResultController.gateState(o.orgId)
+                    assertEquals(ProbeResultController.idleGate.byteUnits - 24, inside.byteUnits)
+                    assertEquals(ProbeResultController.idleGate.reads - 1, inside.reads)
+                }
+            }
+            assertEquals(ProbeResultController.idleGate, ProbeResultController.gateState(o.orgId))
+        }
+    }
+
+    @Test
+    fun `the body is answered from inside the gate`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        val seen = java.util.concurrent.atomic.AtomicReference<ProbeResultController.GateState?>()
+        ProbeResultController.insideGateProbe = { seen.set(ProbeResultController.gateState(o.orgId)) }
+        try {
+            val (status, raw) = send(address, "GET", bodyPath(fx, fx.step), fx.readKey)
+            assertEquals(200, status, raw)
+            val inside = seen.get()
+            assertNotNull(inside, "The answer was not sent through the gate")
+            assertEquals(ProbeResultController.idleGate.byteUnits - 24, inside!!.byteUnits)
+            assertEquals(ProbeResultController.idleGate.orgReads - 1, inside.orgReads)
+        } finally {
+            ProbeResultController.insideGateProbe = null
+        }
+    }
+
+    @Test
+    fun `a read cancelled mid-read records nothing and leaves the gate idle`() {
+        val fx = fixtures(nextAddress())
+        val o = fx.owner
+        val (store, step) = storeStep(fx)
+        withGate(deadline = 30.seconds) {
+            val entered = java.util.concurrent.CountDownLatch(1)
+            val open = java.util.concurrent.CountDownLatch(1)
+            ProbeResultController.storeClient = {
+                object : BodyStorageClient() {
+                    override fun sizeOf(uri: String): Long? = 1
+                    override fun readBytes(uri: String, maxBytes: Long): BodyStorageClient.StoredBody {
+                        entered.countDown()
+                        open.await()
+                        return BodyStorageClient.StoredBody.Found(byteArrayOf(1), null)
+                    }
+                }
+            }
+            runBlocking {
+                val job = launch(Dispatchers.IO) { ProbeResultController.getStepBody(o.orgId, fx.service, fx.result, step, o.userId) }
+                assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                job.cancel()
+                open.countDown()
+                job.join()
+                assertTrue(job.isCancelled)
+            }
+            assertNull(transaction { BodyStores.selectAll().where { BodyStores.id eq store }.single()[BodyStores.lastFailureCode] })
+            assertEquals(ProbeResultController.idleGate, ProbeResultController.gateState(o.orgId))
+        }
+    }
+
+    @Test
+    fun `members and groups come back by name, then id`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        // Inserted in reverse, with one name twice.
+        for (name in listOf("Zulu", "Mike", "Alpha", "Alpha")) {
+            val id = UUID.randomUUID()
+            transaction {
+                insertUser(id, "dir-${id.toString().take(8)}@tracedown.dev")
+                Users.update({ Users.id eq id }) { it[displayName] = name }
+                insertMembership(o.orgId, id)
+            }
+            GroupController.createGroup(o.orgId, "$name group ${id.toString().take(4)}", o.userId)
+        }
+        for ((path, nameKey, idKey) in listOf(Triple("/members", "displayName", "userId"), Triple("/groups", "name", "id"))) {
+            val total = obj(send(address, "GET", "${PublicApi.V1}$path", fx.readKey).second).str("total").toInt()
+            val paged = (1..total).map { page ->
+                obj(send(address, "GET", "${PublicApi.V1}$path?page=$page&pageSize=1", fx.readKey).second)["items"]!!.jsonArray.single().jsonObject
+            }
+            val expected = paged.sortedWith(compareBy({ it.str(nameKey) }, { it.str(idKey) }))
+            assertEquals(expected.map { it.str(idKey) }, paged.map { it.str(idKey) }, "$path by name, then id")
+        }
+    }
+
+    @Test
+    fun `binding a webhook needs write on the resource, listing needs read`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        transaction {
+            OrgUsers.update({ (OrgUsers.organizationId eq fx.owner.orgId) and (OrgUsers.userId eq fx.member.userId) }) {
+                it[orgWebhooks] = 2
+                it[permissionCache] = null
+            }
+        }
+        ResourceAccessController.upsert(fx.owner.orgId, "service", fx.service, UpsertAccessRequest("user", fx.member.userId.toString(), 1), fx.owner.userId)
+        val list = "/webhooks/bindings?resourceType=service&resourceId=${fx.service}"
+        assertEquals(200, send(address, "GET", "${PublicApi.V1}$list", fx.memberKey).first)
+        val (keyStatus, keyRaw) = send(address, "POST", "${PublicApi.V1}$list", fx.memberKey, """{"webhookId":"${fx.spareWebhook}"}""")
+        val (twinStatus, twinRaw) = send(address, "POST", "$v1/webhooks/bindings/service/${fx.service}", fx.memberSession, """{"webhookId":"${fx.spareWebhook}"}""")
+        assertTrue(keyStatus >= 400, keyRaw)
+        assertEquals(twinStatus, keyStatus, "key $keyRaw, session $twinRaw")
+        assertEquals(errorOf(twinRaw), errorOf(keyRaw))
+    }
+
+    @Test
+    fun `masked says so on writes and on every hierarchy`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val created = obj(send(address, "POST", "${PublicApi.V1}/projects/${fx.project}/variables", fx.writeKey,
+            """{"key":"MASK_ME","value":"hidden","type":"secret"}""").second)
+        assertEquals("true", created.str("masked"))
+        assertEquals(VariableCrypto.MASK, created.str("value"))
+        val updated = obj(send(address, "PATCH", "${PublicApi.V1}/projects/${fx.project}/variables/${created.str("id")}", fx.writeKey,
+            """{"value":"still hidden"}""").second)
+        assertEquals("true", updated.str("masked"))
+        val metric = obj(send(address, "POST", "${PublicApi.V1}/projects/${fx.project}/variables", fx.writeKey,
+            """{"key":"PLAIN","value":"shown","type":"metric"}""").second)
+        assertEquals("false", metric.str("masked"))
+
+        for (path in listOf(
+            "/workspaces/${fx.workspace}/variables/hierarchy",
+            "/projects/${fx.project}/variables/hierarchy",
+            "/services/${fx.service}/variables/hierarchy",
+        )) {
+            val variables = obj(send(address, "GET", "${PublicApi.V1}$path", fx.readKey).second)["scopes"]!!.jsonArray
+                .flatMap { it.jsonObject["variables"]!!.jsonArray.map { v -> v.jsonObject } }
+            assertTrue(variables.isNotEmpty(), path)
+            for (v in variables) {
+                assertEquals(v.str("value") == VariableCrypto.MASK, v.str("masked").toBoolean(), "$path: $v")
+                if (v.str("type") == "secret") assertTrue(v.str("masked").toBoolean(), "$path: $v")
+            }
+        }
+    }
+
     // ── The description ──
 
     @Test
@@ -1927,6 +2155,7 @@ class ApiKeyResourcesTest {
         assertTrue(paths.keys.all { it.startsWith("${PublicApi.V1}/") }, "Only the public tree: ${paths.keys}")
 
         for ((method, path, op) in operations) {
+            if ("/test/" in path) continue
             val where = "$method $path"
             assertTrue(op["operationId"]?.jsonPrimitive?.content?.isNotBlank() == true, "No operationId on $where")
             assertTrue(op["summary"]?.jsonPrimitive?.content?.isNotBlank() == true, "No summary on $where")
@@ -1945,7 +2174,7 @@ class ApiKeyResourcesTest {
                 assertEquals(q.required, p!!["required"]?.jsonPrimitive?.content?.toBoolean() ?: false, "$where ?${q.name}")
             }
         }
-        val ids = operations.map { it.third.str("operationId") }
+        val ids = operations.filterNot { "/test/" in it.second }.map { it.third.str("operationId") }
         assertEquals(ids.size, ids.toSet().size, "operationIds repeat: $ids")
 
         assertEquals("bearer", doc["components"]!!.jsonObject["securitySchemes"]!!.jsonObject["apiKey"]!!.jsonObject.str("scheme"))

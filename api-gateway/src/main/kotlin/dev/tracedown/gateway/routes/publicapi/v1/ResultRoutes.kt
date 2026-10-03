@@ -3,7 +3,6 @@ package dev.tracedown.gateway.routes.publicapi.v1
 import dev.tracedown.gateway.controllers.results.ProbeResultController
 import dev.tracedown.gateway.routes.publicapi.apiCaller
 import dev.tracedown.gateway.util.publicPaging
-import io.ktor.http.HttpStatusCode
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
@@ -62,8 +61,6 @@ fun Route.resultRoutes() {
         val stepId = call.pathUuid("stepId")
         // Answered from inside the read: the body is held, encoded and sent
         // under the same bound on memory (see readStepBody).
-        ProbeResultController.readStepBody(caller.orgId, serviceId, resultId, stepId, caller.userId) { body ->
-            if (body == null) call.respond(HttpStatusCode.NoContent, "") else call.respond(body)
-        }
+        ProbeResultController.respondStepBody(call, caller.orgId, serviceId, resultId, stepId, caller.userId)
     }
 }
