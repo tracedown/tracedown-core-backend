@@ -284,9 +284,10 @@ object InviteController {
             InviteInfo(
                 orgName = org[Organizations.name],
                 email = user[Users.email],
-                // A stub invited user is created with an empty password hash; a
-                // non-empty one means this email already has a real account.
-                userExists = user[Users.passwordHash].isNotBlank(),
+                // A stub invited user is created with an empty password hash;
+                // anything else — a hash, or no password at all — means this
+                // email already has a real account.
+                userExists = !Users.isUnclaimedStub(user),
             )
         }
     }
@@ -303,7 +304,9 @@ object InviteController {
         userAgent: String?,
     ): AcceptInviteResponse {
         // Branch on whether the invited email already has a real account: a stub
-        // invited user has an empty password hash, a real one does not.
+        // invited user has an empty password hash, a real one does not. An
+        // account with no password at all is a real one — the token alone must
+        // never be enough to set a password on it.
         val target = transaction {
             val invite = findValidInvite(token)
             val userId = invite[OrgUsers.userId]
@@ -312,7 +315,7 @@ object InviteController {
                 userId = userId,
                 orgId = invite[OrgUsers.organizationId],
                 email = user[Users.email],
-                existingAccount = user[Users.passwordHash].isNotBlank(),
+                existingAccount = !Users.isUnclaimedStub(user),
             )
         }
 
@@ -336,19 +339,31 @@ object InviteController {
         // Activate the membership and set last_org to the joined org; the session
         // minted below reads last_org, so both a new and an existing user land in
         // the org they just joined.
-        val session = Interceptors.injectableInTx("membership.create", InterceptorContext(orgId = target.orgId)) {
+        // The context names the account and says whether this acceptance
+        // created it (claimed an unclaimed row) or joined one that already
+        // existed — a hook recording something about the person needs to know
+        // which, and cannot tell from the rows once the accept has run.
+        val context = InterceptorContext(orgId = target.orgId, userId = target.userId)
+        context.extra[ACCOUNT_CREATED] = !target.existingAccount
+        val session = Interceptors.injectableInTx("membership.create", context) {
             val invite = findValidInvite(token)
             val userId = invite[OrgUsers.userId]
             val orgId = invite[OrgUsers.organizationId]
             val now = Instant.now()
 
-            Users.update({ Users.id eq userId }) {
-                it[selectedOrgId] = orgId
-                if (!target.existingAccount) {
+            if (target.existingAccount) {
+                Users.update({ Users.id eq userId }) { it[selectedOrgId] = orgId }
+            } else {
+                // The claim: only a row still unclaimed takes these credentials.
+                // Claimed in between (another path got there first), the token
+                // alone must not overwrite what that path set.
+                val claimed = Users.update({ (Users.id eq userId) and (Users.passwordHash eq "") }) {
+                    it[selectedOrgId] = orgId
                     it[Users.passwordHash] = PasswordHasher.hash(password!!)
                     it[Users.displayName] = displayName!!
                     it[isActive] = true
                 }
+                if (claimed == 0) throw ConflictException(ErrorCodes.EMAIL_TAKEN)
             }
             val orgUserId = invite[OrgUsers.id]
             OrgUsers.update({ OrgUsers.id eq orgUserId }) {
@@ -368,6 +383,9 @@ object InviteController {
             if (target.existingAccount) AcceptInviteStatus.ACCEPTED_EXISTING else AcceptInviteStatus.ACCEPTED_NEW
         return AcceptInviteResponse(status, token = session.token)
     }
+
+    /** `InterceptorContext.extra` key: true when the acceptance turned an unclaimed row into an account. */
+    const val ACCOUNT_CREATED = "accountCreated"
 
     /** The invited email resolved to its user + org, before activation. */
     private data class InviteTarget(
@@ -476,6 +494,12 @@ object InviteController {
             AuditService.log(orgId, requestingUserId, "revoke.invite", "invite", inviteId.toString(),
                 entityDisplayName = inviteEmail)
             RealtimePublisher.publish("org:$orgId", orgId, "invite.revoked")
+
+            // A stub this was the only invitation for is now a row with no way
+            // in and no way out — not an account, not invited, and holding the
+            // address against its owner until the orphan sweep. Reconciling
+            // soft-deletes it, which is what lets a signup take the address.
+            AccountLifecycle.reconcile(invite[OrgUsers.userId], now)
         }
     }
 

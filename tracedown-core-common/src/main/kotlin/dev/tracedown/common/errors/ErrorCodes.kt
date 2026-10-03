@@ -100,6 +100,8 @@ object ErrorCodes {
     const val PASSWORD_TOO_SHORT = "password_too_short"
     const val PASSWORD_TOO_WEAK = "password_too_weak"
     const val INCORRECT_PASSWORD = "incorrect_password"
+    /** A password had to be re-verified and the account has none. */
+    const val PASSWORD_NOT_SET = "password_not_set"
 
     // ── Rate limit ──
     const val RATE_LIMITED = "rate_limited"

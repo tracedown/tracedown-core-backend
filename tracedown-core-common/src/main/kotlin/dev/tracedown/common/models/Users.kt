@@ -1,5 +1,6 @@
 package dev.tracedown.common.models
 
+import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.Table
 import org.jetbrains.exposed.v1.core.java.javaUUID
 import org.jetbrains.exposed.v1.javatime.timestamp
@@ -7,7 +8,20 @@ import org.jetbrains.exposed.v1.javatime.timestamp
 object Users : Table("users") {
     val id = javaUUID("id")
     val email = varchar("email", 256)
-    val passwordHash = varchar("password_hash", 256)
+
+    /**
+     * Three states, and the difference between the last two is load-bearing:
+     *  - a bcrypt hash — the account signs in with a password;
+     *  - `null` — a real account that has no password. Credential sign-in always
+     *    fails for it and there is no current password to re-verify; it gets one
+     *    through the emailed reset link;
+     *  - `""` — the stub an invitation creates. Not an account yet: the invite
+     *    link may claim it and set its first password, which is exactly what must
+     *    never be possible for a real account.
+     *
+     * Ask [isUnclaimedStub] / [hasPassword] rather than comparing by hand.
+     */
+    val passwordHash = varchar("password_hash", 256).nullable()
     val displayName = varchar("display_name", 128)
     val totpSecretEncrypted = varchar("totp_secret_encrypted", 512).nullable()
     val totpSecretIv = varchar("totp_secret_iv", 32).nullable()
@@ -39,4 +53,10 @@ object Users : Table("users") {
     val createdAt = timestamp("created_at")
 
     override val primaryKey = PrimaryKey(id)
+
+    /** True for the stub an invitation created and nobody has claimed yet. */
+    fun isUnclaimedStub(user: ResultRow): Boolean = user[passwordHash]?.isBlank() == true
+
+    /** True when the account has a password to sign in with, and to re-verify. */
+    fun hasPassword(user: ResultRow): Boolean = !user[passwordHash].isNullOrBlank()
 }

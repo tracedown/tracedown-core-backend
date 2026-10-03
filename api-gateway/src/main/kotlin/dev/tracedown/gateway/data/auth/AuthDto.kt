@@ -87,6 +87,12 @@ data class UserSummary(
     val displayName: String,
     val totpEnabled: Boolean,
     val selectedOrgId: String? = null,
+    /**
+     * False for an account that has no password. Such an account cannot pass a
+     * password re-verification and sets its first one through the reset link,
+     * so a client needs to know before it asks for a "current password".
+     */
+    val hasPassword: Boolean = true,
 )
 
 /**

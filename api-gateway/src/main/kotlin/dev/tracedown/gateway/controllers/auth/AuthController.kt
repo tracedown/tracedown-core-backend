@@ -107,30 +107,54 @@ object AuthController {
 
         return transaction {
             val user = verifyCredentials(request.email, request.password)
-            val userId = user[Users.id]
-            val userHasTotp = user[Users.totpEnabled]
-            val targetOrgId = resolveTargetOrgId(user)
-            // A user with no active organization may still sign in — they land on
-            // the app's "no organizations" screen (e.g. removed from their last
-            // org, or a pending invitee). Org-mandated TOTP only applies when
-            // there is actually an org to enforce it.
-            val totpEnforced = targetOrgId != null && isTotpEnforcedForOrg(userId, targetOrgId)
+            completeSignIn(user, sessionTtlMinutes, ipAddress, userAgent)
+        }
+    }
 
-            when {
-                userHasTotp -> {
-                    // User has TOTP enrolled — open a pending session; its id is the
-                    // challenge the client echoes back to verifyTotp.
-                    val pendingId = createPendingSession(userId, targetOrgId, ipAddress, userAgent)
-                    LoginResponse(totpRequired = true, challenge = pendingId.toString())
-                }
-                totpEnforced -> {
-                    // TOTP is enforced but user hasn't enrolled — require setup
-                    val setupToken = createChallenge(userId)
-                    LoginResponse(totpSetupRequired = true, setupToken = setupToken)
-                }
-                else -> {
-                    createSession(user, sessionTtlMinutes, ipAddress, userAgent)
-                }
+    /**
+     * Finishes a sign-in for [user], whose identity is already established —
+     * by the password check in [login], or by a host application that proved it
+     * some other way.
+     *
+     * Everything that follows the first factor lives here so that no way of
+     * establishing an identity can skip it: an enrolled second factor is always
+     * challenged, an organization's enrollment requirement always applies, and
+     * a deactivated account is always refused. Returns the same three shapes
+     * [login] does. [user] must be a freshly read, non-deleted row.
+     *
+     * Joins the caller's transaction when there is one.
+     */
+    fun completeSignIn(
+        user: ResultRow,
+        sessionTtlMinutes: Long,
+        ipAddress: String?,
+        userAgent: String?,
+    ): LoginResponse = transaction {
+        if (!user[Users.isActive]) throw UnauthorizedException(ErrorCodes.ACCOUNT_DEACTIVATED)
+
+        val userId = user[Users.id]
+        val userHasTotp = user[Users.totpEnabled]
+        val targetOrgId = resolveTargetOrgId(user)
+        // A user with no active organization may still sign in — they land on
+        // the app's "no organizations" screen (e.g. removed from their last
+        // org, or a pending invitee). Org-mandated TOTP only applies when
+        // there is actually an org to enforce it.
+        val totpEnforced = targetOrgId != null && isTotpEnforcedForOrg(userId, targetOrgId)
+
+        when {
+            userHasTotp -> {
+                // User has TOTP enrolled — open a pending session; its id is the
+                // challenge the client echoes back to verifyTotp.
+                val pendingId = createPendingSession(userId, targetOrgId, ipAddress, userAgent)
+                LoginResponse(totpRequired = true, challenge = pendingId.toString())
+            }
+            totpEnforced -> {
+                // TOTP is enforced but user hasn't enrolled — require setup
+                val setupToken = createChallenge(userId)
+                LoginResponse(totpSetupRequired = true, setupToken = setupToken)
+            }
+            else -> {
+                createSession(user, sessionTtlMinutes, ipAddress, userAgent)
             }
         }
     }
@@ -611,6 +635,10 @@ object AuthController {
             val user = Users.selectAll()
                 .where { (Users.email eq email) and (Users.deleted eq false) and (Users.isActive eq true) }
                 .firstOrNull()
+                // A row nobody has claimed yet is not an account; a reset link
+                // must not be the way to make it one. (An account with no
+                // password at all — NULL — is a real account and may reset.)
+                ?.takeUnless { Users.isUnclaimedStub(it) }
 
             if (user != null) {
                 val userId = user[Users.id]
@@ -749,10 +777,12 @@ object AuthController {
                 .where { (Users.id eq userId) and (Users.deleted eq false) }
                 .firstOrNull() ?: throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
 
-            val hashResult = BCrypt.verifyer().verify(
-                currentPassword.toCharArray(),
-                user[Users.passwordHash],
-            )
+            // An account with no password has no current one to prove; it sets
+            // its first through the emailed reset link, never here on a
+            // session's say-so alone.
+            val storedHash = user[Users.passwordHash]?.takeIf { it.isNotBlank() }
+                ?: throw BadRequestException(ErrorCodes.PASSWORD_NOT_SET)
+            val hashResult = BCrypt.verifyer().verify(currentPassword.toCharArray(), storedHash)
             if (!hashResult.verified) throw BadRequestException(ErrorCodes.INCORRECT_PASSWORD)
 
             val newHash = PasswordHasher.hash(newPassword)
@@ -766,6 +796,11 @@ object AuthController {
      * Re-verifies the caller's identity for sensitive operations: password
      * always; a TOTP (or recovery) code when the user is enrolled. Throws on
      * any mismatch. Call within a transaction-free context.
+     *
+     * An account with no password cannot pass: there is nothing to re-verify it
+     * against, and a session alone is precisely what this exists to not trust.
+     * It answers [ErrorCodes.PASSWORD_NOT_SET] so the client can say what to do
+     * about it rather than "incorrect password".
      */
     fun verifyIdentity(userId: UUID, password: String, code: String?) {
         transaction {
@@ -773,19 +808,37 @@ object AuthController {
                 .where { (Users.id eq userId) and (Users.deleted eq false) }
                 .firstOrNull() ?: throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
 
-            val hashResult = BCrypt.verifyer().verify(
-                password.toCharArray(),
-                user[Users.passwordHash],
-            )
+            val storedHash = user[Users.passwordHash]?.takeIf { it.isNotBlank() }
+                ?: throw BadRequestException(ErrorCodes.PASSWORD_NOT_SET)
+            val hashResult = BCrypt.verifyer().verify(password.toCharArray(), storedHash)
             if (!hashResult.verified) throw BadRequestException(ErrorCodes.INCORRECT_PASSWORD)
 
-            val secret = user[Users.totpSecretEncrypted]
-            val iv = user[Users.totpSecretIv]
-            if (secret != null && iv != null) {
-                if (code.isNullOrBlank()) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
-                if (!consumeSecondFactor(user, code)) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
-            }
+            requireSecondFactorIfEnrolled(user, code)
         }
+    }
+
+    /**
+     * Re-verifies only the second factor: a TOTP (or recovery) code, when the
+     * user has one enrolled. Returns whether there was one to verify.
+     *
+     * For a caller that cannot use [verifyIdentity] because the account has no
+     * password, and still must not act on a session alone where a second factor
+     * exists. An account with none enrolled passes with `false` — what to make
+     * of an account that has neither is the caller's decision, not this one's.
+     */
+    fun verifySecondFactor(userId: UUID, code: String?): Boolean = transaction {
+        val user = Users.selectAll()
+            .where { (Users.id eq userId) and (Users.deleted eq false) }
+            .firstOrNull() ?: throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
+        requireSecondFactorIfEnrolled(user, code)
+    }
+
+    /** Consumes [code] against [user]'s enrolled second factor; no-op (false) when none is enrolled. */
+    private fun requireSecondFactorIfEnrolled(user: ResultRow, code: String?): Boolean {
+        if (user[Users.totpSecretEncrypted] == null || user[Users.totpSecretIv] == null) return false
+        if (code.isNullOrBlank()) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
+        if (!consumeSecondFactor(user, code)) throw BadRequestException(ErrorCodes.INVALID_TOTP_CODE)
+        return true
     }
 
     // ── TOTP Management ──
@@ -1027,7 +1080,7 @@ object AuthController {
      *
      * Two properties, both deliberate:
      *  - **Constant work for unknown/credential-less accounts.** A missing email
-     *    (or an invited stub with no password yet) still spends one bcrypt
+     *    (or an invited stub, or an account that has no password) still spends one bcrypt
      *    verification against [dummyHash] before failing, so timing does not
      *    distinguish "no such account" from "wrong password".
      *  - **Deactivation is disclosed only after the password is proven.** The
@@ -1052,9 +1105,10 @@ object AuthController {
         }
 
         val storedHash = user[Users.passwordHash]
-        if (storedHash.isBlank()) {
-            // An invited stub has no password yet; treat it exactly like a wrong
-            // password (same work, same code) rather than revealing it exists.
+        if (storedHash.isNullOrBlank()) {
+            // An invited stub has no password yet, and an account may have none
+            // at all; treat both exactly like a wrong password (same work, same
+            // code) rather than revealing the account exists.
             BCrypt.verifyer().verify(password.toCharArray(), dummyHash)
             throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
         }
@@ -1196,6 +1250,7 @@ object AuthController {
         displayName = user[Users.displayName],
         totpEnabled = user[Users.totpEnabled],
         selectedOrgId = user[Users.selectedOrgId]?.toString(),
+        hasPassword = Users.hasPassword(user),
     )
 
     private fun generateToken(): String {

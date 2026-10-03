@@ -16,8 +16,15 @@ import java.util.UUID
 
 /**
  * Shared account (user) creation. Used by self-serve onboarding as well as any
- * other flow that needs to provision a user with a real password. Hashing goes
- * through [PasswordHasher] so it never drifts from the login verification path.
+ * other flow that needs to provision a user. Hashing goes through
+ * [PasswordHasher] so it never drifts from the login verification path.
+ *
+ * A null password creates an account that has none (see [Users.passwordHash]):
+ * for a caller that established who the person is by other means. It is
+ * deliberately not the empty hash an invitation writes — that one marks a row
+ * an invite link may still claim. `unclaimed` writes exactly that row instead:
+ * not an account yet, for a flow that reserves the address and lets something
+ * else — an invitation, a verification — claim it with a password later.
  *
  * Runs in its own transaction; when called inside an existing Exposed
  * transaction it joins that one, so callers can create a user and adjacent rows
@@ -39,8 +46,9 @@ object AccountService {
      *
      * The row (and its id) is reused only because `users.email` is globally
      * unique — a second row for the same address would collide. Everything of the
-     * prior owner is wiped: credentials are replaced with a fresh [password] /
-     * [displayName], every 2FA field and the selected-org preference are cleared,
+     * prior owner is wiped: credentials are replaced with a fresh [password] (or
+     * none, when null) / [displayName], every 2FA field and the selected-org
+     * preference are cleared,
      * `created_at` is reset (fresh purge-grace window), and the user-scoped 2FA
      * recovery codes and live sessions are hard-deleted — the latter is essential,
      * since the reused id would otherwise leave old session tokens valid for the
@@ -51,9 +59,10 @@ object AccountService {
      */
     fun reclaimSoftDeleted(
         email: String,
-        password: String,
+        password: String?,
         displayName: String = email.substringBefore("@"),
         isActive: Boolean = true,
+        unclaimed: Boolean = false,
     ): UUID? = transaction {
         val normalized = email.lowercase()
         val existing = Users.selectAll()
@@ -64,7 +73,7 @@ object AccountService {
 
         Users.update({ Users.id eq userId }) {
             it[Users.email] = normalized               // normalise casing on reclaim
-            it[passwordHash] = PasswordHasher.hash(password)
+            it[passwordHash] = if (unclaimed) "" else password?.let(PasswordHasher::hash)
             it[Users.displayName] = displayName
             it[totpSecretEncrypted] = null
             it[totpSecretIv] = null
@@ -88,19 +97,21 @@ object AccountService {
 
     /**
      * Creates a user account and returns its id. [displayName] defaults to the
-     * local-part of the email.
+     * local-part of the email. A null [password] creates the account without one;
+     * [unclaimed] creates the row an invitation would, with no account behind it.
      */
     fun createUser(
         email: String,
-        password: String,
+        password: String?,
         displayName: String = email.substringBefore("@"),
         isActive: Boolean = true,
+        unclaimed: Boolean = false,
     ): UUID = transaction {
         val userId = UUID.randomUUID()
         Users.insert {
             it[id] = userId
             it[Users.email] = email
-            it[passwordHash] = PasswordHasher.hash(password)
+            it[passwordHash] = if (unclaimed) "" else password?.let(PasswordHasher::hash)
             it[Users.displayName] = displayName
             it[Users.isActive] = isActive
             it[deleted] = false

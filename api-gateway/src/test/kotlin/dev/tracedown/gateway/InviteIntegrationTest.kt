@@ -1,5 +1,8 @@
 package dev.tracedown.gateway
 
+import dev.tracedown.common.onboarding.PasswordHasher
+import dev.tracedown.gateway.controllers.orgs.InviteController
+import dev.tracedown.common.interceptors.Interceptors
 import com.typesafe.config.ConfigFactory
 import io.ktor.server.config.HoconApplicationConfig
 import io.ktor.server.engine.EmbeddedServer
@@ -18,7 +21,13 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import dev.tracedown.common.models.OrgUsers
+import dev.tracedown.common.models.Users
 import org.flywaydb.core.Flyway
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
@@ -322,6 +331,12 @@ class InviteIntegrationTest {
             """{"password":"RevokeTest1!","displayName":"Revoked User"}""",
         )
         assertEquals(401, acceptStatus)
+
+        // The stub this was the only invitation for is not left holding the
+        // address with no way in: it is soft-deleted, which is what lets a
+        // signup take the address over.
+        val stub = transaction { Users.selectAll().where { Users.email eq newEmail }.first() }
+        assertTrue(stub[Users.deleted], "an uninvited, unclaimed row is reconciled away")
     }
 
     @Test
@@ -347,5 +362,108 @@ class InviteIntegrationTest {
         val elapsed = System.currentTimeMillis() - start
 
         assertTrue(elapsed >= 450, "Response should be timing-normalized (took ${elapsed}ms)")
+    }
+
+    /**
+     * An account with no password is a real account, not a stub. The invite
+     * token alone must never be able to set a password on it: only an empty
+     * hash marks a row the link may claim.
+     */
+    @Test
+    @Order(14)
+    fun `an invite cannot set a password on an account that has none`() {
+        val email = "nopassword@example.com"
+        val userId = java.util.UUID.randomUUID()
+        transaction {
+            Users.insert {
+                it[id] = userId
+                it[Users.email] = email
+                it[passwordHash] = null
+                it[displayName] = "No Password"
+                it[isActive] = true
+                it[deleted] = false
+                it[createdAt] = java.time.Instant.now()
+            }
+        }
+
+        val (adminToken, _) = login()
+        val (inviteStatus, inviteBody) = post("/api/v1/invites", """{"email":"$email"}""", adminToken)
+        assertEquals(200, inviteStatus, "Response: $inviteBody")
+        val inviteToken = transaction {
+            OrgUsers.selectAll().where { OrgUsers.userId eq userId }.first()[OrgUsers.inviteToken]
+        }
+
+        val (infoStatus, info) = get("/api/v1/invites/$inviteToken")
+        assertEquals(200, infoStatus)
+        assertTrue(
+            Json.parseToJsonElement(info).jsonObject["userExists"]!!.jsonPrimitive.boolean,
+            "an account with no password already exists",
+        )
+
+        val (status, body) = post(
+            "/api/v1/invites/$inviteToken/accept",
+            """{"password":"$INVITEE_PASSWORD","displayName":"Somebody Else"}""",
+        )
+        assertEquals(200, status, "Response: $body")
+        assertEquals("login_required", body["status"]?.jsonPrimitive?.content)
+        assertTrue(
+            body["token"].let { it == null || it is kotlinx.serialization.json.JsonNull },
+            "no session is handed out",
+        )
+        transaction {
+            val user = Users.selectAll().where { Users.id eq userId }.first()
+            assertEquals(null, user[Users.passwordHash], "the account still has no password")
+            assertEquals("No Password", user[Users.displayName])
+        }
+    }
+
+    @Test
+    @Order(15)
+    fun `the accept tells its hooks whether it created the account`() {
+        val seen = mutableListOf<Boolean?>()
+        Interceptors.after("membership.create") { ctx, result ->
+            seen.add(ctx.extra[InviteController.ACCOUNT_CREATED] as? Boolean)
+            result
+        }
+        try {
+            val (adminToken, _) = login()
+
+            // A stub, claimed by the invitation: created.
+            val stubEmail = "created-${java.util.UUID.randomUUID()}@example.com"
+            assertEquals(200, post("/api/v1/invites", """{"email":"$stubEmail"}""", adminToken).first)
+            val stubToken = transaction {
+                val stubId = Users.selectAll().where { Users.email eq stubEmail }.first()[Users.id]
+                OrgUsers.selectAll().where { OrgUsers.userId eq stubId }.first()[OrgUsers.inviteToken]
+            }
+            val (created, createdBody) = post(
+                "/api/v1/invites/$stubToken/accept",
+                """{"password":"$INVITEE_PASSWORD","displayName":"Created Here"}""",
+            )
+            assertEquals(200, created, "Response: $createdBody")
+            assertEquals(listOf(true), seen)
+
+            // An existing account, accepting while signed in: joined, not created.
+            val existingEmail = "existing-${java.util.UUID.randomUUID()}@example.com"
+            val existingId = java.util.UUID.randomUUID()
+            transaction {
+                Users.insert {
+                    it[id] = existingId; it[Users.email] = existingEmail
+                    it[passwordHash] = PasswordHasher.hash(INVITEE_PASSWORD)
+                    it[displayName] = "Already Here"; it[isActive] = true; it[deleted] = false
+                    it[createdAt] = java.time.Instant.now()
+                }
+            }
+            assertEquals(200, post("/api/v1/invites", """{"email":"$existingEmail"}""", adminToken).first)
+            val existingToken = transaction {
+                OrgUsers.selectAll().where { OrgUsers.userId eq existingId }.first()[OrgUsers.inviteToken]
+            }
+            val (_, loginBody) = post("/api/v1/auth/login", """{"email":"$existingEmail","password":"$INVITEE_PASSWORD"}""")
+            val session = loginBody["token"]!!.jsonPrimitive.content
+            val (joined, joinedBody) = post("/api/v1/invites/$existingToken/accept", "{}", session)
+            assertEquals(200, joined, "Response: $joinedBody")
+            assertEquals(listOf(true, false), seen)
+        } finally {
+            Interceptors.clearAll()
+        }
     }
 }
