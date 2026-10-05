@@ -336,6 +336,40 @@ class EncryptedVariableTargetTest {
     }
 
     @Test
+    fun `a braced reference is never resolved, as dispatch never resolves it`() {
+        // `$p.key` is the only form the scheduler substitutes; the save-time
+        // checks used to resolve `${p.key}` as well, and passed a host that
+        // dispatch would then find unresolved.
+        val k = key("baseUrl")
+        transaction {
+            ProjectVariables.insert {
+                it[id] = UUID.randomUUID()
+                it[ProjectVariables.projectId] = EncryptedVariableTargetTest.projectId
+                it[key] = k
+                it[value] = "https://api.verified.example"
+                it[secret] = false
+                it[encrypted] = false
+                it[createdAt] = NOW
+                it[updatedAt] = NOW
+            }
+        }
+        val refused = seedService()
+        assertEquals(
+            ErrorCodes.BLOCKED_PROBE_TARGET,
+            refusal(refused, """get("${D}{p.$k}/health").expect(status: 200)""").code,
+        )
+        assertEquals("", storedScript(refused), "nothing written")
+
+        // A templated host is left for dispatch by the address check, and the
+        // unverified-domain rule counts it unverified though the value sits on
+        // a verified domain.
+        val counted = seedService()
+        val url = "https://${D}{p.$k}/health"
+        save(counted, """get("$url").expect(status: 200)""")
+        assertEquals(listOf(url), ServiceController.get(orgId, counted, ownerId).unverifiedTargets)
+    }
+
+    @Test
     fun `a plaintext variable host is still named as resolved`() {
         val serviceId = seedService()
         val k = key("baseUrl")

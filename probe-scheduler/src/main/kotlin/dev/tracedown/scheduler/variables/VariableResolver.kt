@@ -28,6 +28,8 @@ import java.util.UUID
  */
 object VariableResolver {
 
+    private val log = org.slf4j.LoggerFactory.getLogger(VariableResolver::class.java)
+
     /** Matches scoped variable references: $s.key, $p.key, $w.key, $o.key */
     private val SCOPED_VAR_RE = Regex("""\$([spwo])\.([a-zA-Z_][a-zA-Z0-9_]*)""")
 
@@ -127,6 +129,7 @@ object VariableResolver {
      * secret flag). [orgId] and [scope] identify the encryption context:
      * secrets are envelope-encrypted with the org DEK, everything else with
      * the platform key — [VariableCrypto.decrypt] dispatches on the stored format.
+     * A value that does not decrypt is left out of the map.
      */
     private fun loadScope(
         scopeColumn: org.jetbrains.exposed.v1.core.Column<UUID>,
@@ -156,7 +159,18 @@ object VariableResolver {
                 val v = row[valueCol]
                 val iv = row[ivCol]
                 val enc = row[encCol]
-                val plain = if (enc) VariableCrypto.decrypt(orgId, v, iv, scope, k) else v
+                val plain = if (!enc) v else try {
+                    VariableCrypto.decrypt(orgId, v, iv, scope, k)
+                } catch (_: Exception) {
+                    // Absent, as if never set — the same thing the save-time
+                    // checks make of it. A reference to it then stays in the
+                    // script and the tick takes the unresolved-variable path
+                    // (refused or run with the variable null), rather than one
+                    // unreadable value erroring every tick in its scope. Never
+                    // the value, nor the exception, which may quote it.
+                    log.warn("{} variable {} of org {} did not decrypt; treated as unset", scope, k, orgId)
+                    return@forEach
+                }
                 result[k] = VarEntry(plain, row[secretCol])
             }
         return result

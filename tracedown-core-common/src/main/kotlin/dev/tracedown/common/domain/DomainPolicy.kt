@@ -38,8 +38,10 @@ object DomainPolicy {
 
     // Idents may be dotted: raw scripts carry scoped refs ($p.baseUrl), the
     // scheduler's rewritten scripts carry underscored ones ($p_baseUrl) —
-    // the caller's vars map decides which keys exist.
-    private val VAR_RE = Regex("""\$\{?([a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_])\}?|\$([a-zA-Z_])\}?""")
+    // the caller's vars map decides which keys exist. Only the bare `$name`
+    // form is substituted, as dispatch only resolves that form: a braced
+    // `${...}` stays as written, and its host unresolved.
+    private val VAR_RE = Regex("""\$([a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_])|\$([a-zA-Z_])""")
 
     /**
      * [unverifiedHosts] names what keeps [covered] false: each target host no
@@ -123,7 +125,7 @@ object DomainPolicy {
             }
             .map { Triple(it[OrgDomains.domain], it[OrgDomains.wildcardEnabled], it[OrgDomains.exceptions] ?: emptyList()) }
 
-    /** Replaces `$ident` / `${ident}` with resolved variable values. */
+    /** Replaces each bare `$ident` with its resolved value; anything else is left as written. */
     private fun substituteVars(url: String, vars: Map<String, String>): String {
         return VAR_RE.replace(url) { m ->
             val name = m.groupValues[1].ifEmpty { m.groupValues[2] }

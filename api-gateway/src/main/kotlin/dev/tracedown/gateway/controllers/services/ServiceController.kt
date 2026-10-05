@@ -1062,8 +1062,8 @@ object ServiceController {
      */
     private class PolicyVars(val values: Map<String, String>, val concealed: Set<String>)
 
-    // Scoped references a script makes, `$p.key` or `${p.key}`.
-    private val SCOPED_REF_RE = Regex("""\$\{?([owps]\.[a-zA-Z_][a-zA-Z0-9_]*)""")
+    // Scoped references a script makes, `$p.key` — the only form dispatch resolves.
+    private val SCOPED_REF_RE = Regex("""\$([owps]\.[a-zA-Z_][a-zA-Z0-9_]*)""")
 
     /**
      * Variables for the save-time [DomainPolicy] and probe-target checks, as

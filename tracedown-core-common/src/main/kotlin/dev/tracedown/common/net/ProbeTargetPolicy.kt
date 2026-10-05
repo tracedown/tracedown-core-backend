@@ -134,8 +134,11 @@ object ProbeTargetPolicy {
     private val CALL_RE = Regex("""\b(?:get|post|put|patch|delete)\s*\(\s*"([^"]+)"""")
 
     // Idents may be dotted ($p.baseUrl) or underscored ($p_baseUrl) depending on
-    // whether the script has been through the scheduler's rewrite.
-    private val VAR_RE = Regex("""\$\{?([a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_])\}?|\$([a-zA-Z_])\}?""")
+    // whether the script has been through the scheduler's rewrite. Only the
+    // bare `$name` form is substituted, as dispatch only resolves that form; a
+    // braced `${...}` is left as written, so its host stays unresolved here
+    // exactly as it does at dispatch.
+    private val VAR_RE = Regex("""\$([a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_])|\$([a-zA-Z_])""")
 
     // scheme://authority, taken textually: a URL still carrying a `$` in its
     // path is legal and judgeable, and java.net.URI would refuse some of them.
@@ -145,7 +148,7 @@ object ProbeTargetPolicy {
     fun targetUrls(script: String): List<String> =
         CALL_RE.findAll(script).map { it.groupValues[1] }.toList()
 
-    /** Replaces `$ident` / `${ident}` with resolved variable values. */
+    /** Replaces each bare `$ident` with its resolved value; anything else is left as written. */
     fun substituteVars(url: String, vars: Map<String, String>): String =
         VAR_RE.replace(url) { m ->
             val name = m.groupValues[1].ifEmpty { m.groupValues[2] }

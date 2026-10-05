@@ -263,6 +263,18 @@ class ProbeTargetPolicyTest {
     }
 
     @Test
+    fun `only the bare form of a reference is substituted`() {
+        val vars = mapOf("p.baseUrl" to "https://example.org", "p_baseUrl" to "https://example.org")
+        assertEquals("https://example.org/health", ProbeTargetPolicy.substituteVars("${'$'}p.baseUrl/health", vars))
+        assertEquals("https://example.org/health", ProbeTargetPolicy.substituteVars("${'$'}p_baseUrl/health", vars))
+        // Dispatch resolves neither braced spelling, so neither is resolved here.
+        assertEquals("${'$'}{p.baseUrl}/health", ProbeTargetPolicy.substituteVars("${'$'}{p.baseUrl}/health", vars))
+        val decision = ProbeTargetPolicy.evaluateSyntax("""get("${'$'}{p.baseUrl}/health")""", vars, publicOnly)
+        assertFalse(decision.allowed)
+        assertEquals(ProbeTargetPolicy.REASON_MALFORMED, decision.reason)
+    }
+
+    @Test
     fun `the host of a target is what a per-host check is made about`() {
         assertEquals("api.example.com", ProbeTargetPolicy.hostOf("https://API.Example.com:8443/health?x=1"))
         assertEquals("192.0.2.10", ProbeTargetPolicy.hostOf("http://192.0.2.10/"))
