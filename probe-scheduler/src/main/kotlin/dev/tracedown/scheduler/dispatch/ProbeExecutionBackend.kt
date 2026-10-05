@@ -147,8 +147,8 @@ class AgentExecutionBackend(
             )
             attempts++
             egressBytes += dispatched.agentEgressBytes
-            // Only the agent's own answer counts — a synthetic timeout is the
-            // scheduler's word, not the agent's.
+            // Only the agent's own answer counts — a synthetic result for an
+            // agent that went silent is the scheduler's word, not the agent's.
             if (dispatched.fromAgent) liveness?.markSeen(agent.id)
 
             val failure = dispatched.failure

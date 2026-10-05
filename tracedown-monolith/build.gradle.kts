@@ -42,6 +42,12 @@ dependencies {
     implementation(libs.hikari)
     implementation(libs.exposed.core)
     implementation(libs.exposed.jdbc)
+    implementation(libs.kotlinx.coroutines.core)
+
+    testImplementation(platform(libs.junit.bom))
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+    testImplementation(libs.kotlin.test)
 }
 
 val serviceModules = listOf(
