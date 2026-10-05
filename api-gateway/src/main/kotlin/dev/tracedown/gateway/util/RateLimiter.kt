@@ -142,8 +142,11 @@ fun rateLimitTierFor(rawPath: String): RateLimiter.Tier? {
     path.startsWith("/internal/") -> RateLimiter.Tier.INTERNAL
     // The data export fans out over many per-user queries, so it shares the
     // stricter auth tier rather than the general one.
+    // Email change checks a password and mails an address of the caller's
+    // choosing; its confirm link is a credential, like a reset link.
     path.startsWith("/api/v1/auth/login") ||
         path.startsWith("/api/v1/auth/password-reset") ||
+        path.startsWith("/api/v1/me/email") ||
         path.startsWith("/api/v1/me/export") -> RateLimiter.Tier.AUTH
         else -> RateLimiter.Tier.GENERAL
     }

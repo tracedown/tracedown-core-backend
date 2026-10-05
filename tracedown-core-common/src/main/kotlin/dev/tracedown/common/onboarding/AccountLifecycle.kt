@@ -4,6 +4,7 @@ import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Sessions
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.TotpRecoveryCodes
 import dev.tracedown.common.models.Users
 import org.jetbrains.exposed.v1.core.and
@@ -138,6 +139,7 @@ object AccountLifecycle {
      */
     private fun purgePersonalData(userId: UUID) {
         Sessions.deleteWhere { Sessions.userId eq userId }
+        EmailChangeRequests.voidFor(userId)
 
         val orgUserIds = OrgUsers.selectAll()
             .where { OrgUsers.userId eq userId }
@@ -245,5 +247,6 @@ object AccountLifecycle {
         }
         TotpRecoveryCodes.deleteWhere { TotpRecoveryCodes.userId eq userId }
         Sessions.deleteWhere { Sessions.userId eq userId }
+        EmailChangeRequests.voidFor(userId)
     }
 }

@@ -2,6 +2,7 @@ package dev.tracedown.worker.jobs
 
 import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.AgentBootstrapTokens
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.PasswordResetTokens
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -38,17 +39,21 @@ class ExpiredTokenCleanupJob(
 
     override suspend fun execute() {
         val now = Instant.now()
-        val (resets, bootstraps) = ioTransaction {
+        val (resets, bootstraps, emailChanges) = ioTransaction {
             val resets = PasswordResetTokens.deleteWhere { expiresAt less now }
             val bootstraps = AgentBootstrapTokens.deleteWhere {
                 (expiresAt less now) and (used eq false)
             }
-            resets to bootstraps
+            // An expired request holds an address somebody typed — possibly a
+            // stranger's. The request cooldown only ever reads rows a minute
+            // old, so nothing live depends on these.
+            val emailChanges = EmailChangeRequests.deleteWhere { expiresAt less now }
+            Triple(resets, bootstraps, emailChanges)
         }
-        if (resets > 0 || bootstraps > 0) {
+        if (resets > 0 || bootstraps > 0 || emailChanges > 0) {
             log.info(
-                "Expired token cleanup: {} password reset tokens, {} agent bootstrap tokens deleted",
-                resets, bootstraps,
+                "Expired token cleanup: {} password reset tokens, {} agent bootstrap tokens, {} email change requests deleted",
+                resets, bootstraps, emailChanges,
             )
         }
     }

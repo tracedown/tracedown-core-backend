@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="supported-color-schemes" content="dark">
+  <title>Your email address has been changed</title>
+</head>
+<body style="margin:0;padding:0;background-color:#0e1719;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#0e1719;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="520" cellpadding="0" cellspacing="0" style="background-color:#222729;border:1px solid #3a4143;border-radius:8px;overflow:hidden;">
+          {{brandHeader}}
+          <tr>
+            <td style="padding:32px 40px 0;">
+              <h1 style="margin:0 0 8px;font-size:22px;font-weight:600;color:#f2f5f4;">Your email address has been changed</h1>
+              <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:#9eaeac;">
+                Hi {{userName}}, the email address on your account is now <strong style="color:#f2f5f4;">{{newEmail}}</strong>. Mail about your account, including sign-in and recovery, goes there from now on, and this address is no longer connected to it.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px 40px;">
+              <p style="margin:0;font-size:12px;color:#74807e;">
+                If this was you, there is nothing to do here. If it was not, somebody had your password and now holds the account: reply to this message or contact the operator of this Tracedown instance as soon as you can.
+              </p>
+            </td>
+          </tr>
+          {{brandFooter}}
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

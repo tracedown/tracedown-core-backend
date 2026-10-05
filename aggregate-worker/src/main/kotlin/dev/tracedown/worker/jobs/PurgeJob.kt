@@ -538,6 +538,7 @@ class PurgeJob(
             // Strictly-owned credential and session material.
             "DELETE FROM sessions WHERE user_id IN ($PURGEABLE_USERS)",
             "DELETE FROM password_reset_tokens WHERE user_id IN ($PURGEABLE_USERS)",
+            "DELETE FROM email_change_requests WHERE user_id IN ($PURGEABLE_USERS)",
             "DELETE FROM totp_recovery_codes WHERE user_id IN ($PURGEABLE_USERS)",
             "DELETE FROM users WHERE id IN ($PURGEABLE_USERS)",
         )

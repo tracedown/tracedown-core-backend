@@ -1,8 +1,11 @@
 package dev.tracedown.gateway.controllers.me
 
 import dev.tracedown.common.audit.AuditService
+import dev.tracedown.common.auth.TokenHasher
+import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ApiKeys
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.NotificationLog
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgAuditLog
@@ -18,9 +21,9 @@ import dev.tracedown.common.models.Sessions
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.models.WorkspaceVariables
 import dev.tracedown.gateway.controllers.auth.AuthController
-import dev.tracedown.gateway.controllers.auth.SessionController
-import dev.tracedown.gateway.data.auth.UserSummary
 import dev.tracedown.gateway.data.me.ChangeEmailRequest
+import dev.tracedown.gateway.data.me.EmailChangeRequested
+import dev.tracedown.gateway.data.me.EmailChanged
 import dev.tracedown.gateway.data.me.ExportApiKey
 import dev.tracedown.gateway.data.me.ExportAuditEntry
 import dev.tracedown.gateway.data.me.ExportNotificationLogEntry
@@ -33,6 +36,7 @@ import dev.tracedown.gateway.data.me.ExportSession
 import dev.tracedown.gateway.data.me.ExportVariable
 import dev.tracedown.gateway.data.me.UserDataExport
 import dev.tracedown.gateway.util.BadRequestException
+import dev.tracedown.gateway.util.TooManyRequestsException
 import dev.tracedown.gateway.util.UnauthorizedException
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -47,17 +51,22 @@ import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.Table
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.greater
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.core.lowerCase
 import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.core.or
 import org.jetbrains.exposed.v1.core.stringParam
+import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
+import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.UUID
+
+private val log = LoggerFactory.getLogger("dev.tracedown.gateway.controllers.me.UserDataController")
 
 /**
  * Account-scoped data operations for the calling user: a full personal data
@@ -100,79 +109,243 @@ object UserDataController {
         )
     }
 
+    /** How long the link mailed to the new address stays good. */
+    private const val EMAIL_CHANGE_TTL_MINUTES = 60L
+
     /**
-     * Changes the account email. Re-verifies identity (password, plus a TOTP
-     * code when enrolled), enforces global email uniqueness (case-insensitive,
-     * matching account creation), audits the change, and — as a
-     * credential-adjacent event — signs out every other session, keeping the
-     * current one. Returns the updated profile.
+     * How soon an account may ask again. The request mails an address the
+     * caller chose, so the caller — password in hand — must not be able to
+     * turn this into a stream of mail at somebody; one a minute is enough for
+     * a person who mistyped.
      */
-    fun changeEmail(
+    private const val EMAIL_CHANGE_COOLDOWN_SECONDS = 60L
+
+    /**
+     * How many requests may be mailed to one address in an hour, across all
+     * accounts: the per-account cooldown alone lets many accounts take turns
+     * at one inbox. Three covers a person correcting a typo twice.
+     */
+    private const val EMAIL_CHANGE_PER_ADDRESS_PER_HOUR = 3L
+
+    /**
+     * Asks to change the account email. Re-verifies identity (password, plus a
+     * TOTP code when enrolled), checks that the address is free, and mails a
+     * confirmation link to the NEW address. **Nothing on the account changes
+     * here**: the address is the account's identity for sign-in, invitations
+     * and alerts, and it moves only once [confirmEmailChange] proves somebody
+     * receives mail at the new one. The old address is told as well, so a
+     * change the holder did not ask for is visible where they still are — and
+     * told how to stop it: changing the password voids the request.
+     *
+     * One live request per account; asking again supersedes the earlier link.
+     */
+    fun requestEmailChange(
         userId: UUID,
-        sessionId: UUID,
-        orgId: UUID?,
         request: ChangeEmailRequest,
-    ): UserSummary {
+        emailPublisher: EmailPublisher,
+        confirmUrlBuilder: (String) -> String,
+    ): EmailChangeRequested {
+        val newEmail = request.newEmail.trim()
+        val now = Instant.now()
+
+        // The cheap refusals first, so a TOTP code is not spent on a request
+        // that was never going to be accepted.
+        transaction { checkCooldown(userId, newEmail, now) }
         AuthController.verifyIdentity(userId, request.currentPassword, request.code)
 
-        val newEmail = request.newEmail.trim()
-        val updated = transaction {
+        val token = generateToken()
+        val expiresAt = now.plusSeconds(EMAIL_CHANGE_TTL_MINUTES * 60)
+        val (oldEmail, displayName, requestId) = transaction {
+            // The row lock serialises concurrent requests of one account, so
+            // "one live request" holds: the second waits, then sees the first.
             val user = Users.selectAll()
                 .where { (Users.id eq userId) and (Users.deleted eq false) }
+                .forUpdate()
                 .firstOrNull() ?: throw UnauthorizedException(ErrorCodes.INVALID_CREDENTIALS)
-            val oldEmail = user[Users.email]
-
-            val taken = Users.selectAll()
-                .where {
-                    (Users.email.lowerCase() eq newEmail.lowercase()) and
-                    (Users.deleted eq false) and
-                    (Users.id neq userId)
-                }
-                .limit(1)
-                .any()
-            if (taken) throw BadRequestException(ErrorCodes.EMAIL_TAKEN)
-
-            Users.update({ Users.id eq userId }) { it[email] = newEmail }
-
-            // Record the rectification (GDPR Art. 16). The audit log is org-scoped
-            // (OrgAuditLog.organizationId is NOT NULL) and there is no user-scoped
-            // audit table, so an org context is required to have a home. When a
-            // session has a selected org we log there; when it does not, we log the
-            // change into EVERY org the user is an active member of, so an account
-            // email change is never invisible in the audit trail just because no org
-            // happened to be selected. An account with no membership at all has no
-            // audit home by construction — accepted, and the deliberate no-op below.
-            val emailDiff = buildJsonObject {
-                putJsonObject("email") {
-                    put("old", oldEmail)
-                    put("new", newEmail)
-                }
-            }.toString()
-            val auditOrgIds = if (orgId != null) {
-                listOf(orgId)
-            } else {
-                OrgUsers.selectAll()
-                    .where {
-                        (OrgUsers.userId eq userId) and
-                        (OrgUsers.status eq "active") and
-                        (OrgUsers.deleted eq false)
-                    }
-                    .map { it[OrgUsers.organizationId] }
-                    .distinct()
+            if (user[Users.email].equals(newEmail, ignoreCase = true)) {
+                throw BadRequestException(ErrorCodes.FIELD_INVALID)
             }
-            auditOrgIds.forEach { auditOrgId ->
+            if (emailTaken(newEmail, userId)) throw BadRequestException(ErrorCodes.EMAIL_TAKEN)
+            checkCooldown(userId, newEmail, now)
+
+            // The earlier link, if any, stops working: one live request.
+            EmailChangeRequests.update({ (EmailChangeRequests.userId eq userId) and (EmailChangeRequests.used eq false) }) {
+                it[used] = true
+            }
+            val requestId = UUID.randomUUID()
+            EmailChangeRequests.insert {
+                it[id] = requestId
+                it[EmailChangeRequests.userId] = userId
+                it[EmailChangeRequests.newEmail] = newEmail
+                it[tokenHash] = TokenHasher.sha256Hex(token)
+                it[EmailChangeRequests.expiresAt] = expiresAt
+                it[createdAt] = now
+            }
+            Triple(user[Users.email], user[Users.displayName], requestId)
+        }
+        log.info("Email change requested: user={} request={}", userId, requestId)
+
+        // To the new address: the link, and nothing the account chose — the
+        // recipient may be a stranger, and this mail is signed by the platform.
+        // To the old: a heads-up, with nothing in it that acts — if this was
+        // not the holder, the link must not be where they can reach it.
+        emailPublisher.publish(
+            to = newEmail,
+            subject = "Confirm your new email address",
+            type = "system.email-change",
+            vars = mapOf(
+                "newEmail" to newEmail,
+                "expiryMinutes" to EMAIL_CHANGE_TTL_MINUTES.toString(),
+                "confirmLink" to confirmUrlBuilder(token),
+            ),
+            source = "api-gateway",
+        )
+        emailPublisher.publish(
+            to = oldEmail,
+            subject = "Your email address is being changed",
+            type = "system.email-change-notice",
+            vars = mapOf(
+                "userName" to displayName,
+                "newEmail" to newEmail,
+            ),
+            source = "api-gateway",
+        )
+        return EmailChangeRequested(newEmail = newEmail, expiresAt = expiresAt.toString())
+    }
+
+    /**
+     * Too soon for this account, or too often for that address. Runs in the
+     * caller's transaction — once before the password check, once under the
+     * row lock, where it is the one that counts.
+     */
+    private fun checkCooldown(userId: UUID, newEmail: String, now: Instant) {
+        val latest = EmailChangeRequests.selectAll()
+            .where { EmailChangeRequests.userId eq userId }
+            .orderBy(EmailChangeRequests.createdAt, SortOrder.DESC)
+            .limit(1)
+            .firstOrNull()
+        if (latest != null && latest[EmailChangeRequests.createdAt].plusSeconds(EMAIL_CHANGE_COOLDOWN_SECONDS) > now) {
+            throw TooManyRequestsException(ErrorCodes.EMAIL_CHANGE_COOLDOWN)
+        }
+        val toThatAddress = EmailChangeRequests.selectAll()
+            .where {
+                (EmailChangeRequests.newEmail.lowerCase() eq newEmail.lowercase()) and
+                    (EmailChangeRequests.createdAt greater now.minusSeconds(3600))
+            }
+            .count()
+        if (toThatAddress >= EMAIL_CHANGE_PER_ADDRESS_PER_HOUR) {
+            throw TooManyRequestsException(ErrorCodes.EMAIL_CHANGE_COOLDOWN)
+        }
+    }
+
+    /**
+     * Writes the change the link mailed to the new address asked for.
+     *
+     * Unauthenticated: the link is the credential, and the person following
+     * it may well be in a different browser from the one that asked. The
+     * token is single-use and short-lived, the address is checked to be free
+     * again (it may have been taken meanwhile), the change is audited in every
+     * organization the account is active in, and — as for a password reset —
+     * every session is signed out: the account's identity has changed, and
+     * whoever holds a session now signs in again under the new address. The
+     * old address is told the change went through, so a holder who missed the
+     * first notice still learns where their account went.
+     */
+    fun confirmEmailChange(token: String, emailPublisher: EmailPublisher): EmailChanged {
+        val tokenHash = TokenHasher.sha256Hex(token)
+        val (oldEmail, displayName, newEmail) = transaction {
+            val pending = EmailChangeRequests.selectAll()
+                .where {
+                    (EmailChangeRequests.tokenHash eq tokenHash) and
+                        (EmailChangeRequests.used eq false) and
+                        (EmailChangeRequests.expiresAt greater Instant.now())
+                }
+                .firstOrNull() ?: throw BadRequestException(ErrorCodes.INVALID_TOKEN)
+            val userId = pending[EmailChangeRequests.userId]
+            val newEmail = pending[EmailChangeRequests.newEmail]
+            // Closed or switched off since the request: the link is as dead as
+            // the sessions those paths dropped.
+            val user = Users.selectAll()
+                .where { (Users.id eq userId) and (Users.deleted eq false) and (Users.isActive eq true) }
+                .firstOrNull() ?: throw BadRequestException(ErrorCodes.INVALID_TOKEN)
+            // The claim: of two follows of one link, one flips the row.
+            val claimed = EmailChangeRequests.update({
+                (EmailChangeRequests.id eq pending[EmailChangeRequests.id]) and (EmailChangeRequests.used eq false)
+            }) { it[used] = true }
+            if (claimed == 0) throw BadRequestException(ErrorCodes.INVALID_TOKEN)
+            if (emailTaken(newEmail, userId)) throw BadRequestException(ErrorCodes.EMAIL_TAKEN)
+
+            val oldEmail = user[Users.email]
+            Users.update({ Users.id eq userId }) { it[email] = newEmail }
+            auditEmailChange(userId, user[Users.displayName], oldEmail, newEmail)
+
+            Sessions.update({ (Sessions.userId eq userId) and (Sessions.revoked eq false) }) {
+                it[revoked] = true
+            }
+            log.info("Email change confirmed: user={} request={}", userId, pending[EmailChangeRequests.id])
+            Triple(oldEmail, user[Users.displayName], newEmail)
+        }
+        emailPublisher.publish(
+            to = oldEmail,
+            subject = "Your email address has been changed",
+            type = "system.email-changed",
+            vars = mapOf(
+                "userName" to displayName,
+                "newEmail" to newEmail,
+            ),
+            source = "api-gateway",
+        )
+        return EmailChanged(email = newEmail)
+    }
+
+    /**
+     * True when any other row holds [email], case-insensitively. Deleted rows
+     * count too: `users.email` is unique across all of them, and a closed
+     * account's address goes back into circulation only through the signup
+     * that reclaims the row.
+     */
+    private fun emailTaken(email: String, userId: UUID): Boolean =
+        Users.selectAll()
+            .where { (Users.email.lowerCase() eq email.lowercase()) and (Users.id neq userId) }
+            .limit(1)
+            .any()
+
+    /**
+     * Records the rectification (GDPR Art. 16). The audit log is org-scoped
+     * (OrgAuditLog.organizationId is NOT NULL) and there is no user-scoped
+     * audit table, so the change is logged into EVERY org the user is an
+     * active member of — an account email change is never invisible in the
+     * audit trail just because no org happened to be selected. An account with
+     * no membership at all has no audit home by construction — accepted.
+     */
+    private fun auditEmailChange(userId: UUID, displayName: String, oldEmail: String, newEmail: String) {
+        val emailDiff = buildJsonObject {
+            putJsonObject("email") {
+                put("old", oldEmail)
+                put("new", newEmail)
+            }
+        }.toString()
+        OrgUsers.selectAll()
+            .where {
+                (OrgUsers.userId eq userId) and
+                    (OrgUsers.status eq "active") and
+                    (OrgUsers.deleted eq false)
+            }
+            .map { it[OrgUsers.organizationId] }
+            .distinct()
+            .forEach { orgId ->
                 AuditService.log(
-                    auditOrgId, userId, "update.email", "user", userId.toString(),
-                    entityDisplayName = user[Users.displayName],
+                    orgId, userId, "update.email", "user", userId.toString(),
+                    entityDisplayName = displayName,
                     diff = emailDiff,
                 )
             }
+    }
 
-            Users.selectAll().where { Users.id eq userId }.first()
-        }
-
-        SessionController.revokeAllOtherSessions(userId, sessionId, orgId)
-        return AuthController.userSummaryFrom(updated)
+    private fun generateToken(): String {
+        val bytes = ByteArray(32)
+        java.security.SecureRandom().nextBytes(bytes)
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
     }
 
     // ── Export sections ──

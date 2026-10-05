@@ -16,6 +16,7 @@ import dev.tracedown.common.onboarding.PasswordHasher
 import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.common.auth.canRead
 import dev.tracedown.common.models.Organizations
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.PasswordResetTokens
 import dev.tracedown.common.models.SessionStatus
 import dev.tracedown.common.models.Sessions
@@ -731,6 +732,8 @@ object AuthController {
             PasswordResetTokens.update({ PasswordResetTokens.id eq matchedToken[PasswordResetTokens.id] }) {
                 it[used] = true
             }
+            // Whoever asked to move the address did so with the old password.
+            EmailChangeRequests.voidFor(userId)
 
             // Revoke all sessions for security
             Sessions.update({
@@ -789,6 +792,9 @@ object AuthController {
             Users.update({ Users.id eq userId }) {
                 it[passwordHash] = newHash
             }
+            // Changing the password is how the holder cancels an address
+            // change they did not ask for — the notice mailed to them says so.
+            EmailChangeRequests.voidFor(userId)
         }
     }
 
