@@ -1,6 +1,7 @@
 package dev.tracedown.common.domain
 
 import dev.tracedown.common.models.OrgDomains
+import dev.tracedown.common.net.ProbeTargetPolicy
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -43,7 +44,7 @@ object DomainPolicy {
     /**
      * [unverifiedHosts] names what keeps [covered] false: each target host no
      * verified domain covers, or the raw URL when its host could not be
-     * resolved (a variable with no value). Distinct, in script order, empty
+     * resolved (a variable with no value) or was built from a concealed one. Distinct, in script order, empty
      * when covered — the client shows them beside the setting they restrict.
      */
     data class Evaluation(
@@ -53,8 +54,21 @@ object DomainPolicy {
         val unverifiedHosts: List<String> = emptyList(),
     )
 
-    /** Must be called within a transaction. `vars` is a flat name→value map. */
-    fun evaluate(script: String, vars: Map<String, String>, orgId: UUID): Evaluation {
+    /**
+     * Must be called within a transaction. `vars` is a flat name→value map.
+     *
+     * [concealed] names the entries of [vars] whose values the caller of the
+     * evaluation may not be shown (decrypted variables). They are used to judge
+     * like any other, but a host built from one is never named in
+     * [Evaluation.unverifiedHosts]: the call's URL is listed as the script
+     * spells it instead, the same way an unresolved host is.
+     */
+    fun evaluate(
+        script: String,
+        vars: Map<String, String>,
+        orgId: UUID,
+        concealed: Set<String> = emptySet(),
+    ): Evaluation {
         val usesIncludes = INCLUDES_RE.containsMatchIn(script)
         val urls = CALL_RE.findAll(script).map { it.groupValues[1] }.toList()
         if (urls.isEmpty()) return Evaluation(covered = true, callCount = 0, usesIncludes = usesIncludes)
@@ -67,8 +81,17 @@ object DomainPolicy {
 
         val domains = verifiedDomains(orgId)
 
-        val uncovered = hosts.filter { host -> domains.none { covers(host!!, it.first, it.second, it.third) } }
-            .map { it!! }
+        // A host is named only when the script and the shown variables alone
+        // spell it (a concealed value in the path hides nothing of the host);
+        // otherwise the call's own text stands in for it.
+        val shown = vars - concealed
+        val uncovered = urls.indices
+            .filter { i -> domains.none { covers(hosts[i]!!, it.first, it.second, it.third) } }
+            .map { i ->
+                val host = hosts[i]!!
+                if (concealed.isEmpty() || ProbeTargetPolicy.hostOf(substituteVars(urls[i], shown)) == host) host
+                else urls[i]
+            }
             .distinct()
         return Evaluation(
             covered = uncovered.isEmpty(),

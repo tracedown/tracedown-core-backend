@@ -246,6 +246,23 @@ class ProbeTargetPolicyTest {
     }
 
     @Test
+    fun `a refusal names the target as written beside the substituted one`() {
+        // The substituted URL may carry a decrypted value; `source` is the one
+        // a log line can name.
+        val script = """get("${'$'}p.baseUrl/health")"""
+        val vars = mapOf("p.baseUrl" to "http://10.0.0.5")
+        for (decision in listOf(
+            ProbeTargetPolicy.evaluateSyntax(script, vars, publicOnly),
+            ProbeTargetPolicy.evaluate(script, vars, publicOnly, failingResolver),
+        )) {
+            assertFalse(decision.allowed)
+            assertEquals(ProbeTargetPolicy.REASON_PRIVATE_ADDRESS, decision.reason)
+            assertEquals("http://10.0.0.5/health", decision.url)
+            assertEquals("${'$'}p.baseUrl/health", decision.source)
+        }
+    }
+
+    @Test
     fun `the host of a target is what a per-host check is made about`() {
         assertEquals("api.example.com", ProbeTargetPolicy.hostOf("https://API.Example.com:8443/health?x=1"))
         assertEquals("192.0.2.10", ProbeTargetPolicy.hostOf("http://192.0.2.10/"))

@@ -389,7 +389,7 @@ class DispatchQueue(
             if (!target.allowed) {
                 log.warn(
                     "service {} targets an address this install does not permit ({} — {}) — skipping",
-                    serviceId, target.url, target.reason,
+                    serviceId, target.source, target.reason,
                 )
                 // A skipped row, not a failure: nothing was learned about the
                 // target, and a synthetic failure would read as downtime for a

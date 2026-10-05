@@ -73,10 +73,16 @@ object ProbeTargetPolicy {
     /** One call URL found in a script, and the verdict on it. */
     data class Decision(
         val allowed: Boolean,
-        /** The offending target, as it read after variable substitution. */
+        /**
+         * The offending target, as it read after variable substitution. It can
+         * carry the plaintext of an encrypted variable, so it is for judging,
+         * never for a log line or a response — name the target by [source].
+         */
         val url: String? = null,
         /** One of the `REASON_*` codes. */
         val reason: String? = null,
+        /** The offending target as the script spells it, variables unsubstituted. */
+        val source: String? = null,
     ) {
         companion object {
             val ALLOWED = Decision(allowed = true)
@@ -233,7 +239,7 @@ object ProbeTargetPolicy {
         for (raw in targetUrls(script)) {
             val url = substituteVars(raw, vars)
             val reason = checkResolved(url, mode, resolve)
-            if (reason != null) return Decision(allowed = false, url = url, reason = reason)
+            if (reason != null) return Decision(allowed = false, url = url, reason = reason, source = raw)
         }
         return Decision.ALLOWED
     }
@@ -246,7 +252,7 @@ object ProbeTargetPolicy {
         for (raw in targetUrls(script)) {
             val url = substituteVars(raw, vars)
             val reason = checkSyntax(url, mode)
-            if (reason != null) return Decision(allowed = false, url = url, reason = reason)
+            if (reason != null) return Decision(allowed = false, url = url, reason = reason, source = raw)
         }
         return Decision.ALLOWED
     }

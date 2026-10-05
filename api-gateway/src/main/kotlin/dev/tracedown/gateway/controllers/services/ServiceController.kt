@@ -311,11 +311,11 @@ object ServiceController {
             if (trustedDomainMode) {
                 base
             } else {
-                val policy = DomainPolicy.evaluate(
-                    base.script,
-                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
-                    orgId,
-                )
+                // Read access is all this takes, and it reveals no encrypted
+                // value — so a host built from one is listed as the script
+                // spells the call, never as resolved (see PolicyVars).
+                val vars = resolveScopedVarsForPolicy(base.script, serviceId, ctx.projectId, ctx.workspaceId, orgId)
+                val policy = DomainPolicy.evaluate(base.script, vars.values, orgId, vars.concealed)
                 base.copy(unverifiedTargets = policy.unverifiedHosts)
             }
         }
@@ -470,17 +470,23 @@ object ServiceController {
             // leaves the rest to dispatch, which judges the concrete URL. The
             // point is that a script this install will never run says so when it
             // is written, rather than being accepted and silently skipped on
-            // every tick.
+            // every tick. Both checks judge the values dispatch will send,
+            // encrypted ones included (see resolveScopedVarsForPolicy).
+            val policyVars by lazy {
+                resolveScopedVarsForPolicy(effectiveScript, serviceId, ctx.projectId, ctx.workspaceId, orgId)
+            }
             if (request.script != null) {
                 val targets = dev.tracedown.common.net.ProbeTargetPolicy.evaluateSyntax(
                     effectiveScript,
-                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
+                    policyVars.values,
                     probeTargetPolicy,
                 )
                 if (!targets.allowed) {
+                    // The target as written: the substituted one can carry a
+                    // decrypted value.
                     log.info(
                         "service {} script rejected: target {} ({})",
-                        serviceId, targets.url, targets.reason,
+                        serviceId, targets.source, targets.reason,
                     )
                     throw BadRequestException(ErrorCodes.BLOCKED_PROBE_TARGET)
                 }
@@ -491,11 +497,7 @@ object ServiceController {
             val policyRelevant = request.script != null ||
                 (request.schedule != null && intervalTooShort)
             if (!trustedDomainMode && policyRelevant) {
-                val policy = DomainPolicy.evaluate(
-                    effectiveScript,
-                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
-                    orgId,
-                )
+                val policy = DomainPolicy.evaluate(effectiveScript, policyVars.values, orgId, policyVars.concealed)
                 if (!policy.covered) {
                     // includes() against an unverified target is a scraping oracle —
                     // refuse it at save time (dispatch would refuse it anyway).
@@ -1050,31 +1052,79 @@ object ServiceController {
     }
 
     /**
-     * Flat variable map for [DomainPolicy] URL substitution at save time —
-     * scoped keys (`s.key`, `p.key`, ...) matching raw-script references.
-     * Encrypted values are skipped: their hosts can't be checked here and
-     * dispatch re-evaluates with real values anyway.
+     * The variables [resolveScopedVarsForPolicy] hands the save-time policies.
+     * [values] is flat, keyed as raw scripts reference them (`s.key`, `p.key`,
+     * ...). [concealed] names the keys whose values were decrypted: they judge
+     * a target like any other value, but nothing taken from one is ever shown
+     * to the caller — a reader may not reveal a "variable" and nobody may
+     * reveal a secret, so where a host comes from one, the call is named as
+     * the script spells it (`$p.baseUrl/health`), never by its resolved host.
+     */
+    private class PolicyVars(val values: Map<String, String>, val concealed: Set<String>)
+
+    // Scoped references a script makes, `$p.key` or `${p.key}`.
+    private val SCOPED_REF_RE = Regex("""\$\{?([owps]\.[a-zA-Z_][a-zA-Z0-9_]*)""")
+
+    /**
+     * Variables for the save-time [DomainPolicy] and probe-target checks, as
+     * dispatch will substitute them, so a script accepted here is not skipped
+     * there for a reason this could have seen, and the reverse: an encrypted
+     * value is decrypted exactly as the scheduler decrypts it (the platform-key
+     * "variable" type and the org-key secrets, bound to `orgId:scope:key`).
+     * Only the encrypted variables [script] references are decrypted. One that
+     * will not decrypt is left out, so its host stays unresolved — refused or
+     * counted unverified as before — and is never an error. Decrypted values
+     * live in the returned map only: never logged, never returned.
      */
     private fun resolveScopedVarsForPolicy(
+        script: String,
         serviceId: UUID,
         projectId: UUID,
         workspaceId: UUID,
         orgId: UUID,
-    ): Map<String, String> {
+    ): PolicyVars {
+        val referenced = SCOPED_REF_RE.findAll(script).map { it.groupValues[1] }.toSet()
         val vars = mutableMapOf<String, String>()
+        val concealed = mutableSetOf<String>()
+
+        fun put(prefix: String, scope: String, key: String, value: String, iv: String?, encrypted: Boolean) {
+            val name = "$prefix.$key"
+            if (!encrypted) {
+                vars[name] = value
+                return
+            }
+            if (name !in referenced) return
+            val plain = try {
+                VariableCrypto.decrypt(orgId, value, iv, scope, key)
+            } catch (_: Exception) {
+                log.debug("{} variable {} of org {} did not decrypt; its host is unresolved", scope, key, orgId)
+                return
+            }
+            vars[name] = plain
+            concealed += name
+        }
+
         OrgVariables.selectAll()
-            .where { (OrgVariables.organizationId eq orgId) and (OrgVariables.deleted eq false) and (OrgVariables.encrypted eq false) }
-            .forEach { vars["o.${it[OrgVariables.key]}"] = it[OrgVariables.value] }
+            .where { (OrgVariables.organizationId eq orgId) and (OrgVariables.deleted eq false) }
+            .forEach {
+                put("o", "org", it[OrgVariables.key], it[OrgVariables.value], it[OrgVariables.valueIv], it[OrgVariables.encrypted])
+            }
         WorkspaceVariables.selectAll()
-            .where { (WorkspaceVariables.workspaceId eq workspaceId) and (WorkspaceVariables.deleted eq false) and (WorkspaceVariables.encrypted eq false) }
-            .forEach { vars["w.${it[WorkspaceVariables.key]}"] = it[WorkspaceVariables.value] }
+            .where { (WorkspaceVariables.workspaceId eq workspaceId) and (WorkspaceVariables.deleted eq false) }
+            .forEach {
+                put("w", "workspace", it[WorkspaceVariables.key], it[WorkspaceVariables.value], it[WorkspaceVariables.valueIv], it[WorkspaceVariables.encrypted])
+            }
         ProjectVariables.selectAll()
-            .where { (ProjectVariables.projectId eq projectId) and (ProjectVariables.deleted eq false) and (ProjectVariables.encrypted eq false) }
-            .forEach { vars["p.${it[ProjectVariables.key]}"] = it[ProjectVariables.value] }
+            .where { (ProjectVariables.projectId eq projectId) and (ProjectVariables.deleted eq false) }
+            .forEach {
+                put("p", "project", it[ProjectVariables.key], it[ProjectVariables.value], it[ProjectVariables.valueIv], it[ProjectVariables.encrypted])
+            }
         ServiceVariables.selectAll()
-            .where { (ServiceVariables.serviceId eq serviceId) and (ServiceVariables.deleted eq false) and (ServiceVariables.encrypted eq false) }
-            .forEach { vars["s.${it[ServiceVariables.key]}"] = it[ServiceVariables.value] }
-        return vars
+            .where { (ServiceVariables.serviceId eq serviceId) and (ServiceVariables.deleted eq false) }
+            .forEach {
+                put("s", "service", it[ServiceVariables.key], it[ServiceVariables.value], it[ServiceVariables.valueIv], it[ServiceVariables.encrypted])
+            }
+        return PolicyVars(vars, concealed)
     }
 
     // ── Allowed agents ──
