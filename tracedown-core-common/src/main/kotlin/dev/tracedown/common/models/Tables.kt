@@ -40,6 +40,7 @@ object Tables {
         BodyStores,
         ApiKeys,
         CaRoot,
+        EmailChangeRequests,
         GrafanaIntegrations,
         NotificationLog,
         NotificationSilences,

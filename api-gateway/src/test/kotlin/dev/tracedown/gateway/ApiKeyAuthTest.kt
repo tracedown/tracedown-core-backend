@@ -6,6 +6,7 @@ import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.interceptors.Interceptors
 import dev.tracedown.common.models.ApiKeys
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.OrgAuditLog
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Organizations
@@ -238,6 +239,7 @@ class ApiKeyAuthTest {
                 // On, because the key budgets are under test — with the
                 // per-address tiers out of the way of the suite's own traffic.
                 "rateLimit.enabled" to "true",
+                "platform.allowEmailChange" to "true",
                 "rateLimit.general.maxRequests" to "100000",
                 "rateLimit.auth.maxRequests" to "100000",
                 "rateLimit.api.maxRequests" to KEY_BUDGET.toString(),
@@ -583,12 +585,23 @@ class ApiKeyAuthTest {
             assertEquals(200, status, raw)
             json(raw).str("token")
         }
+        val renamed = "renamed-${owner.userId.toString().take(8)}@tracedown.dev"
         val (status, raw) = post(
             "/api/v1/me/email",
-            """{"newEmail":"renamed-${owner.userId.toString().take(8)}@tracedown.dev","currentPassword":"$newPassword"}""",
+            """{"newEmail":"$renamed","currentPassword":"$newPassword"}""",
             fresh,
         )
         assertEquals(200, status, raw)
+        // The link goes to the new address by mail; stand in for it with a token of our own.
+        val token = "confirm-${UUID.randomUUID()}"
+        transaction {
+            EmailChangeRequests.update({ EmailChangeRequests.userId eq owner.userId }) {
+                it[tokenHash] = TokenHasher.sha256Hex(token)
+            }
+        }
+        val (confirmed, confirmedRaw) = post("/api/v1/me/email/confirm", """{"token":"$token"}""")
+        assertEquals(200, confirmed, confirmedRaw)
+        assertEquals(renamed, transaction { Users.selectAll().where { Users.id eq owner.userId }.first()[Users.email] })
         assertEquals(200, get("/api/public/v1/key", key).first)
         assertEquals(false, keyRow(json(get("/api/public/v1/key", key).second).str("id"))[ApiKeys.revoked])
     }

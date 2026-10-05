@@ -292,6 +292,8 @@ data class OwnedOrgSummary(
 @Serializable
 data class ProfileCapabilitiesResponse(
     val allowProfileEdit: Boolean,
+    /** Whether the account may change its own address (confirmed from the new inbox). */
+    val allowEmailChange: Boolean = false,
     val allowAccountClosure: Boolean,
     /** Empty unless [allowAccountClosure] — nothing else consumes it. */
     val ownedOrgs: List<OwnedOrgSummary> = emptyList(),

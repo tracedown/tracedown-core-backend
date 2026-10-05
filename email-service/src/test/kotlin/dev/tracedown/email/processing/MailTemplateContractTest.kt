@@ -27,7 +27,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * these pin what the templates consume — and a rename that lands on only one side
  * fails a build instead of losing or defacing mail.
  *
- * **Scope.** Only mail this edition ships is pinned here: the two `system.*`
+ * **Scope.** Only mail this edition ships is pinned here: the `system.*`
  * templates api-gateway publishes, and the shared `layout.html`. Mail belonging to
  * a host application arrives through the template directory instead, and its
  * templates are pinned by a contract test in the repository that owns them. This
@@ -52,6 +52,13 @@ class MailTemplateContractTest {
         "system.invite" to setOf("inviterName", "orgName", "inviteLink"),
         // api-gateway → AuthController password reset
         "system.password-reset" to setOf("userName", "expiryMinutes", "resetLink"),
+        // api-gateway → UserDataController.requestEmailChange: the link, to the
+        // new address — nothing the account chose in it, the recipient may be
+        // a stranger — and the heads-up to the old one.
+        "system.email-change" to setOf("newEmail", "expiryMinutes", "confirmLink"),
+        "system.email-change-notice" to setOf("userName", "newEmail"),
+        // api-gateway → UserDataController.confirmEmailChange, to the old address
+        "system.email-changed" to setOf("userName", "newEmail"),
         // api-gateway → OrgSettingsRoutes, after the owner deletes the org
         "system.org-deleted" to setOf("userName", "orgName", "deletedDate", "purgeDate"),
     )

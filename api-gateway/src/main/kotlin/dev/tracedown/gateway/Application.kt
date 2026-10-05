@@ -576,7 +576,7 @@ fun Application.module() {
         pingRoute()
         bulkRoutes()
         authRoutes(appConfig, emailPublisher)
-        meRoutes()
+        meRoutes(appConfig, emailPublisher)
         inviteRoutes(appConfig, emailPublisher)
         groupRoutes()
         orgSettingsRoutes(appConfig, emailPublisher)

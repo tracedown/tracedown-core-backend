@@ -30,8 +30,8 @@ class WebhookBindingMigrationTest {
             .withPassword("test")
 
         /** The migration immediately before the one under test. */
-        private const val PREVIOUS = "1790981412"
-        private const val UNDER_TEST = "1790988470"
+        private const val PREVIOUS = "1791183961"
+        private const val UNDER_TEST = "1791184021"
     }
 
     private fun flyway(target: String) = Flyway.configure()

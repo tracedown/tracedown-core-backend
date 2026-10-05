@@ -36,10 +36,10 @@ class ApiKeyMigrationTest {
 
         /** The migration immediately before the one under test. */
         private const val PREVIOUS = "1790689566"
-        private const val UNDER_TEST = "1790926762"
+        private const val UNDER_TEST = "1791183901"
 
         /** The companion migration that adds the audit column, applied right after. */
-        private const val AUDIT_COLUMN = "1790981412"
+        private const val AUDIT_COLUMN = "1791183961"
 
         private const val BCRYPT = "\$2a\$10\$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
         private val SHA256 = "ab".repeat(32)
