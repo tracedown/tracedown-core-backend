@@ -568,6 +568,30 @@ class ApiKeyAuthTest {
     }
 
     @Test
+    fun `an account with no password sets one before it can make a key`() {
+        val owner = newOwner()
+        val session = login(owner)
+        // Signed in some other way than by password: the session stands, and there is nothing to confirm with.
+        transaction { Users.update({ Users.id eq owner.userId }) { it[passwordHash] = null } }
+
+        assertRefused(
+            400, "password_not_set",
+            post("/api/v1/me/api-keys", """{"name":"ci","password":"$PASSWORD"}""", session),
+        )
+        // Leaving the field empty is no way round it: the request is refused before the account is looked at.
+        assertRefused(
+            400, "invalid_request_body",
+            post("/api/v1/me/api-keys", """{"name":"ci","password":""}""", session),
+        )
+        assertEquals(0L, transaction { ApiKeys.selectAll().where { ApiKeys.createdBy eq owner.userId }.count() })
+
+        // With a password set, the same session makes the key.
+        transaction { Users.update({ Users.id eq owner.userId }) { it[passwordHash] = BCrypt.withDefaults().hashToString(4, PASSWORD.toCharArray()) } }
+        val (status, raw) = post("/api/v1/me/api-keys", """{"name":"ci","password":"$PASSWORD"}""", session)
+        assertEquals(201, status, raw)
+    }
+
+    @Test
     fun `a password reset or email change does not revoke keys`() {
         val owner = newOwner()
         val session = login(owner)
