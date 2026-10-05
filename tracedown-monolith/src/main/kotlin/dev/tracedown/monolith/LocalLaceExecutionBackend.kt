@@ -2,26 +2,46 @@ package dev.tracedown.monolith
 
 import dev.lacelang.executor.runScript
 import dev.lacelang.validator.parse
+import dev.tracedown.scheduler.dispatch.AgentDispatchService
 import dev.tracedown.scheduler.dispatch.ProbeExecutionBackend
-import kotlinx.coroutines.Dispatchers
+import dev.tracedown.scheduler.dispatch.SyntheticProbeResult
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.future.await
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.absolutePathString
 
 /**
  * Executes probes in-process with the Kotlin Lace executor — the monolith's
  * replacement for external probe agents. Mirrors the agent's behavior:
- * extension activation by config variables, recovery-message config, body
- * persistence with secret redaction, and a synthetic `timeout` result when the
- * run overruns its window.
+ * extension activation by config variables, message defaults for the events
+ * the extensions emit, body persistence with secret redaction, and the whole-
+ * run budget: a run that outlives it is answered with a synthetic `timeout`
+ * result carrying its own notification event, the way the agent answers at
+ * its run budget. The budget is read the way the agent reads the dispatched
+ * one (`AgentDispatchService.runBudgetMs`): clamped to the same range, and
+ * omitted — the run then goes to the script's own per-call timeouts — for a
+ * non-positive configured timeout, which would otherwise time every run out.
+ *
+ * The executor blocks and offers no cancellation, so runs go to a bounded
+ * pool and the budget is a wall clock over the run's future. An over-budget
+ * run keeps running after the answer has been given, until its own per-call
+ * timeouts expire, and its result is discarded — the same residual gap the
+ * agent documents, bounded the same way: enough such runs fill the pool, and
+ * a run queued behind them that its budget expires on before a worker takes
+ * it is reported as nothing learned (`agent_rejected`), which the queue
+ * records as a skipped tick with its alert — never as a timeout of a target
+ * that was not contacted.
  *
  * Bodies are written under [storageRoot]/{orgId}/{serviceId}/{runTs}/ and
  * referenced as `file://` URIs, matching what the filesystem-backed agent
@@ -29,28 +49,96 @@ import kotlin.io.path.absolutePathString
  */
 class LocalLaceExecutionBackend(
     private val storageRoot: String,
+    poolSize: Int = DEFAULT_POOL_SIZE,
+    private val runner: (ProbeExecutionBackend.Request, AtomicBoolean) -> JsonObject = { request, abandoned ->
+        LocalLaceRun(storageRoot, abandoned).runOnce(request)
+    },
 ) : ProbeExecutionBackend {
 
     private val log = LoggerFactory.getLogger(javaClass)
 
+    /**
+     * Where embedded runs block. Bounded, so abandoned runs cannot multiply
+     * without limit; daemon, so one never holds the JVM's exit.
+     */
+    private val probePool: ExecutorService = Executors.newFixedThreadPool(poolSize) { r ->
+        Thread(r, "embedded-probe-${threadCounter.incrementAndGet()}").apply { isDaemon = true }
+    }
+
     override suspend fun execute(request: ProbeExecutionBackend.Request): List<ProbeExecutionBackend.Execution> {
-        val result = withContext(Dispatchers.IO) {
-            try {
-                withTimeout(request.timeoutMs.toLong() + 15_000L) {
-                    runOnce(request)
-                }
-            } catch (e: TimeoutCancellationException) {
-                log.warn("embedded probe for service {} timed out — recording timeout result", request.serviceId)
-                syntheticResult("timeout", "embedded executor did not finish within ${request.timeoutMs + 15_000}ms")
-            } catch (e: Exception) {
-                log.error("embedded probe for service {} failed: {}", request.serviceId, e.message)
-                syntheticResult("failure", e.message ?: e.javaClass.simpleName)
+        val started = AtomicBoolean(false)
+        val abandoned = AtomicBoolean(false)
+        val run = CompletableFuture.supplyAsync({
+            started.set(true)
+            val result = runner(request, abandoned)
+            if (abandoned.get()) {
+                log.info("abandoned embedded probe for service {} has ended; its result is discarded", request.serviceId)
             }
+            result
+        }, probePool)
+
+        val budgetMs = AgentDispatchService.runBudgetMs(request.timeoutMs)?.toLong()
+        val startedNanos = System.nanoTime()
+        val result = try {
+            if (budgetMs == null) run.await() else withTimeout(budgetMs) { run.await() }
+        } catch (e: TimeoutCancellationException) {
+            abandoned.set(true)
+            val elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000
+            if (!started.get()) {
+                // Never picked up: the pool is full of runs past their own
+                // budgets. Nothing was learned about the target.
+                log.warn(
+                    "embedded probe for service {} did not start within its {}ms run budget — the probe pool is full",
+                    request.serviceId, budgetMs,
+                )
+                return listOf(ProbeExecutionBackend.Execution(agentId = null, result = null, failureReason = "agent_rejected"))
+            }
+            log.warn(
+                "embedded probe for service {} exceeded its {}ms run budget after {}ms — recording timeout result; " +
+                    "the execution thread runs on until its per-call timeouts expire",
+                request.serviceId, budgetMs, elapsedMs,
+            )
+            SyntheticProbeResult.timeout(
+                elapsedMs,
+                diagnostic = "probe did not finish within its ${budgetMs}ms run budget",
+                text = "${SyntheticProbeResult.SERVICE_PREFIX} timed out: the run did not complete within ${budgetMs}ms",
+            )
+        } catch (e: CancellationException) {
+            throw e // shutdown, not a probe outcome
+        } catch (e: Exception) {
+            // The check did not evaluate, so this is an `error`, not a
+            // `failure`: it must not become the next run's `prev` or announce
+            // a recovery on the next good run — the same as the scheduler
+            // records when an external agent fails inside the run.
+            log.error("embedded probe for service {} failed: {}", request.serviceId, e.message)
+            SyntheticProbeResult.error(e.message ?: e.javaClass.simpleName)
         }
         return listOf(ProbeExecutionBackend.Execution(agentId = null, result = result, egressBytes = 0L))
     }
 
-    private fun runOnce(request: ProbeExecutionBackend.Request): JsonObject {
+    override fun close() {
+        probePool.shutdownNow()
+    }
+
+    companion object {
+        /**
+         * Runs in flight at most. The monolith dispatches from 8 workers; the
+         * headroom is for abandoned runs waiting out their per-call timeouts.
+         */
+        const val DEFAULT_POOL_SIZE = 32
+
+        private val threadCounter = AtomicInteger()
+    }
+}
+
+/**
+ * One embedded run: parse, configure extensions, execute, persist bodies —
+ * unless [abandoned] was set meanwhile, in which case the result is going to
+ * be discarded and bodies nothing would ever reference are not written.
+ */
+internal class LocalLaceRun(private val storageRoot: String, private val abandoned: AtomicBoolean) {
+
+    fun runOnce(request: ProbeExecutionBackend.Request): JsonObject {
         @Suppress("UNCHECKED_CAST")
         val ast = parse(request.script).toMap() as Map<String, Any?>
 
@@ -62,15 +150,7 @@ class LocalLaceExecutionBackend(
         if (variables["trackBaseline"] == "true") extensions.add("laceBaseline")
         if (variables["notifyRecovery"] != "false") extensions.add("laceEmitRecovery")
 
-        val config = mutableMapOf<String, Any?>()
-        if ("laceEmitRecovery" in extensions) {
-            config["extensions"] = mapOf(
-                "laceEmitRecovery" to mapOf(
-                    // The recovery text doubles as the dispatcher-side template.
-                    "recovery_message" to "\${s.name} in \${w.name}.\${p.name} recovered",
-                ),
-            )
-        }
+        val config = mutableMapOf<String, Any?>("extensions" to extensionConfig(extensions))
 
         val bodiesDir = if (request.allowBodySave) {
             Files.createTempDirectory("lace-bodies-").absolutePathString()
@@ -86,7 +166,7 @@ class LocalLaceExecutionBackend(
                 config = config,
             )
             val result = JsonInterop.toJsonObject(raw)
-            return if (bodiesDir != null) {
+            return if (bodiesDir != null && !abandoned.get()) {
                 persistBodies(result, bodiesDir, request)
             } else result
         } finally {
@@ -100,6 +180,31 @@ class LocalLaceExecutionBackend(
      * plaintexts are masked out of the body bytes before they touch storage —
      * a monitored endpoint that reflects a credential never lands it on disk.
      */
+    companion object {
+        /**
+         * Message defaults for the events the extensions emit, as dispatcher-
+         * side templates: the bundled per-call timeout text is a bare "Request
+         * timed out", which names neither the service nor the call. No "after
+         * Nms": the dispatcher's `${ms}` is the whole run's elapsed time when
+         * the call has no response, which is wrong past one call. The recovery
+         * text is composed by the dispatcher itself (it alone knows the
+         * downtime), so that one only shapes what the raw result shows.
+         */
+        internal fun extensionConfig(extensions: List<String>): Map<String, Any?> {
+            val config = mutableMapOf<String, Any?>(
+                "laceNotifications" to mapOf(
+                    "timeout_message" to "${SyntheticProbeResult.SERVICE_PREFIX} call to \${url} timed out",
+                ),
+            )
+            if ("laceEmitRecovery" in extensions) {
+                config["laceEmitRecovery"] = mapOf(
+                    "recovery_message" to "${SyntheticProbeResult.SERVICE_PREFIX} recovered",
+                )
+            }
+            return config
+        }
+    }
+
     private fun persistBodies(
         result: JsonObject,
         bodiesDir: String,
@@ -142,12 +247,5 @@ class LocalLaceExecutionBackend(
             }
         }
         return text.toByteArray(Charsets.ISO_8859_1)
-    }
-
-    private fun syntheticResult(outcome: String, error: String): JsonObject = buildJsonObject {
-        put("outcome", outcome)
-        put("elapsedMs", 0)
-        put("calls", buildJsonArray {})
-        put("error", error)
     }
 }

@@ -54,8 +54,9 @@ class RunBudgetTest {
     @Test
     fun `the agent answers before the scheduler gives up`() {
         // The whole point: the budget must expire inside the client timeout, or
-        // the synthetic timeout stays the normal path for a slow script rather
-        // than the fallback for an unresponsive agent.
+        // the scheduler's own give-up (recorded as an agent fault) stays the
+        // normal path for a slow script rather than the fallback for an
+        // unresponsive agent.
         for (configured in listOf(1_000, 30_000, 300_000)) {
             val budget = AgentDispatchService.runBudgetMs(configured)!!
             val clientTimeoutMs = configured.toLong() + 15_000L

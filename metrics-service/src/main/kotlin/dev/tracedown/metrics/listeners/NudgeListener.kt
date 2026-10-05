@@ -40,7 +40,7 @@ class NudgeListener(
      */
     private open class DeltaCounters {
         var total: Long = 0; var success: Long = 0; var failure: Long = 0
-        var timeout: Long = 0; var sumMs: Long = 0; var callCount: Long = 0
+        var timeout: Long = 0; var error: Long = 0; var sumMs: Long = 0; var callCount: Long = 0
 
         fun record(status: String, responseMs: Int, calls: Int) {
             total++
@@ -48,6 +48,11 @@ class NudgeListener(
                 "success" -> success++
                 "failure" -> failure++
                 "timeout" -> timeout++
+                // A run that did not evaluate (agent fault, executor fault).
+                // Counted on its own so a delta made only of these does not
+                // read as all-green to a card that infers status from the
+                // failure and timeout counts alone.
+                "error" -> error++
             }
             sumMs += responseMs
             callCount += calls
@@ -91,6 +96,7 @@ class NudgeListener(
                     put("success", delta.success)
                     put("failure", delta.failure)
                     put("timeout", delta.timeout)
+                    put("error", delta.error)
                     put("sumMs", delta.sumMs)
                     put("callCount", delta.callCount)
                     put("projects", buildJsonObject {
@@ -100,6 +106,7 @@ class NudgeListener(
                                 put("success", p.success)
                                 put("failure", p.failure)
                                 put("timeout", p.timeout)
+                                put("error", p.error)
                                 put("sumMs", p.sumMs)
                                 put("callCount", p.callCount)
                             })

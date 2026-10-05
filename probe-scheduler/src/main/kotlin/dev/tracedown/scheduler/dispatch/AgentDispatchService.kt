@@ -32,8 +32,8 @@ import org.slf4j.LoggerFactory
  * same number this class sizes its own HTTP timeout from and the same number the
  * caller sizes the execution lock's TTL from, which is the point: all three
  * ends agree on when a run is over. Without it the agent ran to its script's
- * own per-call timeouts and the scheduler gave up first, recording a synthetic
- * timeout for a run that was still going.
+ * own per-call timeouts and the scheduler gave up first, recording an agent
+ * fault for a run that was still going.
  *
  * The [clientFactory] hands out a per-agent client that pins the peer to the
  * intended agent's certificate identity, so a probe (and its resolved secret
@@ -47,6 +47,11 @@ class AgentDispatchService(
      * installation that never turns it on is unaffected by any of it.
      */
     private val sealing: PayloadSealing? = null,
+    /**
+     * How long past the run budget the agent is given to answer — its own
+     * processing and the network, on top of the budget it enforces itself.
+     */
+    private val clientGraceMs: Long = DEFAULT_CLIENT_GRACE_MS,
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -55,9 +60,9 @@ class AgentDispatchService(
      * The outcome of a single dispatch: the raw result (or synthetic/none) plus
      * the number of UTF-8 bytes of the request body actually sent to the agent.
      *
-     * @param result the raw ProbeResult as a JsonObject, a synthetic timeout or
-     *   error result, or null when nothing was observed and the run should be
-     *   attempted on another agent
+     * @param result the raw ProbeResult as a JsonObject, a synthetic error
+     *   result for an agent that went silent or broke, or null when nothing was
+     *   observed and the run should be attempted on another agent
      * @param agentEgressBytes UTF-8 byte size of the request body sent to the
      *   agent; zero when the agent was unreachable and nothing was sent
      * @param failure why no ProbeResult came back from the agent, or null when
@@ -71,7 +76,7 @@ class AgentDispatchService(
         /**
          * True when [result] is the agent's own answer — it ran the script and
          * sent a ProbeResult back. False for every synthetic result, including
-         * the timeout the scheduler records when the agent held the job and
+         * the error the scheduler records when the agent held the job and
          * never answered: that one is filed as a result but proves nothing
          * about the agent being alive.
          */
@@ -87,13 +92,18 @@ class AgentDispatchService(
      * - **A result from the agent** — persisted as observed, whatever its
      *   outcome. This is the target-level signal.
      * - **Request/socket timeout** — the agent held the job for the full probe
-     *   budget plus overhead and did not answer. Now that the budget is
+     *   budget plus grace and did not answer. Now that the budget is
      *   dispatched, an over-budget *run* comes back as a real `timeout`
-     *   ProbeResult from the agent 15s before this fires, so reaching here
-     *   means the agent itself stopped answering. It stays a synthetic
-     *   `timeout` ProbeResult on the normal persistence path: the probe most
-     *   likely ran, and re-running it elsewhere would probe a live target twice
-     *   for one scheduled tick, so it is not classified as retryable.
+     *   ProbeResult from the agent before this fires, so reaching here means
+     *   the agent itself stopped answering — a fault of the agent, not an
+     *   observation about the target, recorded as an `error` result on the
+     *   normal persistence path (see [SyntheticProbeResult]). The probe most
+     *   likely ran, and re-running it elsewhere would probe a live target
+     *   twice for one scheduled tick, so it is not classified as retryable.
+     *   Two populations do not get the budget and so land here for a slow
+     *   target too, now recorded as `error` rather than `timeout`: agents
+     *   older than 0.2.0, which never enforced one, and installs with a
+     *   non-positive `probe.defaultTimeoutMs`, where it is omitted on purpose.
      * - **Refused before running** ([AgentFailure.REJECTED]) or **never
      *   reached** ([AgentFailure.UNREACHABLE]) — no result, and the caller may
      *   dispatch the same run to another eligible agent.
@@ -116,8 +126,8 @@ class AgentDispatchService(
             allowBodySave: Boolean = true,
         secretValues: Set<String> = emptySet(),
     ): DispatchResult {
-        // Allow timeout for the probe itself + 15s overhead for agent processing/network
-        val clientTimeoutMs = timeoutMs.toLong() + 15_000L
+        // The budget for the probe itself, plus the grace for agent processing and network.
+        val clientTimeoutMs = timeoutMs.toLong() + clientGraceMs
         val body = buildJsonObject {
             put("script", script)
             put("variables", variables)
@@ -179,7 +189,7 @@ class AgentDispatchService(
                 } else {
                     log.error("dispatch to {} failed inside the agent: HTTP {} ({})", agentUri, statusCode, detail)
                     DispatchResult(
-                        syntheticError("agent failed while running the probe: HTTP $statusCode — $detail"),
+                        SyntheticProbeResult.error("agent failed while running the probe: HTTP $statusCode — $detail"),
                         agentEgressBytes,
                         statusFailure,
                     )
@@ -192,7 +202,7 @@ class AgentDispatchService(
             } catch (e: Exception) {
                 log.error("agent {} answered HTTP {} with something that is not a ProbeResult: {}", agentUri, statusCode, e.message)
                 return DispatchResult(
-                    syntheticError("agent returned a body that is not a ProbeResult: ${e.message}"),
+                    SyntheticProbeResult.error("agent returned a body that is not a ProbeResult: ${e.message}"),
                     agentEgressBytes,
                     AgentFailure.MALFORMED_RESULT,
                 )
@@ -205,11 +215,11 @@ class AgentDispatchService(
             log.warn("dispatch to {} could not connect within the connect timeout: {}", agentUri, e.message)
             DispatchResult(null, 0L, AgentFailure.UNREACHABLE)
         } catch (e: HttpRequestTimeoutException) {
-            log.warn("dispatch to {} timed out after {}ms — recording timeout result", agentUri, clientTimeoutMs)
-            DispatchResult(syntheticTimeout(clientTimeoutMs), agentEgressBytes)
+            log.warn("dispatch to {} timed out after {}ms — recording error result", agentUri, clientTimeoutMs)
+            DispatchResult(agentSilent(clientTimeoutMs), agentEgressBytes)
         } catch (e: SocketTimeoutException) {
-            log.warn("dispatch to {} socket-timed-out after {}ms — recording timeout result", agentUri, clientTimeoutMs)
-            DispatchResult(syntheticTimeout(clientTimeoutMs), agentEgressBytes)
+            log.warn("dispatch to {} socket-timed-out after {}ms — recording error result", agentUri, clientTimeoutMs)
+            DispatchResult(agentSilent(clientTimeoutMs), agentEgressBytes)
         } catch (e: CancellationException) {
             // Shutdown, not an agent fault. Rethrown so the retry loop above
             // stops rather than walking the fleet on the way down.
@@ -223,32 +233,16 @@ class AgentDispatchService(
     }
 
     /**
-     * A minimal ProbeResult standing in for a probe the agent could not return
-     * in time. `outcome=timeout` is the honest monitoring status; empty `calls`
-     * because no call produced timings. The ingestor persists it like any other
-     * timeout.
+     * The agent took the job and returned nothing within [clientTimeoutMs] —
+     * the budget it was dispatched plus the grace for processing and network.
+     * The check did not evaluate, so this is an `error`, never a `timeout`.
+     * Both count against uptime; the difference is that an `error` does not
+     * become the next run's `prev`, so no recovery is ever announced from it,
+     * and it carries no alert — the service's owner was not told of an outage
+     * that there is no evidence of.
      */
-    private fun syntheticTimeout(elapsedMs: Long): JsonObject = buildJsonObject {
-        put("outcome", "timeout")
-        put("elapsedMs", elapsedMs)
-        put("calls", buildJsonArray {})
-        put("error", "agent did not return a result within ${elapsedMs}ms")
-    }
-
-    /**
-     * A minimal result standing in for a run the agent took on and could not
-     * complete. `outcome` is deliberately outside the ProbeResult vocabulary
-     * (spec §9 knows only success/failure/timeout) — the ingestor normalises
-     * anything it does not recognise to `error`, and this is exactly that case:
-     * the check did not evaluate, so nothing may be claimed about the target.
-     * [detail] is what the person who wrote the script needs to see.
-     */
-    private fun syntheticError(detail: String): JsonObject = buildJsonObject {
-        put("outcome", "error")
-        put("elapsedMs", 0)
-        put("calls", buildJsonArray {})
-        put("error", detail)
-    }
+    private fun agentSilent(clientTimeoutMs: Long): JsonObject =
+        SyntheticProbeResult.error("agent did not return a result within ${clientTimeoutMs}ms")
 
     /** A short, log- and result-safe excerpt of an agent's answer. */
     private fun detailOf(body: String): String =
@@ -257,6 +251,9 @@ class AgentDispatchService(
     companion object {
         /** Enough to identify the fault, short enough to keep out of the result payload's way. */
         private const val ERROR_DETAIL_MAX_CHARS = 300
+
+        /** Grace past the run budget for the agent to answer: its processing plus the network. */
+        const val DEFAULT_CLIENT_GRACE_MS = 15_000L
 
         /**
          * The smallest run budget worth sending. Below it a probe cannot finish
