@@ -6,7 +6,7 @@ package dev.tracedown.common.net
  *
  * It percent-decodes each segment, drops empty segments (collapsing `//` and a
  * trailing slash), and rejects any path carrying a dot-segment (`.` or `..`, in
- * any encoding) by returning null. The motivating case: `//api/v1/auth/login`
+ * any encoding) or an encoded `/` by returning null. The motivating case: `//api/v1/auth/login`
  * and `/api/v1/auth/login` route to the same handler, but a classifier reading
  * the raw URI sees two different strings and can put the doubled-slash form in a
  * more permissive bucket than the real one.
@@ -31,6 +31,9 @@ object PathCanonicalizer {
             if (raw.isEmpty()) continue
             val decoded = percentDecode(raw) ?: return null
             if (decoded == "." || decoded == "..") return null
+            // An encoded slash is one segment to the router and would read as
+            // two here: `/api/x%2Fy` must not classify as `/api/x/y`.
+            if ('/' in decoded) return null
             out.add(decoded)
         }
         return "/" + out.joinToString("/")

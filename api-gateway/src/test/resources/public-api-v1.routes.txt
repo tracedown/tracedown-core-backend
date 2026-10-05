@@ -1,0 +1,72 @@
+DELETE /api/public/v1/access/{resourceType}/{resourceId}/{principalType}/{principalId} revokeResourceAccess 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/projects/{id} deleteProject 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/projects/{id}/variables/{varId} deleteProjectVariable 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/services/{id} deleteService 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/services/{id}/variables/{varId} deleteServiceVariable 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/silences/{id} deleteSilence 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/variables/{varId} deleteOrganizationVariable 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/webhooks/bindings/{id} deleteWebhookBinding 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/workspaces/{id} deleteWorkspace 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+DELETE /api/public/v1/workspaces/{id}/variables/{varId} deleteWorkspaceVariable 200 [] -> - / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+GET /api/public/v1/access/{resourceType}/{resourceId} listResourceAccess 200 [] -> - / kotlin.collections.List<gateway.data.orgs.ResourceAccessEntry>
+GET /api/public/v1/agents listAgents 200 [] -> - / kotlin.collections.List<gateway.data.agents.PublicAgentSummary>
+GET /api/public/v1/groups listGroups 200 [page pageSize] -> - / common.pfs.Page<gateway.data.orgs.PublicGroupSummary>
+GET /api/public/v1/key describeKey 200 [] -> - / gateway.data.apikeys.ApiKeyInfo
+GET /api/public/v1/members listMembers 200 [page pageSize] -> - / common.pfs.Page<gateway.data.orgs.PublicMemberSummary>
+GET /api/public/v1/projects listProjects 200 [workspaceId! page pageSize] -> - / common.pfs.Page<gateway.data.projects.ProjectSummary>
+GET /api/public/v1/projects/{id} getProject 200 [] -> - / gateway.data.projects.ProjectSummary
+GET /api/public/v1/projects/{id}/metrics getProjectMetrics 200 [] -> - / gateway.data.metrics.ServiceMetricsDto
+GET /api/public/v1/projects/{id}/metrics/history getProjectMetricsHistory 200 [hours] -> - / kotlin.collections.List<gateway.data.metrics.HourlyBucket>
+GET /api/public/v1/projects/{id}/variables listProjectVariables 200 [page pageSize] -> - / common.pfs.Page<gateway.data.VariableSummary>
+GET /api/public/v1/projects/{id}/variables/hierarchy getProjectVariableHierarchy 200 [] -> - / gateway.data.VariableHierarchyResponse
+GET /api/public/v1/services listServices 200 [projectId! page pageSize] -> - / common.pfs.Page<gateway.data.services.ServiceSummary>
+GET /api/public/v1/services/{id} getService 200 [] -> - / gateway.data.services.ServiceSummary
+GET /api/public/v1/services/{id}/agents listServiceAgents 200 [] -> - / kotlin.collections.List<kotlin.String>
+GET /api/public/v1/services/{id}/metrics getServiceMetrics 200 [] -> - / gateway.data.metrics.ServiceMetricsDto
+GET /api/public/v1/services/{id}/metrics/history getServiceMetricsHistory 200 [hours] -> - / kotlin.collections.List<gateway.data.metrics.HourlyBucket>
+GET /api/public/v1/services/{id}/metrics/statistics getServiceStatistics 200 [window] -> - / gateway.data.metrics.ServiceStatisticsDto
+GET /api/public/v1/services/{id}/metrics/statistics/assertions getServiceAssertionFailures 200 [window] -> - / gateway.data.metrics.AssertionFailuresDto
+GET /api/public/v1/services/{id}/metrics/statistics/endpoint-series getServiceEndpointSeries 200 [window] -> - / gateway.data.metrics.EndpointSeriesDto
+GET /api/public/v1/services/{id}/metrics/statistics/failure-heatmap getServiceFailureHeatmap 200 [days] -> - / gateway.data.metrics.FailureHeatmapDto
+GET /api/public/v1/services/{id}/results listServiceResults 200 [since page pageSize] -> - / common.pfs.Page<gateway.data.results.ProbeResultSummary>
+GET /api/public/v1/services/{id}/results/{resultId} getServiceResult 200 [] -> - / gateway.data.results.ProbeResultDetail
+GET /api/public/v1/services/{id}/results/{resultId}/steps/{stepId}/body getStepBody 200 [] -> - / gateway.data.results.StepBodyContent
+GET /api/public/v1/services/{id}/snapshot getServiceSnapshot 200 [] -> - / gateway.data.services.ServiceSnapshot
+GET /api/public/v1/services/{id}/variables listServiceVariables 200 [page pageSize] -> - / common.pfs.Page<gateway.data.VariableSummary>
+GET /api/public/v1/services/{id}/variables/hierarchy getServiceVariableHierarchy 200 [] -> - / gateway.data.VariableHierarchyResponse
+GET /api/public/v1/silences listSilences 200 [page pageSize] -> - / common.pfs.Page<gateway.data.silences.SilenceSummary>
+GET /api/public/v1/silences/{id} getSilence 200 [] -> - / gateway.data.silences.SilenceSummary
+GET /api/public/v1/variables listOrganizationVariables 200 [page pageSize] -> - / common.pfs.Page<gateway.data.VariableSummary>
+GET /api/public/v1/webhooks listWebhooks 200 [page pageSize] -> - / common.pfs.Page<gateway.data.webhooks.PublicWebhookSummary>
+GET /api/public/v1/webhooks/bindings listWebhookBindings 200 [resourceType! resourceId! page pageSize] -> - / common.pfs.Page<gateway.data.webhooks.WebhookBindingSummary>
+GET /api/public/v1/workspaces listWorkspaces 200 [page pageSize] -> - / common.pfs.Page<gateway.data.workspaces.WorkspaceSummary>
+GET /api/public/v1/workspaces/{id} getWorkspace 200 [] -> - / gateway.data.workspaces.WorkspaceSummary
+GET /api/public/v1/workspaces/{id}/metrics getWorkspaceMetrics 200 [] -> - / gateway.data.metrics.ServiceMetricsDto
+GET /api/public/v1/workspaces/{id}/metrics/history getWorkspaceMetricsHistory 200 [hours] -> - / kotlin.collections.List<gateway.data.metrics.HourlyBucket>
+GET /api/public/v1/workspaces/{id}/variables listWorkspaceVariables 200 [page pageSize] -> - / common.pfs.Page<gateway.data.VariableSummary>
+GET /api/public/v1/workspaces/{id}/variables/hierarchy getWorkspaceVariableHierarchy 200 [] -> - / gateway.data.VariableHierarchyResponse
+PATCH /api/public/v1/projects/{id} updateProject 200 [] -> gateway.data.projects.UpdateProjectRequest / gateway.data.projects.ProjectSummary
+PATCH /api/public/v1/projects/{id}/services-toggle toggleProjectServices 200 [] -> gateway.data.services.ToggleServiceRequest / gateway.data.services.ScopedToggleResult
+PATCH /api/public/v1/projects/{id}/variables/{varId} updateProjectVariable 200 [] -> gateway.data.UpdateVariableRequest / gateway.data.VariableSummary
+PATCH /api/public/v1/services/{id} updateService 200 [] -> gateway.data.services.UpdateServiceRequest / gateway.data.services.ServiceSummary
+PATCH /api/public/v1/services/{id}/script updateServiceScript 200 [] -> gateway.data.services.UpdateScriptRequest / gateway.data.services.ServiceSummary
+PATCH /api/public/v1/services/{id}/toggle toggleService 200 [] -> gateway.data.services.ToggleServiceRequest / gateway.data.services.ServiceSummary
+PATCH /api/public/v1/services/{id}/variables/{varId} updateServiceVariable 200 [] -> gateway.data.UpdateVariableRequest / gateway.data.VariableSummary
+PATCH /api/public/v1/silences/{id} updateSilence 200 [] -> gateway.data.silences.UpdateSilenceRequest / gateway.data.silences.SilenceSummary
+PATCH /api/public/v1/variables/{varId} updateOrganizationVariable 200 [] -> gateway.data.UpdateVariableRequest / gateway.data.VariableSummary
+PATCH /api/public/v1/webhooks/bindings/{id} updateWebhookBinding 200 [] -> kotlin.collections.Map<kotlin.String, kotlin.Boolean> / gateway.data.webhooks.WebhookBindingSummary
+PATCH /api/public/v1/workspaces/{id} updateWorkspace 200 [] -> gateway.data.workspaces.UpdateWorkspaceRequest / gateway.data.workspaces.WorkspaceSummary
+PATCH /api/public/v1/workspaces/{id}/services-toggle toggleWorkspaceServices 200 [] -> gateway.data.services.ToggleServiceRequest / gateway.data.services.ScopedToggleResult
+PATCH /api/public/v1/workspaces/{id}/variables/{varId} updateWorkspaceVariable 200 [] -> gateway.data.UpdateVariableRequest / gateway.data.VariableSummary
+POST /api/public/v1/projects createProject 200 [] -> gateway.data.projects.CreateProjectRequest / gateway.data.projects.ProjectSummary
+POST /api/public/v1/projects/{id}/variables createProjectVariable 200 [] -> gateway.data.CreateVariableRequest / gateway.data.VariableSummary
+POST /api/public/v1/services createService 200 [] -> gateway.data.services.CreateServiceRequest / gateway.data.services.ServiceSummary
+POST /api/public/v1/services/{id}/run runService 202 [] -> - / gateway.data.services.RunRequested
+POST /api/public/v1/services/{id}/variables createServiceVariable 200 [] -> gateway.data.CreateVariableRequest / gateway.data.VariableSummary
+POST /api/public/v1/silences createSilence 200 [] -> gateway.data.silences.CreateSilenceRequest / gateway.data.silences.SilenceSummary
+POST /api/public/v1/variables createOrganizationVariable 200 [] -> gateway.data.CreateVariableRequest / gateway.data.VariableSummary
+POST /api/public/v1/webhooks/bindings createWebhookBinding 200 [resourceType! resourceId!] -> gateway.data.webhooks.WebhookBindingRequest / gateway.data.webhooks.WebhookBindingSummary
+POST /api/public/v1/workspaces createWorkspace 200 [] -> gateway.data.workspaces.CreateWorkspaceRequest / gateway.data.workspaces.WorkspaceSummary
+POST /api/public/v1/workspaces/{id}/variables createWorkspaceVariable 200 [] -> gateway.data.CreateVariableRequest / gateway.data.VariableSummary
+PUT /api/public/v1/access/{resourceType}/{resourceId} grantResourceAccess 200 [] -> gateway.data.orgs.UpsertAccessRequest / kotlin.collections.Map<kotlin.String, kotlin.Boolean>
+PUT /api/public/v1/services/{id}/agents setServiceAgents 200 [] -> gateway.data.services.SetAllowedAgentsRequest / kotlin.collections.List<kotlin.String>

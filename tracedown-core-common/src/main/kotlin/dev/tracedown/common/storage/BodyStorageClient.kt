@@ -366,6 +366,35 @@ open class BodyStorageClient(
     }
 
     /**
+     * The size in bytes of the body at [uri], or null when nothing is there —
+     * read from a stat or a HEAD, nothing is downloaded. Confinement applies
+     * (throws [StorageConfinementException]); an unreachable store or refused
+     * credentials throw as well.
+     *
+     * A size, not a promise: the object can change before it is read, which
+     * is why [readBytes] still caps by streaming. What it is for is deciding
+     * how much of a budget a read is about to need before making it.
+     */
+    open fun sizeOf(uri: String): Long? {
+        return when (val parsed = StorageUri.parse(uri)) {
+            is StorageUri.File -> {
+                val file = confineFilePath(parsed.path)
+                if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) null else Files.size(file)
+            }
+            is StorageUri.S3 -> {
+                confineS3(parsed.bucket, parsed.key)
+                val client = s3Client ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
+                try {
+                    client.headObject(HeadObjectRequest.builder().bucket(parsed.bucket).key(parsed.key).build())
+                        .contentLength() ?: 0L
+                } catch (e: AwsServiceException) {
+                    if (isMissing(e)) null else throw e
+                }
+            }
+        }
+    }
+
+    /**
      * Reads the bytes at [uri], never more than [maxBytes]. Confinement applies
      * (throws [StorageConfinementException]); an unreachable store or refused
      * credentials throw as well. A missing object is [StoredBody.Missing].
@@ -390,7 +419,7 @@ open class BodyStorageClient(
             }
             is StorageUri.S3 -> {
                 confineS3(parsed.bucket, parsed.key)
-                val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+                val client = s3Client ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
                 val head = try {
                     client.headObject(HeadObjectRequest.builder().bucket(parsed.bucket).key(parsed.key).build())
                 } catch (e: AwsServiceException) {
@@ -525,7 +554,7 @@ open class BodyStorageClient(
     }
 
     private fun deleteS3(bucket: String, key: String): Boolean {
-        val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+        val client = s3Client ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
         // S3 DELETE on a missing key succeeds, so the "already gone" case never
         // reaches the catch. Anything that does is a real failure and must
         // propagate: this used to log and return false, which the retention and
@@ -540,7 +569,7 @@ open class BodyStorageClient(
     }
 
     private fun deleteS3Bulk(bucket: String, entries: List<Pair<String, String>>): Map<String, String?> {
-        val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+        val client = s3Client ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
         val uriByKey = entries.toMap()
         val failed = LinkedHashMap<String, String?>()
         for (chunk in entries.chunked(S3_DELETE_CHUNK)) {
@@ -572,7 +601,7 @@ open class BodyStorageClient(
     }
 
     private fun presignS3(bucket: String, key: String): String {
-        val presigner = s3Presigner ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+        val presigner = s3Presigner ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
         return presigner.presignGetObject(
             GetObjectPresignRequest.builder()
                 .signatureDuration(PRESIGN_EXPIRY)
@@ -699,7 +728,7 @@ open class BodyStorageClient(
     }
 
     private fun relocateS3(conf: BodyConfinement, bucket: String, key: String, destKey: String): String {
-        val client = s3Client ?: throw IllegalStateException("S3 config not provided but s3:// URI encountered")
+        val client = s3Client ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
         // Confine the SOURCE (rejects a foreign bucket / out-of-prefix key).
         confineS3(bucket, key)
         val allowedBucket = conf.s3Bucket

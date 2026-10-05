@@ -1,32 +1,15 @@
 package dev.tracedown.gateway.routes.v1.metrics
 
-import dev.tracedown.common.auth.canAccessResource
-import dev.tracedown.common.errors.ErrorCodes
-import dev.tracedown.common.models.Projects
-import dev.tracedown.common.models.Services
 import dev.tracedown.gateway.controllers.metrics.DashboardMetricsController
-import dev.tracedown.gateway.data.metrics.MetricsCounters
-import dev.tracedown.gateway.data.metrics.MetricsState
-import dev.tracedown.gateway.data.metrics.ServiceMetricsDto
+import dev.tracedown.gateway.controllers.metrics.MetricsAccess
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
-import dev.tracedown.gateway.util.BadRequestException
-import dev.tracedown.gateway.util.NotFoundException
-import dev.tracedown.gateway.util.ResourceResolver
 import dev.tracedown.gateway.util.parseUuid
-import dev.tracedown.gateway.util.requireCachedPermissions
 import io.ktor.http.HttpStatusCode
 import io.ktor.resources.Resource
-import io.ktor.server.application.ApplicationCall
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.resources.get
 import kotlinx.serialization.Serializable
-import org.jetbrains.exposed.v1.core.and
-import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.core.inList
-import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import java.util.UUID
 
 /**
  * @OpenAPITag Dashboard Metrics
@@ -70,8 +53,6 @@ class ServiceMetrics(val serviceId: String) {
     )
 }
 
-private val STATISTICS_WINDOWS = setOf("24h", "7d", "30d", "90d")
-
 @Serializable
 @Resource("/api/v1/projects/{projectId}/metrics")
 class ProjectMetrics(val projectId: String)
@@ -93,14 +74,7 @@ fun Route.dashboardMetricsRoutes() {
     get<ServiceMetrics> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val serviceId = parseUuid(resource.serviceId, "service ID")
-        transaction {
-            val ctx = ResourceResolver.resolveService(serviceId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))) {
-                throw NotFoundException()
-            }
-        }
-        val metrics = DashboardMetricsController.getServiceMetrics(serviceId)
+        val metrics = MetricsAccess.serviceCurrent(orgId, principal.userId, serviceId)
         if (metrics != null) call.respond(metrics) else call.respond(HttpStatusCode.NoContent, "")
     }
 
@@ -108,181 +82,69 @@ fun Route.dashboardMetricsRoutes() {
     get<ServiceMetrics.History> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val serviceId = parseUuid(resource.parent.serviceId, "service ID")
-        transaction {
-            val ctx = ResourceResolver.resolveService(serviceId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))) {
-                throw NotFoundException()
-            }
-        }
-
-        val hours = resource.hours
-        if (hours < 1 || hours > 168) throw BadRequestException(ErrorCodes.FIELD_INVALID)
-
-        call.respond(DashboardMetricsController.getServiceHistory(serviceId, hours))
+        call.respond(MetricsAccess.serviceHistory(orgId, principal.userId, serviceId, resource.hours))
     }
 
     /** Returns the last N recent-probe data points for a service (default 10, max 50). */
     get<ServiceMetrics.RecentProbes> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val serviceId = parseUuid(resource.parent.serviceId, "service ID")
-        transaction {
-            val ctx = ResourceResolver.resolveService(serviceId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))) {
-                throw NotFoundException()
-            }
-        }
-        val limit = resource.limit.coerceIn(1, 50)
-        call.respond(DashboardMetricsController.getServiceRecentProbes(serviceId, limit))
+        call.respond(MetricsAccess.serviceRecentProbes(orgId, principal.userId, serviceId, resource.limit))
     }
 
     /** Deep statistics (uptime/error-rate/latency trend + per-region) from probe_aggregates. */
     get<ServiceMetrics.Statistics> { resource ->
-        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
-        if (resource.window !in STATISTICS_WINDOWS) throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        call.respond(DashboardMetricsController.getServiceStatistics(serviceId, resource.window))
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val serviceId = parseUuid(resource.parent.serviceId, "service ID")
+        call.respond(MetricsAccess.serviceStatistics(orgId, principal.userId, serviceId, resource.window))
     }
 
     /** The same window per endpoint over time, on the same buckets, from probe_step_aggregates. */
     get<ServiceMetrics.EndpointSeries> { resource ->
-        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
-        if (resource.window !in STATISTICS_WINDOWS) throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        call.respond(DashboardMetricsController.getEndpointSeries(serviceId, resource.window))
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val serviceId = parseUuid(resource.parent.serviceId, "service ID")
+        call.respond(MetricsAccess.endpointSeries(orgId, principal.userId, serviceId, resource.window))
     }
 
     /** The window's most-failing assertions, computed from raw probe_steps. */
     get<ServiceMetrics.Assertions> { resource ->
-        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
-        if (resource.window !in STATISTICS_WINDOWS) throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        call.respond(DashboardMetricsController.getAssertionFailures(serviceId, resource.window))
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val serviceId = parseUuid(resource.parent.serviceId, "service ID")
+        call.respond(MetricsAccess.assertionFailures(orgId, principal.userId, serviceId, resource.window))
     }
 
     /** Failed runs by UTC hour of day and ISO weekday, from the hourly rollups. */
     get<ServiceMetrics.FailureHeatmap> { resource ->
-        val serviceId = requireStatisticsAccess(call, resource.parent.serviceId)
-        // Refused rather than quietly clamped: a heatmap of "the last 0 days"
-        // and one of "the last 4000" are both a caller mistake, and answering
-        // the second would scan whatever retention happens to hold.
-        if (resource.days < 1 || resource.days > DashboardMetricsController.MAX_HEATMAP_DAYS) {
-            throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        }
-        call.respond(DashboardMetricsController.getFailureHeatmap(serviceId, resource.days))
+        val (principal, orgId) = requireAuthWithOrg(call)
+        val serviceId = parseUuid(resource.parent.serviceId, "service ID")
+        call.respond(MetricsAccess.failureHeatmap(orgId, principal.userId, serviceId, resource.days))
     }
 
     /** Aggregated metrics for accessible services in a project. Filters by service-level permissions. */
     get<ProjectMetrics> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val projectId = parseUuid(resource.projectId, "project ID")
-        val serviceIds = transaction {
-            val ctx = ResourceResolver.resolveProject(projectId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "project", projectId, listOf("workspace::${ctx.workspaceId}"))) {
-                throw NotFoundException()
-            }
-            val parentChain = listOf("project::$projectId", "workspace::${ctx.workspaceId}")
-            Services.selectAll()
-                .where { (Services.projectId eq projectId) and (Services.deleted eq false) }
-                .filter { canAccessResource(cached, "service", it[Services.id], parentChain) }
-                .map { it[Services.id] }
-        }
-        val metrics = DashboardMetricsController.getAggregatedMetrics(serviceIds) ?: emptyAggregateMetrics()
-        call.respond(metrics.copy(serviceCount = serviceIds.size))
+        call.respond(MetricsAccess.projectCurrent(orgId, principal.userId, projectId).orEmpty())
     }
 
     /** Aggregated metrics for accessible services in a workspace. Filters by project-level permissions. */
     get<WorkspaceMetrics> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val workspaceId = parseUuid(resource.workspaceId, "workspace ID")
-        val (projectIds, serviceIds) = transaction {
-            ResourceResolver.resolveWorkspace(workspaceId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "workspace", workspaceId)) {
-                throw NotFoundException()
-            }
-            val wsKey = "workspace::$workspaceId"
-            val accessibleProjectIds = Projects.selectAll()
-                .where { (Projects.workspaceId eq workspaceId) and (Projects.deleted eq false) }
-                .filter { canAccessResource(cached, "project", it[Projects.id], listOf(wsKey)) }
-                .map { it[Projects.id] }
-            val ids = if (accessibleProjectIds.isEmpty()) emptyList()
-            else Services.selectAll()
-                .where { (Services.projectId inList accessibleProjectIds) and (Services.deleted eq false) }
-                .map { it[Services.id] }
-            accessibleProjectIds to ids
-        }
-        val metrics = DashboardMetricsController.getAggregatedMetrics(serviceIds) ?: emptyAggregateMetrics()
-        call.respond(metrics.copy(projectCount = projectIds.size, serviceCount = serviceIds.size))
+        call.respond(MetricsAccess.workspaceCurrent(orgId, principal.userId, workspaceId).orEmpty())
     }
 
     /** Aggregated hourly history for accessible services in a project. Default 24h, max 168h. */
     get<ProjectMetricsHistory> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val projectId = parseUuid(resource.projectId, "project ID")
-        val hours = resource.hours
-        if (hours < 1 || hours > 168) throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        val serviceIds = transaction {
-            val ctx = ResourceResolver.resolveProject(projectId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "project", projectId, listOf("workspace::${ctx.workspaceId}"))) {
-                throw NotFoundException()
-            }
-            val parentChain = listOf("project::$projectId", "workspace::${ctx.workspaceId}")
-            Services.selectAll()
-                .where { (Services.projectId eq projectId) and (Services.deleted eq false) }
-                .filter { canAccessResource(cached, "service", it[Services.id], parentChain) }
-                .map { it[Services.id] }
-        }
-        call.respond(DashboardMetricsController.getAggregatedHistory(serviceIds, hours))
+        call.respond(MetricsAccess.projectHistory(orgId, principal.userId, projectId, resource.hours))
     }
 
     /** Aggregated hourly history for accessible services in a workspace. Default 24h, max 168h. */
     get<WorkspaceMetricsHistory> { resource ->
         val (principal, orgId) = requireAuthWithOrg(call)
         val workspaceId = parseUuid(resource.workspaceId, "workspace ID")
-        val hours = resource.hours
-        if (hours < 1 || hours > 168) throw BadRequestException(ErrorCodes.FIELD_INVALID)
-        val serviceIds = transaction {
-            ResourceResolver.resolveWorkspace(workspaceId, orgId)
-            val cached = requireCachedPermissions(orgId, principal.userId)
-            if (!canAccessResource(cached, "workspace", workspaceId)) {
-                throw NotFoundException()
-            }
-            val wsKey = "workspace::$workspaceId"
-            val accessibleProjectIds = Projects.selectAll()
-                .where { (Projects.workspaceId eq workspaceId) and (Projects.deleted eq false) }
-                .filter { canAccessResource(cached, "project", it[Projects.id], listOf(wsKey)) }
-                .map { it[Projects.id] }
-            if (accessibleProjectIds.isEmpty()) emptyList()
-            else Services.selectAll()
-                .where { (Services.projectId inList accessibleProjectIds) and (Services.deleted eq false) }
-                .map { it[Services.id] }
-        }
-        call.respond(DashboardMetricsController.getAggregatedHistory(serviceIds, hours))
+        call.respond(MetricsAccess.workspaceHistory(orgId, principal.userId, workspaceId, resource.hours))
     }
 }
-
-/**
- * The access check the four statistics reads share: the service has to exist in
- * the caller's organization and be reachable through their permissions, or the
- * answer is the one an unknown id gets — a route must not confirm the existence
- * of a service the caller cannot see.
- */
-private fun requireStatisticsAccess(call: ApplicationCall, rawServiceId: String): UUID {
-    val (principal, orgId) = requireAuthWithOrg(call)
-    val serviceId = parseUuid(rawServiceId, "service ID")
-    transaction {
-        val ctx = ResourceResolver.resolveService(serviceId, orgId)
-        val cached = requireCachedPermissions(orgId, principal.userId)
-        if (!canAccessResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))) {
-            throw NotFoundException()
-        }
-    }
-    return serviceId
-}
-
-/** Zeroed aggregate for resources whose services have no metrics yet — counts still apply. */
-private fun emptyAggregateMetrics() = ServiceMetricsDto(
-    counters = MetricsCounters(probesTotal = 0, probesSuccess = 0, probesFailure = 0, probesTimeout = 0),
-    state = MetricsState(lastStatus = null, lastConsecutive = 0, lastResponseMs = 0, lastRunAt = null),
-)

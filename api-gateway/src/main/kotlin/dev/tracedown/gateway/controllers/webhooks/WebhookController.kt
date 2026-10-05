@@ -2,46 +2,54 @@ package dev.tracedown.gateway.controllers.webhooks
 
 import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
+import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.config.DeletionRetention
+import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
 import dev.tracedown.common.models.Organizations
-import dev.tracedown.common.pfs.Page
-import dev.tracedown.common.pfs.PfsParams
-import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ResourceWebhookAccess
 import dev.tracedown.common.models.Services
-import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.models.WebhookDeliveries
 import dev.tracedown.common.models.Workspaces
+import dev.tracedown.common.pfs.Page
+import dev.tracedown.common.pfs.PfsParams
+import dev.tracedown.common.pfs.applyPfs
+import dev.tracedown.gateway.controllers.orgs.ResourceAccessController
 import dev.tracedown.gateway.data.webhooks.CreateWebhookRequest
+import dev.tracedown.gateway.data.webhooks.PublicWebhookSummary
 import dev.tracedown.gateway.data.webhooks.UpdateWebhookRequest
 import dev.tracedown.gateway.data.webhooks.WebhookBindingRequest
 import dev.tracedown.gateway.data.webhooks.WebhookBindingSummary
 import dev.tracedown.gateway.data.webhooks.WebhookSummary
-import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.fieldError
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
+import java.time.Instant
+import java.util.UUID
+import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
-import java.time.Instant
-import java.util.UUID
 
 object WebhookController {
 
     private val validMethods = setOf("GET", "POST", "PUT", "PATCH")
     private val validResourceTypes = setOf("workspace", "project", "service")
+
+    /** The order webhooks are listed in when the caller asks for none. */
+    private val WEBHOOK_ORDER = listOf(WebhookDeliveries.createdAt to SortOrder.ASC, WebhookDeliveries.id to SortOrder.ASC)
 
     // ── Webhook CRUD ──
 
@@ -88,8 +96,34 @@ object WebhookController {
 
             val query = WebhookDeliveries.selectAll()
                 .where { (WebhookDeliveries.organizationId eq orgId) and (WebhookDeliveries.deleted eq false) }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(pfs, WEBHOOK_ORDER)
             val items = pagedQuery.map { webhookSummaryFromRow(it, redact) }
+            Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /**
+     * Lists the organization's webhooks with nothing but what identifies one —
+     * never its URL, body template or delivery configuration, whatever the
+     * caller may otherwise read. For the key-authenticated API, which only
+     * attaches existing webhooks to resources: a URL or a body may carry a
+     * token, and a key has no use for one. Same permission as [list].
+     */
+    fun listRedacted(orgId: UUID, userId: UUID, pfs: PfsParams): Page<PublicWebhookSummary> {
+        return transaction {
+            requireOrgRead(orgId, userId) { it.webhooks }
+            val query = WebhookDeliveries.selectAll()
+                .where { (WebhookDeliveries.organizationId eq orgId) and (WebhookDeliveries.deleted eq false) }
+            val (pagedQuery, total) = query.applyPfs(pfs, WEBHOOK_ORDER)
+            val items = pagedQuery.map { row ->
+                PublicWebhookSummary(
+                    id = row[WebhookDeliveries.id].toString(),
+                    name = row[WebhookDeliveries.name],
+                    label = row[WebhookDeliveries.label],
+                    method = row[WebhookDeliveries.method],
+                    createdAt = row[WebhookDeliveries.createdAt].toString(),
+                )
+            }
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }
@@ -169,17 +203,19 @@ object WebhookController {
     /** Binds a webhook to a resource (workspace, project, or service). Requires webhooks.write. */
     fun createBinding(orgId: UUID, resourceType: String, resourceId: UUID, request: WebhookBindingRequest, userId: UUID): WebhookBindingSummary {
         if (resourceType !in validResourceTypes) {
-            throw BadRequestException(ErrorCodes.FIELD_INVALID)
+            throw fieldError("resourceType")
         }
 
         val webhookId = try { UUID.fromString(request.webhookId) } catch (_: Exception) {
-            throw BadRequestException(ErrorCodes.INVALID_UUID)
+            throw fieldError("webhookId", ErrorCodes.INVALID_UUID)
         }
 
         return transaction {
             requireOrgWrite(orgId, userId) { it.webhooks }
             requireWebhookExists(webhookId, orgId)
-            requireResourceExists(resourceType, resourceId, orgId)
+            // Binding a webhook to a resource changes what that resource does,
+            // so it takes write on the resource, as granting access to it does.
+            ResourceAccessController.requireResourceWrite(orgId, userId, resourceType, resourceId)
 
             val exists = ResourceWebhookAccess.selectAll()
                 .where {
@@ -188,19 +224,18 @@ object WebhookController {
                     (ResourceWebhookAccess.resourceId eq resourceId)
                 }
                 .any()
-            if (exists) throw ConflictException()
+            if (exists) throw ConflictException(ErrorCodes.BINDING_EXISTS)
 
             val id = UUID.randomUUID()
             val now = Instant.now()
 
-            ResourceWebhookAccess.insert {
-                it[ResourceWebhookAccess.id] = id
-                it[ResourceWebhookAccess.orgId] = orgId
-                it[ResourceWebhookAccess.resourceType] = resourceType
-                it[ResourceWebhookAccess.resourceId] = resourceId
-                it[webhookDeliveryId] = webhookId
-                it[enabled] = request.enabled
-                it[createdAt] = now
+            // The check above does not stop two creates that race it; the
+            // unique index does, and its refusal is the same answer.
+            try {
+                insertBinding(id, orgId, resourceType, resourceId, webhookId, request.enabled, now)
+            } catch (e: ExposedSQLException) {
+                if (isUniqueViolation(e)) throw ConflictException(ErrorCodes.BINDING_EXISTS)
+                throw e
             }
 
             val webhookName = WebhookDeliveries.selectAll()
@@ -216,11 +251,14 @@ object WebhookController {
     /** Lists webhook bindings for a resource. Requires webhooks.read. */
     fun listBindings(orgId: UUID, resourceType: String, resourceId: UUID, userId: UUID, pfs: PfsParams): Page<WebhookBindingSummary> {
         if (resourceType !in validResourceTypes) {
-            throw BadRequestException(ErrorCodes.FIELD_INVALID)
+            throw fieldError("resourceType")
         }
 
         return transaction {
             requireOrgRead(orgId, userId) { it.webhooks }
+            // What is bound to a resource is part of that resource: only for
+            // a caller who may see it.
+            ResourceAccessController.requireResourceRead(orgId, userId, resourceType, resourceId)
 
             val query = (ResourceWebhookAccess innerJoin WebhookDeliveries)
                 .selectAll()
@@ -230,24 +268,58 @@ object WebhookController {
                     (ResourceWebhookAccess.orgId eq orgId) and
                     (WebhookDeliveries.deleted eq false)
                 }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(
+                pfs, listOf(ResourceWebhookAccess.createdAt to SortOrder.ASC, ResourceWebhookAccess.id to SortOrder.ASC),
+            )
             val items = pagedQuery.map { bindingSummaryFromRow(it) }
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }
+
+    private fun insertBinding(
+        id: UUID,
+        orgId: UUID,
+        resourceType: String,
+        resourceId: UUID,
+        webhookId: UUID,
+        enabled: Boolean,
+        now: Instant,
+    ) {
+        ResourceWebhookAccess.insert {
+            it[ResourceWebhookAccess.id] = id
+            it[ResourceWebhookAccess.orgId] = orgId
+            it[ResourceWebhookAccess.resourceType] = resourceType
+            it[ResourceWebhookAccess.resourceId] = resourceId
+            it[webhookDeliveryId] = webhookId
+            it[ResourceWebhookAccess.enabled] = enabled
+            it[createdAt] = now
+        }
+    }
+
+    /** Whether [e] is Postgres refusing a duplicate key (23505), anywhere in its causes. */
+    private fun isUniqueViolation(e: ExposedSQLException): Boolean =
+        generateSequence<Throwable>(e) { cause -> cause.cause?.takeIf { it !== cause } }
+            .any { (it as? java.sql.SQLException)?.sqlState == "23505" }
 
     /** Updates a binding's enabled state. Requires webhooks.write. */
     fun updateBinding(orgId: UUID, bindingId: UUID, enabled: Boolean, userId: UUID): WebhookBindingSummary {
         return transaction {
             requireOrgWrite(orgId, userId) { it.webhooks }
 
-            val updated = ResourceWebhookAccess.update({
+            val previous = ResourceWebhookAccess.selectAll()
+                .where { (ResourceWebhookAccess.id eq bindingId) and (ResourceWebhookAccess.orgId eq orgId) }
+                .firstOrNull() ?: throw NotFoundException()
+            ResourceWebhookAccess.update({
                 (ResourceWebhookAccess.id eq bindingId) and (ResourceWebhookAccess.orgId eq orgId)
             }) {
                 it[ResourceWebhookAccess.enabled] = enabled
             }
-            if (updated == 0) throw NotFoundException()
 
+            AuditService.log(
+                orgId, userId, "update.webhook-binding", "webhook-binding", bindingId.toString(),
+                entityDisplayName = null,
+                diff = auditDiff(Triple("enabled", previous[ResourceWebhookAccess.enabled], enabled)),
+            )
             bindingSummary(bindingId)
         }
     }
@@ -308,39 +380,6 @@ object WebhookController {
                 (WebhookDeliveries.deleted eq false)
             }
             .any()
-        if (!exists) throw NotFoundException()
-    }
-
-    /** Verifies that a resource exists in the org. Polymorphic — no FK, validated at application layer. */
-    private fun requireResourceExists(resourceType: String, resourceId: UUID, orgId: UUID) {
-        val exists = when (resourceType) {
-            "workspace" -> Workspaces.selectAll()
-                .where { (Workspaces.id eq resourceId) and (Workspaces.organizationId eq orgId) and (Workspaces.deleted eq false) }
-                .any()
-            "project" -> {
-                // Project belongs to a workspace in the org
-                (Projects innerJoin Workspaces)
-                    .selectAll()
-                    .where {
-                        (Projects.id eq resourceId) and
-                        (Workspaces.organizationId eq orgId) and
-                        (Projects.deleted eq false)
-                    }
-                    .any()
-            }
-            "service" -> {
-                // Service belongs to a project in a workspace in the org
-                (Services innerJoin Projects innerJoin Workspaces)
-                    .selectAll()
-                    .where {
-                        (Services.id eq resourceId) and
-                        (Workspaces.organizationId eq orgId) and
-                        (Services.deleted eq false)
-                    }
-                    .any()
-            }
-            else -> false
-        }
         if (!exists) throw NotFoundException()
     }
 

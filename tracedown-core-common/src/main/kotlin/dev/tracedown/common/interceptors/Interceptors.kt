@@ -1,5 +1,6 @@
 package dev.tracedown.common.interceptors
 
+import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import java.util.UUID
 
@@ -74,9 +75,17 @@ object Interceptors {
      * Transaction-scoped variant of [injectable] for check-and-act operations.
      *
      * Opens a single database transaction and runs the before-hooks, [block],
-     * and after-hooks all INSIDE it. This makes a before-hook's read (e.g. a
-     * COUNT of existing resources) and [block]'s write atomic — no other
-     * connection can slip a row in between the check and the insert.
+     * and after-hooks all INSIDE it, so a hook's refusal undoes the block and a
+     * failed block undoes whatever a hook wrote.
+     *
+     * One transaction is not, by itself, mutual exclusion. The pool runs at
+     * REPEATABLE READ, where a transaction reads from the snapshot taken at its
+     * first statement: two of these running at once each count from their own
+     * snapshot and both find room. A check-and-act that has to hold under
+     * concurrency needs two things from its block — a row lock that makes the
+     * contenders take turns, and [isolation] set to READ COMMITTED, so the one
+     * that waited counts again from what the other committed rather than from
+     * the snapshot it took before waiting.
      *
      * [block] must NOT open its own `transaction { }`; it already runs inside
      * this one and its Exposed calls use the current transaction.
@@ -85,12 +94,21 @@ object Interceptors {
     inline fun <T> injectableInTx(
         operation: String,
         ctx: InterceptorContext,
+        isolation: Int? = null,
         crossinline block: () -> T,
-    ): T = transaction {
-        runBefore(operation, ctx)
-        var result: Any? = block()
-        result = runAfter(operation, ctx, result)
-        result as T
+    ): T {
+        // A nested call joins the open transaction and the requested level is
+        // silently ignored — the check-and-act it was asked for would then be
+        // racy again. Say so where it is written rather than where it fails.
+        check(isolation == null || TransactionManager.currentOrNull() == null) {
+            "injectableInTx(\"$operation\") asked for an isolation level inside an open transaction"
+        }
+        return transaction(transactionIsolation = isolation) {
+            runBefore(operation, ctx)
+            var result: Any? = block()
+            result = runAfter(operation, ctx, result)
+            result as T
+        }
     }
 
     /** Runs all before-hooks for an operation. */

@@ -24,7 +24,9 @@ private fun JdbcTransaction.execCount(sql: String): Long =
  * children carry no purge_after of their own. Data-preserving links (audit-log
  * actor, created_by provenance, session/user org selection, last-run pointer,
  * notification-log sources) are cleared automatically by ON DELETE SET NULL
- * actions declared in the schema.
+ * actions declared in the schema. One of those is more than provenance: an API
+ * key's created_by is the user it acts as, and a key left with nobody to act
+ * as authenticates nothing.
  *
  * A container's cascade reaches its descendants by parentage, not by their own
  * deletion state, so a child that was never soft-deleted at all — a legacy row
@@ -424,9 +426,10 @@ class PurgeJob(
         // ── User cascade ──
         // Accounts still owning an organization are excluded (see purgeUsers).
         // Data-preserving links — org_audit_log.user_id (audit history is kept,
-        // actor anonymized), org_users.invited_by and the created_by provenance
-        // columns (resources outlive their creator) — are cleared by
-        // ON DELETE SET NULL declared in the schema.
+        // actor anonymized), org_users.invited_by and the created_by columns
+        // (resources outlive their creator; an API key, which acts as its
+        // creator, is left dead) — are cleared by ON DELETE SET NULL declared
+        // in the schema.
         private const val PURGEABLE_USERS =
             "SELECT id FROM users WHERE $PURGE_DUE AND id NOT IN (SELECT owner_id FROM organizations)"
         private const val MEMBERSHIPS_OF_PURGEABLE_USERS =

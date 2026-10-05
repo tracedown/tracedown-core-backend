@@ -111,3 +111,13 @@ data class AgentRenewRequest(
         Validators.maxLen("signature", signature, 1024)?.let(::add)
     }
 }
+
+/**
+ * An agent as the key-authenticated API lists it: the slug a service's agent
+ * list names it by, and its label. No address, no credentials, no state.
+ */
+@Serializable
+data class PublicAgentSummary(
+    val slug: String,
+    val label: String,
+)

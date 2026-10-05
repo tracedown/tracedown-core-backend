@@ -21,6 +21,13 @@ metrics). Exposure to the world is your host web server's job:
 3. Reload the server. The frontend calls same-origin `/api/v1` and `/ws`,
    which the config proxies to the localhost ports.
 
+Both configs proxy everything under `/api/`. That covers the dashboard's API
+(`/api/v1`), the key-authenticated API (`/api/public`) and that API's
+description (`/api/openapi/public/v1.json`, served without a key). A proxy
+that allowlists prefixes instead must pass all three. The description names
+its server by a relative URL, so a gateway published under a path prefix
+still gives clients the right addresses.
+
 Then enrol at least one probe agent — nothing probes without one. The agent
 ships as a Docker image and pip package; see the
 [tracedown-probe-agent](https://github.com/tracedown/tracedown-probe-agent)

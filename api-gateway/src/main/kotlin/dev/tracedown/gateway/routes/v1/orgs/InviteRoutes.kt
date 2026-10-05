@@ -7,6 +7,7 @@ import dev.tracedown.gateway.data.orgs.AcceptInviteRequest
 import dev.tracedown.gateway.data.orgs.InviteRequest
 import java.util.UUID
 import dev.tracedown.gateway.routes.v1
+import dev.tracedown.gateway.routes.v1.auth.requireAuth
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
 import dev.tracedown.gateway.util.AppConfig
 import dev.tracedown.gateway.util.clientIp
@@ -97,11 +98,6 @@ fun Route.inviteRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
 
 /** The signed-in user's id, or null when no valid session accompanies the call. */
 private fun resolveOptionalSession(call: io.ktor.server.application.ApplicationCall): UUID? =
-    runCatching {
-        val header = call.request.headers["Authorization"] ?: return@runCatching null
-        val token = if (header.startsWith("Bearer ", ignoreCase = true)) header.substring(7) else header
-        if (token.isBlank()) null
-        // TOTP enrollment isn't re-checked here: the session was already fully
-        // established at login; we only need to know who the caller is.
-        else AuthController.resolveSession(token, checkTotpEnrollment = false).userId
-    }.getOrNull()
+    // TOTP enrollment isn't re-checked here: the session was already fully
+    // established at login; we only need to know who the caller is.
+    runCatching { requireAuth(call, checkTotpEnrollment = false).userId }.getOrNull()

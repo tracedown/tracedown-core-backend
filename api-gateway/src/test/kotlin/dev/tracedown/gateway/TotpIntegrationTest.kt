@@ -321,6 +321,46 @@ class TotpIntegrationTest {
     }
 
     @Test
+    fun `enough wrong codes lock the account, and the right one is then refused too`() {
+        val (_, loginBody) = post(
+            "/api/v1/auth/login",
+            """{"email":"$TOTP_USER_EMAIL","password":"$TOTP_USER_PASSWORD"}""",
+        )
+        val challenge = loginBody["challenge"]!!.jsonPrimitive.content
+        try {
+            // Each refusal has to be counted even though the refusing request
+            // rolled back — otherwise the lock never arrives.
+            repeat(dev.tracedown.gateway.controllers.auth.TotpPolicy.MAX_ATTEMPTS) {
+                val (status, _) = post("/api/v1/auth/login/totp", """{"challenge":"$challenge","code":"000000"}""")
+                assertEquals(401, status)
+            }
+            val locked = transaction {
+                Users.selectAll().where { Users.email eq TOTP_USER_EMAIL }.first()[Users.totpLockedUntil]
+            }
+            assertNotNull(locked, "The account must be locked after the last allowed failure")
+
+            // A fresh challenge, the right code: still refused while locked.
+            val (_, again) = post(
+                "/api/v1/auth/login",
+                """{"email":"$TOTP_USER_EMAIL","password":"$TOTP_USER_PASSWORD"}""",
+            )
+            val code = TotpUtil.generateCode(totpSecret)
+            val (status, _) = post(
+                "/api/v1/auth/login/totp",
+                """{"challenge":"${again["challenge"]!!.jsonPrimitive.content}","code":"$code"}""",
+            )
+            assertEquals(401, status)
+        } finally {
+            transaction {
+                Users.update({ Users.email eq TOTP_USER_EMAIL }) {
+                    it[totpLockedUntil] = null
+                    it[totpFailedAttempts] = 0
+                }
+            }
+        }
+    }
+
+    @Test
     fun `TOTP verification with invalid challenge returns 401`() {
         val (status, _) = post(
             "/api/v1/auth/login/totp",

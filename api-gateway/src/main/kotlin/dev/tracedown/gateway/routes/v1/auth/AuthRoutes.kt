@@ -2,6 +2,8 @@ package dev.tracedown.gateway.routes.v1.auth
 
 import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.gateway.context.AuthPrincipal
+import dev.tracedown.gateway.context.CallAuthenticator
+import dev.tracedown.gateway.context.SessionAuth
 import dev.tracedown.gateway.controllers.auth.AuthController
 import dev.tracedown.gateway.controllers.auth.SessionController
 import dev.tracedown.gateway.data.auth.ChangePasswordRequest
@@ -24,7 +26,6 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.clientIp
 import dev.tracedown.gateway.util.ForbiddenException
-import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.parsePfsParams
 import dev.tracedown.gateway.util.parseUuid
 import dev.tracedown.gateway.util.tryReceive
@@ -331,36 +332,42 @@ fun Route.authRoutes(appConfig: AppConfig, emailPublisher: EmailPublisher) {
 }
 
 /**
- * Extracts and validates the session from the Authorization header.
+ * Authenticates the request and returns its caller.
+ *
+ * Which credential is accepted depends on where the request is going, and that
+ * is decided here and nowhere else (see [CallAuthenticator]): the
+ * key-authenticated API accepts an API key and only that, everything else
+ * accepts a session and only that. A caller of this function therefore never
+ * has to ask which kind it got in order to be safe — a handler outside the
+ * key-authenticated API cannot be reached with a key at all.
+ *
  * If [checkTotpEnrollment] is true (default), also enforces TOTP enrollment
  * for users whose org/group requires it. Exempt endpoints (logout, TOTP setup)
  * pass false.
+ *
+ * The credential is resolved once per request however many times this is
+ * called, so anything that runs ahead of a handler and needs to know who is
+ * calling can ask without costing a second lookup.
  */
 fun requireAuth(
     call: io.ktor.server.application.ApplicationCall,
     checkTotpEnrollment: Boolean = true,
 ): AuthPrincipal {
-    val header = call.request.headers["Authorization"]
-        ?: throw UnauthorizedException(ErrorCodes.MISSING_AUTH_HEADER)
-
-    val token = if (header.startsWith("Bearer ", ignoreCase = true)) {
-        header.substring(7)
-    } else {
-        header
-    }
-
-    if (token.isBlank()) throw UnauthorizedException()
-
-    val principal = AuthController.resolveSession(token, checkTotpEnrollment)
+    val caller = CallAuthenticator.resolve(call)
+    if (checkTotpEnrollment) SessionAuth.requireTotpEnrollment(caller)
+    // The usage bookkeeping waits for the last guard — but a gate that asks
+    // without the TOTP check, ahead of routing, must not run it: the tree's
+    // own ask comes later with the check on.
+    if (checkTotpEnrollment) caller.admitted()
     // Attribute the rest of this request's logs to the caller's org. The
     // per-call LogContext plugin clears any stale value at the start of every
     // request, so this is the sole writer on the (synchronous) handler path.
-    dev.tracedown.common.logging.LogContext.putOrg(principal.organizationId)
-    return principal
+    dev.tracedown.common.logging.LogContext.putOrg(caller.principal.organizationId)
+    return caller.principal
 }
 
 /**
- * Like [requireAuth] but also validates that the session has an organization context.
+ * Like [requireAuth] but also validates that the caller has an organization context.
  * Returns the principal and the org ID. Throws 400 if no org is selected.
  */
 fun requireAuthWithOrg(

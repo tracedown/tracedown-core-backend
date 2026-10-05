@@ -65,4 +65,27 @@ class RateLimitTierTest {
         assertNull(rateLimitTierFor("/ping"))
         assertEquals(RateLimiter.Tier.GENERAL, rateLimitTierFor("/pingpong"))
     }
+
+    @Test
+    fun `minting a key is a password check and sits on the login budget`() {
+        assertEquals(RateLimiter.Tier.AUTH, rateLimitTierFor("/api/v1/me/api-keys", io.ktor.http.HttpMethod.Post))
+        assertEquals(RateLimiter.Tier.AUTH, rateLimitTierFor("//api/v1/me/api-keys/", io.ktor.http.HttpMethod.Post))
+        // Listing one's keys is not.
+        assertEquals(RateLimiter.Tier.GENERAL, rateLimitTierFor("/api/v1/me/api-keys", io.ktor.http.HttpMethod.Get))
+        assertEquals(RateLimiter.Tier.GENERAL, rateLimitTierFor("/api/v1/me/api-keys/x/revoke", io.ktor.http.HttpMethod.Post))
+    }
+
+    @Test
+    fun `the key-authenticated API has no per-address tier because it is metered per key`() {
+        assertNull(rateLimitTierFor("/api/public/v1/key"))
+        assertNull(rateLimitTierFor("/api/public"))
+        // An equivalent spelling is the same namespace…
+        assertNull(rateLimitTierFor("//api/public/v1/key"))
+        assertNull(rateLimitTierFor("/api/%70ublic/v1/key"))
+        // …and a path that merely starts with the same letters is not in it.
+        assertEquals(RateLimiter.Tier.GENERAL, rateLimitTierFor("/api/publicity"))
+        // An encoded slash is one segment to the router: not this namespace,
+        // and not canonical, so it lands on the strictest tier.
+        assertEquals(RateLimiter.Tier.AUTH, rateLimitTierFor("/api/public%2Fv1/key"))
+    }
 }

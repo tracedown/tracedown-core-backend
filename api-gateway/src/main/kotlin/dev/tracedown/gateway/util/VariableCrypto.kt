@@ -8,6 +8,13 @@ import dev.tracedown.common.errors.ErrorCodes
  */
 object VariableCrypto {
 
+    /**
+     * What an encrypted value is shown as wherever it is listed, at every
+     * scope. One value, so a client can tell a masked value from a real one
+     * by more than its looks — and, better, by `VariableSummary.masked`.
+     */
+    const val MASK = "••••••"
+
     fun init(aesKeyHex: String) {
         dev.tracedown.common.util.VariableCrypto.init(aesKeyHex)
     }
@@ -42,10 +49,13 @@ object VariableCrypto {
      */
     fun displayValue(rawValue: String, iv: String?, secret: Boolean, encrypted: Boolean, show: Boolean): String {
         return when {
-            secret -> "••••••"
+            secret -> MASK
             encrypted && show -> decrypt(rawValue, iv!!)
-            encrypted -> "••••••"
+            encrypted -> MASK
             else -> rawValue
         }
     }
+
+    /** Whether [displayValue] masks a value of this type under this show flag. */
+    fun isMasked(secret: Boolean, encrypted: Boolean, show: Boolean): Boolean = secret || (encrypted && !show)
 }

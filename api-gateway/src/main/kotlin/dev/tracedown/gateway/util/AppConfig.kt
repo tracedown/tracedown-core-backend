@@ -97,7 +97,13 @@ data class SystemLimitsConfig(
      * identical for every organization.
      */
     val maxVarsPerResource: Int,
-)
+    /** Most API keys one user may hold, across every organization they belong to. */
+    val maxApiKeysPerUser: Int,
+) {
+    companion object {
+        const val DEFAULT_MAX_API_KEYS_PER_USER = 20
+    }
+}
 
 data class AppConfig(
     val database: DatabaseConfig,
@@ -193,6 +199,8 @@ data class AppConfig(
                     resultRetentionDays = config.propertyOrNull("systemLimits.resultRetentionDays")?.getString()?.toInt() ?: 90,
                     maxVarsPerResource = config.propertyOrNull("systemLimits.maxVarsPerResource")?.getString()?.toInt()
                         ?: VariableLimits.DEFAULT_MAX_PER_RESOURCE,
+                    maxApiKeysPerUser = config.propertyOrNull("systemLimits.maxApiKeysPerUser")?.getString()?.toInt()
+                        ?: SystemLimitsConfig.DEFAULT_MAX_API_KEYS_PER_USER,
                 ),
                 maxRequestBodyBytes = config.propertyOrNull("requestBody.maxBytes")
                     ?.getString()?.toLongOrNull()?.takeIf { it > 0 } ?: DEFAULT_MAX_REQUEST_BODY_BYTES,

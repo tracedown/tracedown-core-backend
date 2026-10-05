@@ -2,6 +2,7 @@ package dev.tracedown.gateway.data
 
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
+import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 
 /**
@@ -12,8 +13,12 @@ import kotlinx.serialization.Serializable
  */
 @Serializable
 data class CreateVariableRequest(
+    @JsonSchema.MaxLength(64)
     val key: String,
+    @JsonSchema.MaxLength(4096)
     val value: String,
+    @JsonSchema.Enum("variable", "secret", "metric")
+    @JsonSchema.Default("variable")
     val type: String = "variable",
 ) : Validatable {
     override fun validate() = buildList {
@@ -26,7 +31,7 @@ data class CreateVariableRequest(
 }
 
 @Serializable
-data class UpdateVariableRequest(val value: String) : Validatable {
+data class UpdateVariableRequest(@JsonSchema.MaxLength(4096) val value: String) : Validatable {
     override fun validate() = buildList {
         Validators.notBlank("value", value)?.let(::add)
         Validators.maxLen("value", value, 4096)?.let(::add)
@@ -38,10 +43,13 @@ data class VariableSummary(
     val id: String,
     val key: String,
     val value: String,
+    @JsonSchema.Enum("variable", "secret", "metric")
     val type: String,
     val systemType: String? = null,
     val createdAt: String,
     val updatedAt: String,
+    /** True when [value] is the mask, not the value: a secret, or an encrypted value not revealed. */
+    val masked: Boolean = false,
 )
 
 /** Maps the type string to (secret, encrypted) flags. */

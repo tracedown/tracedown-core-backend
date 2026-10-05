@@ -438,7 +438,7 @@ class PurgeJobTest {
                 it[organizationId] = orgId
                 it[ApiKeys.createdBy] = createdBy
                 it[name] = "key"
-                it[keyHash] = "h"
+                it[keyHash] = "h-$id"
                 it[createdAt] = NOW
             }
             return id

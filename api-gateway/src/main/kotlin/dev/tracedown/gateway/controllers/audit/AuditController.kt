@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.controllers.audit
 
+import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.OrgAuditLog
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.pfs.Page
@@ -32,6 +33,14 @@ object AuditController {
                 org.jetbrains.exposed.v1.core.JoinType.LEFT,
                 onColumn = OrgAuditLog.userId,
                 otherColumn = Users.id,
+            ).join(
+                ApiKeys,
+                org.jetbrains.exposed.v1.core.JoinType.LEFT,
+                onColumn = OrgAuditLog.apiKeyId,
+                otherColumn = ApiKeys.id,
+                // An entry only ever names a key of its own organization; the
+                // join says so too, so a stray id could not show another's name.
+                additionalConstraint = { ApiKeys.organizationId eq OrgAuditLog.organizationId },
             ).selectAll()
                 .where { OrgAuditLog.organizationId eq orgId }
 
@@ -50,6 +59,8 @@ object AuditController {
                     entityDisplayName = row[OrgAuditLog.entityDisplayName],
                     diff = row[OrgAuditLog.diff]?.toString(),
                     comment = row[OrgAuditLog.comment],
+                    apiKeyId = row[OrgAuditLog.apiKeyId]?.toString(),
+                    apiKeyName = row.getOrNull(ApiKeys.name),
                     createdAt = row[OrgAuditLog.createdAt].toString(),
                 )
             }
