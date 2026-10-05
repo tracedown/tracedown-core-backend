@@ -1517,7 +1517,7 @@ object DashboardMetricsController {
      * - avgResponseMs: weighted average across agents
      * - callCount: sum
      * - failedCalls: sum
-     * - status: worst (failure > timeout > success)
+     * - status: worst (failure > error > timeout > success; all-skipped stays skipped)
      * - timestamp: from the first point in the group
      */
     private fun compactByMinute(points: List<ProbePoint>): List<ProbePoint> {
@@ -1541,9 +1541,18 @@ object DashboardMetricsController {
             }
     }
 
-    private fun worstStatus(statuses: List<String>): String = when {
+    internal fun worstStatus(statuses: List<String>): String = when {
         statuses.any { it == "failure" } -> "failure"
+        // A run that did not evaluate is painted failure-red everywhere else
+        // (the aggregates count it as failed too), so it outranks the one
+        // yellow status: adding a run may never make a minute look milder.
+        statuses.any { it == "error" } -> "error"
         statuses.any { it == "timeout" } -> "timeout"
+        statuses.any { it == "success" } -> "success"
+        // Only shed ticks: nothing ran, and the strip dims those. They reach
+        // here through the database fallback alone — the ingestor sends no
+        // nudge for a skipped result.
+        statuses.isNotEmpty() && statuses.all { it == "skipped" } -> "skipped"
         else -> "success"
     }
 
