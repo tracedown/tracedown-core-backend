@@ -1,5 +1,6 @@
 package dev.tracedown.common.onboarding
 
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.Sessions
 import dev.tracedown.common.models.TotpRecoveryCodes
 import dev.tracedown.common.models.Users

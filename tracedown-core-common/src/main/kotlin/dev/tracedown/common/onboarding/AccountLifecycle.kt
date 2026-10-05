@@ -5,6 +5,7 @@ import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.NotificationSilences
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Sessions
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.TotpRecoveryCodes
 import dev.tracedown.common.models.Users
 import org.jetbrains.exposed.v1.core.and
@@ -139,6 +140,7 @@ object AccountLifecycle {
      */
     private fun purgePersonalData(userId: UUID) {
         Sessions.deleteWhere { Sessions.userId eq userId }
+        EmailChangeRequests.voidFor(userId)
 
         val orgUserIds = OrgUsers.selectAll()
             .where { OrgUsers.userId eq userId }
@@ -252,8 +254,10 @@ object AccountLifecycle {
      * or that would show up as the new holder's: recovery codes, sessions, and
      * API keys — a key acts as the account, so it is the prior holder's too,
      * and left in place it would appear in the new holder's list and export
-     * and count against their cap. Every path that hands a soft-deleted
-     * account to a new person calls this. Runs in the caller's transaction.
+     * and count against their cap — and a pending email change, whose link
+     * would otherwise still move the account. Every path that hands a
+     * soft-deleted account to a new person calls this. Runs in the caller's
+     * transaction.
      */
     fun wipePriorHolder(userId: UUID) {
         TotpRecoveryCodes.deleteWhere { TotpRecoveryCodes.userId eq userId }
@@ -265,5 +269,6 @@ object AccountLifecycle {
             it[deletedAt] = now
             it[purgeAfter] = DeletionRetention.purgeAfter(now)
         }
+        EmailChangeRequests.voidFor(userId)
     }
 }

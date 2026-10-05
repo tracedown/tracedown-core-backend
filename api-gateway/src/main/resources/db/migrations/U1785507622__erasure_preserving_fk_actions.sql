@@ -23,13 +23,13 @@ ALTER TABLE org_users DROP CONSTRAINT org_users_invited_by_fkey;
 ALTER TABLE org_users ADD CONSTRAINT org_users_invited_by_fkey
     FOREIGN KEY (invited_by) REFERENCES users(id);
 
--- NOTE (added with V1790926762): the forward file calls api_keys.created_by
--- provenance. Since V1790926762 it is the user a key ACTS AS, so handing an
+-- NOTE (added with V1791183901): the forward file calls api_keys.created_by
+-- provenance. Since V1791183901 it is the user a key ACTS AS, so handing an
 -- erased user's key to the owner would hand the owner's authority to whoever
 -- still holds that key. The reassigned keys are revoked in the same statement.
--- U1790926762 revokes every key anyway, so this only matters if the undos are
+-- U1791183901 revokes every key anyway, so this only matters if the undos are
 -- run out of order; an older copy of this file does not have it — which is
--- why U1790926762 cannot rely on it. (This note lives here for the reason
+-- why U1791183901 cannot rely on it. (This note lives here for the reason
 -- given above: the forward file is frozen.)
 UPDATE api_keys ak SET created_by = o.owner_id, revoked = true
     FROM organizations o WHERE o.id = ak.organization_id AND ak.created_by IS NULL;

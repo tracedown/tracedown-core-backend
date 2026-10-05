@@ -20,6 +20,7 @@ import dev.tracedown.common.models.OrgUserGroups
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.Organizations
+import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.PasswordResetTokens
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeAggregates
@@ -120,7 +121,7 @@ class PurgeFkCompletenessTest {
         /** Every table this test puts a row in. */
         private val SEEDED = setOf(
             "agent_bootstrap_tokens", "agent_certificates", "agent_health_checks", "api_keys",
-            "body_stores", "grafana_integrations", "notification_log", "notification_silences",
+            "body_stores", "email_change_requests", "grafana_integrations", "notification_log", "notification_silences",
             "notification_templates", "org_audit_log", "org_domains", "org_encryption_keys",
             "org_groups", "org_rule_presets", "org_user_groups", "org_users", "org_variables",
             "organizations", "password_reset_tokens", "probe_agents", "probe_aggregates",
@@ -586,6 +587,14 @@ class PurgeFkCompletenessTest {
         PasswordResetTokens.insert {
             it[id] = UUID.randomUUID()
             it[userId] = ownerId
+            it[tokenHash] = "h-${UUID.randomUUID()}"
+            it[expiresAt] = NOW.plusSeconds(3600)
+            it[createdAt] = NOW
+        }
+        EmailChangeRequests.insert {
+            it[id] = UUID.randomUUID()
+            it[userId] = ownerId
+            it[newEmail] = "moving-$ownerId@t.dev"
             it[tokenHash] = "h-${UUID.randomUUID()}"
             it[expiresAt] = NOW.plusSeconds(3600)
             it[createdAt] = NOW
