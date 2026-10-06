@@ -27,6 +27,7 @@ import dev.tracedown.common.pfs.applyPfs
 import dev.tracedown.common.pfs.applySorters
 import dev.tracedown.common.pfs.toPage
 import dev.tracedown.common.realtime.RealtimePublisher
+import dev.tracedown.common.util.FailedAssertions
 import dev.tracedown.common.util.LineDiff
 import dev.tracedown.common.variables.ScriptVariableResolver
 import dev.tracedown.common.variables.SystemVariableSeeder
@@ -1031,22 +1032,8 @@ object ServiceController {
         } ?: return null
 
         return try {
-            val calls = rawResult.jsonObject["calls"]?.jsonArray ?: return null
-            val failed = mutableListOf<FailedAssertion>()
-            for (call in calls) {
-                val assertions = call.jsonObject["assertions"]?.jsonArray ?: continue
-                for (assertion in assertions) {
-                    val obj = assertion.jsonObject
-                    val outcome = obj["outcome"]?.jsonPrimitive?.contentOrNull
-                    if (outcome == "failed") {
-                        failed.add(FailedAssertion(
-                            scope = obj["scope"]?.jsonPrimitive?.contentOrNull ?: "unknown",
-                            expected = obj["expected"]?.jsonPrimitive?.contentOrNull,
-                            actual = obj["actual"]?.jsonPrimitive?.contentOrNull,
-                        ))
-                    }
-                }
-            }
+            val failed = FailedAssertions.fromCalls(rawResult.jsonObject["calls"]?.jsonArray)
+                .map { FailedAssertion(it.scope, it.expected, it.actual, it.expression) }
             if (failed.isEmpty()) null else LastFailureInfo(assertions = failed)
         } catch (_: Exception) {
             null

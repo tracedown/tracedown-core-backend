@@ -3,6 +3,7 @@ package dev.tracedown.ingestor.consumers
 import dev.tracedown.common.alerts.AlertContext
 import dev.tracedown.common.alerts.SystemAlertRouting
 import dev.tracedown.common.alerts.SystemAlertService
+import dev.tracedown.common.util.FailedAssertions
 import dev.tracedown.ingestor.services.ResultPersistenceService
 import io.lettuce.core.KeyScanCursor
 import io.lettuce.core.LMoveArgs
@@ -493,20 +494,13 @@ class ProbeResultConsumer(
             // Failed-assertion details so live clients can update the
             // service's failure preview without a refetch (capped).
             val failedAssertions = buildJsonArray {
-                var added = 0
-                for (call in calls ?: emptyList()) {
-                    val assertions = call.jsonObject["assertions"]?.jsonArray ?: continue
-                    for (assertion in assertions) {
-                        if (added >= 5) break
-                        val obj = assertion.jsonObject
-                        if (obj["outcome"]?.jsonPrimitive?.contentOrNull != "failed") continue
-                        add(buildJsonObject {
-                            put("scope", obj["scope"]?.jsonPrimitive?.contentOrNull ?: "unknown")
-                            put("expected", obj["expected"]?.jsonPrimitive?.contentOrNull)
-                            put("actual", obj["actual"]?.jsonPrimitive?.contentOrNull)
-                        })
-                        added++
-                    }
+                for (failed in FailedAssertions.fromCalls(calls, limit = 5)) {
+                    add(buildJsonObject {
+                        put("scope", failed.scope)
+                        put("expected", failed.expected)
+                        put("actual", failed.actual)
+                        if (failed.expression != null) put("expression", failed.expression)
+                    })
                 }
             }
             if (failedAssertions.isNotEmpty()) put("failedAssertions", failedAssertions)

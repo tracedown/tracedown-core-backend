@@ -246,9 +246,14 @@ data class LastFailureInfo(
 
 @Serializable
 data class FailedAssertion(
+    @JsonSchema.Description("The asserted scope (`status`, `body`, ...), or `assert` for an `.assert()` condition.")
     val scope: String,
+    @JsonSchema.Description("The expected value of a scope assertion; null for a condition.")
     val expected: String?,
+    @JsonSchema.Description("What the target answered; for a condition, its resolved left operand.")
     val actual: String?,
+    @JsonSchema.Description("An `.assert()` condition rendered back to source; null for a scope assertion.")
+    val expression: String? = null,
 )
 
 /** Combined detail + recent probe points, served as one round-trip for the live channel. */
