@@ -203,7 +203,7 @@ class ProbeTargetPolicyTest {
         """.trimIndent()
         val decision = ProbeTargetPolicy.evaluate(script, emptyMap(), publicOnly, resolvingTo("93.184.216.34"))
         assertFalse(decision.allowed)
-        assertEquals("http://169.254.169.254/latest/meta-data/", decision.url)
+        assertEquals("http://169.254.169.254/latest/meta-data/", decision.source)
         assertEquals(ProbeTargetPolicy.REASON_PRIVATE_ADDRESS, decision.reason)
     }
 
@@ -243,6 +243,119 @@ class ProbeTargetPolicyTest {
         assertEquals(ProbeTargetPolicy.REASON_PRIVATE_ADDRESS, decision.reason)
         // …and is a no-op for an install that allows private targets.
         assertTrue(ProbeTargetPolicy.evaluateSyntax(script, emptyMap(), allowPrivate).allowed)
+    }
+
+    @Test
+    fun `a refusal names the target as written, never as substituted`() {
+        // The substituted URL may carry a decrypted value; only `source`, the
+        // call as written, is kept to be logged.
+        val script = """get("${'$'}p.baseUrl/health")"""
+        val vars = mapOf("p_baseUrl" to "http://10.0.0.5")
+        for (decision in listOf(
+            ProbeTargetPolicy.evaluateSyntax(script, vars, publicOnly),
+            ProbeTargetPolicy.evaluate(script, vars, publicOnly, failingResolver),
+        )) {
+            assertFalse(decision.allowed)
+            assertEquals(ProbeTargetPolicy.REASON_PRIVATE_ADDRESS, decision.reason)
+            assertEquals("${'$'}p.baseUrl/health", decision.source)
+            assertFalse(decision.toString().contains("10.0.0.5"))
+        }
+    }
+
+    @Test
+    fun `references are read as Lace and the scheduler read them`() {
+        val vars = mapOf("p_baseUrl" to "https://example.org", "p_host" to "10.0.0.5", "s_sub" to "api")
+        fun sub(url: String) = ProbeTargetPolicy.substituteVars(url, vars)
+        // A scoped reference, and the identifier the scheduler rewrites it to,
+        // read the same variable.
+        assertEquals("https://example.org/health", sub("${'$'}p.baseUrl/health"))
+        assertEquals("https://example.org/health", sub("${'$'}p_baseUrl/health"))
+        // The braced form is replaced whole.
+        assertEquals("https://example.org/health", sub("${'$'}{${'$'}p.baseUrl}/health"))
+        assertEquals("https://api.example.com/", sub("https://${'$'}{${'$'}s.sub}.example.com/"))
+        // One dot belongs to a scoped name; the rest is text.
+        assertEquals("https://api.example.com/", sub("https://${'$'}s.sub.example.com/"))
+        // Not references: braces with no `$` inside, and run-scope variables,
+        // which nothing injected resolves.
+        assertEquals("${'$'}{p.baseUrl}/health", sub("${'$'}{p.baseUrl}/health"))
+        assertEquals("${'$'}${'$'}p_host/x", sub("${'$'}${'$'}p_host/x"))
+    }
+
+    @Test
+    fun `a braced or scoped host is judged on its value at save and at dispatch`() {
+        val vars = mapOf("p_host" to "http://10.0.0.5")
+        for (script in listOf(
+            """get("${'$'}{${'$'}p.host}/health")""",
+            """get("${'$'}{${'$'}p_host}/health")""",
+        )) {
+            assertEquals(ProbeTargetPolicy.REASON_PRIVATE_ADDRESS, ProbeTargetPolicy.evaluateSyntax(script, vars, publicOnly).reason, script)
+            assertEquals(
+                ProbeTargetPolicy.REASON_PRIVATE_ADDRESS,
+                ProbeTargetPolicy.evaluate(script, vars, publicOnly, failingResolver).reason,
+                script,
+            )
+        }
+        // Braces without a `$` inside are not a reference: unresolved, refused.
+        val unbraced = ProbeTargetPolicy.evaluateSyntax("""get("${'$'}{p.host}/health")""", vars, publicOnly)
+        assertEquals(ProbeTargetPolicy.REASON_MALFORMED, unbraced.reason)
+    }
+
+    @Test
+    fun `an escaped reference is the reference it interpolates as`() {
+        // `\$p.host` lexes to `$p.host`, which Lace still interpolates.
+        val script = """get("https://\${'$'}p.host/")"""
+        val vars = mapOf("p_host" to "10.0.0.5")
+        assertEquals(ProbeTargetPolicy.REASON_PRIVATE_ADDRESS, ProbeTargetPolicy.evaluateSyntax(script, vars, publicOnly).reason)
+        assertEquals(
+            ProbeTargetPolicy.REASON_PRIVATE_ADDRESS,
+            ProbeTargetPolicy.evaluate(script, vars, publicOnly, failingResolver).reason,
+        )
+        // An escaped quote does not end the URL early.
+        assertEquals(
+            listOf("https://example.com/a\"b"),
+            ProbeTargetPolicy.targetUrls("""get("https://example.com/a\"b")"""),
+        )
+    }
+
+    @Test
+    fun `an authority with a backslash or a control character is refused`() {
+        for (script in listOf(
+            """get("https://1\t27.0.0.1/")""",
+            """get("https://127.0.0.1\n/")""",
+            """get("https://example.com\\@10.0.0.1/")""",
+        )) {
+            assertEquals(ProbeTargetPolicy.REASON_MALFORMED, ProbeTargetPolicy.evaluateSyntax(script, emptyMap(), publicOnly).reason, script)
+            assertEquals(
+                ProbeTargetPolicy.REASON_MALFORMED,
+                ProbeTargetPolicy.evaluate(script, emptyMap(), publicOnly, resolvingTo("93.184.216.34")).reason,
+                script,
+            )
+        }
+        assertNull(ProbeTargetPolicy.hostOf("https://1\t27.0.0.1/"))
+    }
+
+    @Test
+    fun `a numeric host that is not a canonical dotted quad is refused`() {
+        for (host in listOf(
+            "0177.0.0.1", "0x7f.0.0.1", "0x7f000001", "2130706433", "017700000001",
+            "0177.1", "127.1", "127.0.1", "127.0.0.1.", "127.000.0.1", "256.1.1.1",
+        )) {
+            val script = """get("http://$host/")"""
+            assertEquals(ProbeTargetPolicy.REASON_MALFORMED, ProbeTargetPolicy.evaluateSyntax(script, emptyMap(), publicOnly).reason, host)
+            assertEquals(
+                ProbeTargetPolicy.REASON_MALFORMED,
+                ProbeTargetPolicy.evaluate(script, emptyMap(), publicOnly, resolvingTo("93.184.216.34")).reason,
+                host,
+            )
+        }
+        // Canonical addresses and names that merely start with digits are judged as before.
+        assertTrue(ProbeTargetPolicy.evaluateSyntax("""get("http://93.184.216.34/")""", emptyMap(), publicOnly).allowed)
+        assertTrue(ProbeTargetPolicy.evaluateSyntax("""get("https://1e100.net/")""", emptyMap(), publicOnly).allowed)
+        assertTrue(ProbeTargetPolicy.evaluateSyntax("""get("https://123.example.com/")""", emptyMap(), publicOnly).allowed)
+        assertEquals(
+            ProbeTargetPolicy.REASON_PRIVATE_ADDRESS,
+            ProbeTargetPolicy.evaluateSyntax("""get("http://127.0.0.1/")""", emptyMap(), publicOnly).reason,
+        )
     }
 
     @Test

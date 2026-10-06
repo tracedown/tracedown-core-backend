@@ -208,7 +208,8 @@ data class ServiceSummary(
     val saveResponseBodies: Boolean,
     /**
      * Target hosts no verified domain of the organization covers (raw URL when
-     * the host cannot be resolved). Non-empty means the unverified-domain rule
+     * the host cannot be resolved, or is built from an encrypted variable —
+     * a value this read may not reveal). Non-empty means the unverified-domain rule
      * applies to this service: bodies are never saved whatever
      * [saveResponseBodies] says, so the client locks that setting and says why.
      * Filled on the single-service read only; empty on list rows and in

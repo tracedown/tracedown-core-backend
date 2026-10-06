@@ -1,5 +1,6 @@
 package dev.tracedown.common.net
 
+import dev.tracedown.common.variables.ScriptReferences
 import java.net.InetAddress
 
 /**
@@ -73,10 +74,14 @@ object ProbeTargetPolicy {
     /** One call URL found in a script, and the verdict on it. */
     data class Decision(
         val allowed: Boolean,
-        /** The offending target, as it read after variable substitution. */
-        val url: String? = null,
         /** One of the `REASON_*` codes. */
         val reason: String? = null,
+        /**
+         * The offending target as the script spells it, variables
+         * unsubstituted. The substituted URL is deliberately not kept: it can
+         * carry the plaintext of an encrypted variable.
+         */
+        val source: String? = null,
     ) {
         companion object {
             val ALLOWED = Decision(allowed = true)
@@ -124,37 +129,43 @@ object ProbeTargetPolicy {
                 "a private network from this install."
     }
 
-    // Call verbs, matching the shape the unverified-domain policy looks for.
-    private val CALL_RE = Regex("""\b(?:get|post|put|patch|delete)\s*\(\s*"([^"]+)"""")
-
-    // Idents may be dotted ($p.baseUrl) or underscored ($p_baseUrl) depending on
-    // whether the script has been through the scheduler's rewrite.
-    private val VAR_RE = Regex("""\$\{?([a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_])\}?|\$([a-zA-Z_])\}?""")
+    // A call and the body of its URL string literal, escapes included (§2.2).
+    private val CALL_RE = Regex("""\b(?:get|post|put|patch|delete)\s*\(\s*"((?:[^"\\]|\\.)*)"""")
 
     // scheme://authority, taken textually: a URL still carrying a `$` in its
     // path is legal and judgeable, and java.net.URI would refuse some of them.
     private val ORIGIN_RE = Regex("""^([A-Za-z][A-Za-z0-9+.\-]*)://([^/?#]*)""")
 
-    /** Every call URL a script targets, in source order. */
+    /**
+     * Every call URL a script targets, in source order, as the string values
+     * the Lace lexer makes of them — escapes resolved (§2.2), so `\$p.host`
+     * reads as the reference it interpolates as, and `\t` as a tab.
+     */
     fun targetUrls(script: String): List<String> =
-        CALL_RE.findAll(script).map { it.groupValues[1] }.toList()
+        CALL_RE.findAll(script).map { ScriptReferences.unescape(it.groupValues[1]) }.toList()
 
-    /** Replaces `$ident` / `${ident}` with resolved variable values. */
+    /**
+     * Replaces each reference [ScriptReferences] reads in [url] with the
+     * variable it names in [vars] — keyed as injected (`p_baseUrl` for
+     * `$p.baseUrl`, so a script judged before the scheduler's rewrite and the
+     * rewritten one read the same map the same way). A braced reference is
+     * replaced whole. A run-scope reference, or one with no value, is left as
+     * written, and with it a `$` that keeps its host unjudgeable.
+     */
     fun substituteVars(url: String, vars: Map<String, String>): String =
-        VAR_RE.replace(url) { m ->
-            val name = m.groupValues[1].ifEmpty { m.groupValues[2] }
-            vars[name] ?: m.value
-        }
+        ScriptReferences.replace(url) { ref -> if (ref.run) null else vars[ref.variable] }
 
     /**
      * The lowercase host of one already-substituted target URL, or null when
      * there is no host any check here can be made about: a URL this policy
-     * cannot parse, or a host still assembled at runtime (`$o.endpoint`), which
+     * cannot parse (an authority with a backslash or a control character
+     * among them), or a host still assembled at runtime (`$o.endpoint`), which
      * is the case [REASON_DYNAMIC_HOST] already covers where it matters.
      */
     fun hostOf(url: String): String? {
-        val host = parseOrigin(url)?.host ?: return null
-        if (host.contains('$')) return null
+        val origin = parseOrigin(url) ?: return null
+        val host = origin.host ?: return null
+        if (host.contains('$') || unparseableAuthority(origin.authority)) return null
         return host.lowercase()
     }
 
@@ -163,9 +174,13 @@ object ProbeTargetPolicy {
      *
      * This is the write-time half: it catches the literal cases (an IP, an
      * internal name, a non-HTTP scheme) with no network round-trip in a request
-     * handler, and defers everything else to [checkResolved] at dispatch. A host
-     * still carrying a variable is deferred here even under [Mode.PUBLIC_ONLY] —
-     * at save time the variable may simply not be set yet.
+     * handler, and defers everything else to [checkResolved] at dispatch.
+     *
+     * A host that still carries a variable inside a URL (`https://$p.host/`)
+     * is deferred, even under [Mode.PUBLIC_ONLY]: at save time the variable may
+     * simply not be set yet. A URL that is a variable from its first character
+     * (`$p.baseUrl/health`) is not: with the variable unset it has no scheme,
+     * so under [Mode.PUBLIC_ONLY] it is refused as [REASON_MALFORMED].
      *
      * @return a `REASON_*` code, or null when the target is acceptable.
      */
@@ -174,6 +189,7 @@ object ProbeTargetPolicy {
         if (origin.scheme != "http" && origin.scheme != "https") return REASON_SCHEME
         if (mode == Mode.ALLOW_PRIVATE) return null
         val host = origin.host ?: return REASON_MALFORMED
+        if (unparseableAuthority(origin.authority) || nonCanonicalIpv4(host)) return REASON_MALFORMED
         if (host.contains('$')) return null // deferred to dispatch
         if (SsrfGuard.isInternalHostname(host)) return REASON_INTERNAL_HOST
         val literal = parseLiteralIp(host)
@@ -201,6 +217,7 @@ object ProbeTargetPolicy {
         if (origin.scheme != "http" && origin.scheme != "https") return REASON_SCHEME
         if (mode == Mode.ALLOW_PRIVATE) return null
         val host = origin.host ?: return REASON_MALFORMED
+        if (unparseableAuthority(origin.authority) || nonCanonicalIpv4(host)) return REASON_MALFORMED
         // The host itself is built at runtime — nothing here can judge it.
         if (host.contains('$')) return REASON_DYNAMIC_HOST
         if (SsrfGuard.isInternalHostname(host)) return REASON_INTERNAL_HOST
@@ -233,7 +250,7 @@ object ProbeTargetPolicy {
         for (raw in targetUrls(script)) {
             val url = substituteVars(raw, vars)
             val reason = checkResolved(url, mode, resolve)
-            if (reason != null) return Decision(allowed = false, url = url, reason = reason)
+            if (reason != null) return Decision(allowed = false, reason = reason, source = raw)
         }
         return Decision.ALLOWED
     }
@@ -246,7 +263,7 @@ object ProbeTargetPolicy {
         for (raw in targetUrls(script)) {
             val url = substituteVars(raw, vars)
             val reason = checkSyntax(url, mode)
-            if (reason != null) return Decision(allowed = false, url = url, reason = reason)
+            if (reason != null) return Decision(allowed = false, reason = reason, source = raw)
         }
         return Decision.ALLOWED
     }
@@ -254,19 +271,48 @@ object ProbeTargetPolicy {
     private fun systemResolve(host: String): List<InetAddress> =
         InetAddress.getAllByName(host).toList()
 
-    private data class Origin(val scheme: String, val host: String?)
+    private data class Origin(val scheme: String, val authority: String, val host: String?)
+
+    /**
+     * An authority a URL parser could read more than one way: a backslash
+     * (some parsers take it for `/`) or a control character. Lace hands such a
+     * string to the agent as it is, so judging a host out of it here would be
+     * judging a host the agent may never see.
+     */
+    private fun unparseableAuthority(authority: String): Boolean =
+        authority.any { it == '\\' || it < ' ' || it == '\u007f' }
+
+    private val NUMERIC_PART_RE = Regex("""0[xX][0-9a-fA-F]*|[0-9]+""")
+    private val CANONICAL_OCTET_RE = Regex("""0|[1-9][0-9]{0,2}""")
+
+    /**
+     * A host made only of numbers that is not a canonical dotted quad: octal
+     * (`0177.0.0.1`), hex (`0x7f.0.0.1`), a single number (`2130706433`), a
+     * short form (`127.1`) or a trailing dot (`127.0.0.1.`). `inet_aton` and
+     * the resolvers built on it read these as addresses — `0177.0.0.1` is
+     * loopback there — while a strict parser reads them differently or not at
+     * all, so no verdict made here would be about the address the agent
+     * connects to. Refused instead.
+     */
+    private fun nonCanonicalIpv4(host: String): Boolean {
+        val parts = host.removeSuffix(".").split('.')
+        if (parts.any { !NUMERIC_PART_RE.matches(it) }) return false
+        if (parts.size != 4 || host.endsWith('.')) return true
+        return parts.any { !CANONICAL_OCTET_RE.matches(it) || it.toInt() > 255 }
+    }
 
     private fun parseOrigin(url: String): Origin? {
         val m = ORIGIN_RE.find(url.trim()) ?: return null
         val scheme = m.groupValues[1].lowercase()
-        val authority = m.groupValues[2].substringAfterLast('@')
+        val rawAuthority = m.groupValues[2]
+        val authority = rawAuthority.substringAfterLast('@')
         val host = when {
             authority.isEmpty() -> null
             authority.startsWith("[") -> authority.substringAfter('[').substringBefore(']')
                 .takeIf { it.isNotEmpty() }
             else -> authority.substringBefore(':').takeIf { it.isNotEmpty() }
         }
-        return Origin(scheme, host)
+        return Origin(scheme, rawAuthority, host)
     }
 
     private fun parseLiteralIp(host: String): InetAddress? {

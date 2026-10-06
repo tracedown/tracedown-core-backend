@@ -8,6 +8,7 @@ import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.models.Workspaces
+import dev.tracedown.common.variables.ScriptVariableResolver
 import kotlinx.serialization.json.jsonPrimitive
 import org.flywaydb.core.Flyway
 import org.jetbrains.exposed.v1.jdbc.insert
@@ -127,7 +128,7 @@ class DeletedVariableResolveTest {
 
     @Test
     fun `only live variables are injected`() {
-        val result = VariableResolver.resolve(serviceId, "get(\"https://example.com/\$s.count/\$p.gone\")")
+        val result = ScriptVariableResolver.resolve(serviceId, "get(\"https://example.com/\$s.count/\$p.gone\")")
 
         assertEquals("live-value", result.variables["s_count"]?.jsonPrimitive?.content)
         assertEquals("false", result.variables["trackBaseline"]?.jsonPrimitive?.content)

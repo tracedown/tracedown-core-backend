@@ -17,8 +17,9 @@ import kotlinx.serialization.json.JsonPrimitive
  * redirect chains, and any other string field, wherever the value happens to land.
  *
  * Only SECRET variables are redacted (never `variable`/`metric`), and only their
- * resolved plaintext values for this run (surfaced by [VariableResolver]) — so
- * unrelated response content is untouched unless it literally equals a secret.
+ * resolved plaintext values for this run (surfaced by
+ * [dev.tracedown.common.variables.ScriptVariableResolver]) — so unrelated
+ * response content is untouched unless it literally equals a secret.
  */
 object ResultRedactor {
 

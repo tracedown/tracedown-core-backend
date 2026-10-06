@@ -42,18 +42,18 @@ class TargetOptOutCheckerTest {
         assertTrue(checker.optedOut("example.com"))
         assertEquals(
             TargetOptOutChecker.CACHED_YES,
-            redis.store["${TargetOptOutChecker.CACHE_PREFIX}example.com"],
+            redis.store[TargetOptOutChecker.cacheKey("example.com")],
         )
         assertEquals(
             TargetOptOutChecker.CACHE_TTL_SECONDS,
-            redis.ttls["${TargetOptOutChecker.CACHE_PREFIX}example.com"],
+            redis.ttls[TargetOptOutChecker.cacheKey("example.com")],
         )
     }
 
     @Test
     fun `a cached refusal is not looked up again`() {
         val redis = FakeRedis()
-        redis.store["${TargetOptOutChecker.CACHE_PREFIX}example.com"] = TargetOptOutChecker.CACHED_YES
+        redis.store[TargetOptOutChecker.cacheKey("example.com")] = TargetOptOutChecker.CACHED_YES
         val resolver = lookup()
         val checker = TargetOptOutChecker(redis.commands(), resolver)
 
@@ -68,7 +68,7 @@ class TargetOptOutCheckerTest {
         val checker = TargetOptOutChecker(redis.commands(), resolver)
 
         assertFalse(checker.optedOut("api.example.com"))
-        val key = "${TargetOptOutChecker.CACHE_PREFIX}api.example.com"
+        val key = TargetOptOutChecker.cacheKey("api.example.com")
         assertEquals(TargetOptOutChecker.CACHED_NO, redis.store[key])
         assertEquals(TargetOptOutChecker.CACHE_TTL_SECONDS, redis.ttls[key])
 
@@ -102,7 +102,7 @@ class TargetOptOutCheckerTest {
     fun `the TTL is configurable and is what the key gets`() {
         val redis = FakeRedis()
         TargetOptOutChecker(redis.commands(), lookup(), ttlSeconds = 60L).optedOut("example.com")
-        assertEquals(60L, redis.ttls["${TargetOptOutChecker.CACHE_PREFIX}example.com"])
+        assertEquals(60L, redis.ttls[TargetOptOutChecker.cacheKey("example.com")])
     }
 
     /** A RedisCommands proxy that throws on every call. */

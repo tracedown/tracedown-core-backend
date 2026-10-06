@@ -12,16 +12,13 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.interceptors.Injectable
 import dev.tracedown.common.interceptors.InterceptorContext
 import dev.tracedown.common.interceptors.Interceptors
-import dev.tracedown.common.models.OrgVariables
 import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
-import dev.tracedown.common.models.ProjectVariables
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
-import dev.tracedown.common.models.WorkspaceVariables
 import dev.tracedown.common.pfs.Page
 import dev.tracedown.common.pfs.PfsParams
 import dev.tracedown.common.pfs.applyDefaultOrder
@@ -31,6 +28,7 @@ import dev.tracedown.common.pfs.applySorters
 import dev.tracedown.common.pfs.toPage
 import dev.tracedown.common.realtime.RealtimePublisher
 import dev.tracedown.common.util.LineDiff
+import dev.tracedown.common.variables.ScriptVariableResolver
 import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.common.variables.SystemVariables
 import dev.tracedown.common.variables.VariableLimits
@@ -91,6 +89,7 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
+import org.slf4j.LoggerFactory
 
 object ServiceController {
 
@@ -115,7 +114,7 @@ object ServiceController {
         this.probeTargetPolicy = probeTargetPolicy
     }
 
-    private val log = org.slf4j.LoggerFactory.getLogger(ServiceController::class.java)
+    private val log = LoggerFactory.getLogger(ServiceController::class.java)
     private val validProbeModes = setOf("consecutive", "simultaneous", "random")
     private val validQueuePolicies = setOf("skip", "enqueue_once")
 
@@ -313,11 +312,11 @@ object ServiceController {
             if (trustedDomainMode) {
                 base
             } else {
-                val policy = DomainPolicy.evaluate(
-                    base.script,
-                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
-                    orgId,
-                )
+                // Read access is all this takes, and it reveals no encrypted
+                // value — so a host built from one is listed as the script
+                // spells the call, never as resolved (see PolicyVars).
+                val vars = resolveScopedVarsForPolicy(base.script, serviceId)
+                val policy = DomainPolicy.evaluate(base.script, vars.values, orgId, vars.concealed)
                 base.copy(unverifiedTargets = policy.unverifiedHosts)
             }
         }
@@ -466,23 +465,30 @@ object ServiceController {
             // rejected rather than silently throttled. Bodies limits stay
             // dispatch-side — they don't make a script un-runnable.
             // Save-time half of the probe-target policy. Syntactic only — no DNS
-            // in a request handler, and a host that is still a variable may
-            // simply not be set yet — so this catches the literal cases (an
+            // in a request handler — so this catches the literal cases (an
             // address, an internal-only name, a scheme that is not HTTP) and
-            // leaves the rest to dispatch, which judges the concrete URL. The
-            // point is that a script this install will never run says so when it
-            // is written, rather than being accepted and silently skipped on
-            // every tick.
+            // leaves the rest to dispatch, which judges the concrete URL. A
+            // host inside a URL whose variable is not set (`https://$p.host/`)
+            // is left for dispatch too; a URL that is a variable from its first
+            // character (`$p.baseUrl/health`) has no scheme while it is unset,
+            // and is refused here. The point is that a script this install will
+            // never run says so when it is written, rather than being accepted
+            // and silently skipped on every tick. Both checks judge the values
+            // dispatch will send, encrypted ones included (see
+            // resolveScopedVarsForPolicy).
+            val policyVars by lazy { resolveScopedVarsForPolicy(effectiveScript, serviceId) }
             if (request.script != null) {
                 val targets = dev.tracedown.common.net.ProbeTargetPolicy.evaluateSyntax(
                     effectiveScript,
-                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
+                    policyVars.values,
                     probeTargetPolicy,
                 )
                 if (!targets.allowed) {
+                    // The target as written: the substituted one can carry a
+                    // decrypted value.
                     log.info(
                         "service {} script rejected: target {} ({})",
-                        serviceId, targets.url, targets.reason,
+                        serviceId, targets.source, targets.reason,
                     )
                     throw BadRequestException(ErrorCodes.BLOCKED_PROBE_TARGET)
                 }
@@ -493,11 +499,7 @@ object ServiceController {
             val policyRelevant = request.script != null ||
                 (request.schedule != null && intervalTooShort)
             if (!trustedDomainMode && policyRelevant) {
-                val policy = DomainPolicy.evaluate(
-                    effectiveScript,
-                    resolveScopedVarsForPolicy(serviceId, ctx.projectId, ctx.workspaceId, orgId),
-                    orgId,
-                )
+                val policy = DomainPolicy.evaluate(effectiveScript, policyVars.values, orgId, policyVars.concealed)
                 if (!policy.covered) {
                     // includes() against an unverified target is a scraping oracle —
                     // refuse it at save time (dispatch would refuse it anyway).
@@ -1052,31 +1054,33 @@ object ServiceController {
     }
 
     /**
-     * Flat variable map for [DomainPolicy] URL substitution at save time —
-     * scoped keys (`s.key`, `p.key`, ...) matching raw-script references.
-     * Encrypted values are skipped: their hosts can't be checked here and
-     * dispatch re-evaluates with real values anyway.
+     * The variables [resolveScopedVarsForPolicy] hands the save-time policies,
+     * keyed as injected (`p_baseUrl`). [concealed] names the keys whose values
+     * were decrypted: they judge a target like any other value, but nothing
+     * taken from one is ever shown to the caller — a reader may not reveal a
+     * "variable" and nobody may reveal a secret, so where a host comes from
+     * one, the call is named as the script spells it (`$p.baseUrl/health`),
+     * never by its resolved host.
      */
-    private fun resolveScopedVarsForPolicy(
-        serviceId: UUID,
-        projectId: UUID,
-        workspaceId: UUID,
-        orgId: UUID,
-    ): Map<String, String> {
-        val vars = mutableMapOf<String, String>()
-        OrgVariables.selectAll()
-            .where { (OrgVariables.organizationId eq orgId) and (OrgVariables.deleted eq false) and (OrgVariables.encrypted eq false) }
-            .forEach { vars["o.${it[OrgVariables.key]}"] = it[OrgVariables.value] }
-        WorkspaceVariables.selectAll()
-            .where { (WorkspaceVariables.workspaceId eq workspaceId) and (WorkspaceVariables.deleted eq false) and (WorkspaceVariables.encrypted eq false) }
-            .forEach { vars["w.${it[WorkspaceVariables.key]}"] = it[WorkspaceVariables.value] }
-        ProjectVariables.selectAll()
-            .where { (ProjectVariables.projectId eq projectId) and (ProjectVariables.deleted eq false) and (ProjectVariables.encrypted eq false) }
-            .forEach { vars["p.${it[ProjectVariables.key]}"] = it[ProjectVariables.value] }
-        ServiceVariables.selectAll()
-            .where { (ServiceVariables.serviceId eq serviceId) and (ServiceVariables.deleted eq false) and (ServiceVariables.encrypted eq false) }
-            .forEach { vars["s.${it[ServiceVariables.key]}"] = it[ServiceVariables.value] }
-        return vars
+    private class PolicyVars(val values: Map<String, String>, val concealed: Set<String>)
+
+    /**
+     * Variables for the save-time [DomainPolicy] and probe-target checks: the
+     * very map dispatch runs [script] with, built by the same
+     * [ScriptVariableResolver] — encrypted values decrypted, computed and
+     * config variables included, the same precedence — so a script accepted
+     * here is not skipped there for a reason this could have seen, and the
+     * reverse. A variable that will not decrypt is absent, so its host stays
+     * unresolved (dispatch, which cannot run without it, skips the tick
+     * instead). Decrypted values live in the returned map only: never logged,
+     * never returned.
+     */
+    private fun resolveScopedVarsForPolicy(script: String, serviceId: UUID): PolicyVars {
+        val resolved = ScriptVariableResolver.resolve(serviceId, script)
+        return PolicyVars(
+            resolved.variables.mapValues { (_, v) -> v.jsonPrimitive.content },
+            resolved.decrypted,
+        )
     }
 
     // ── Allowed agents ──

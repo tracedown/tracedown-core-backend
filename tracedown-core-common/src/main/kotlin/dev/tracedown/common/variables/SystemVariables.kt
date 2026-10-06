@@ -30,8 +30,8 @@ object SystemVariables {
      * A read-only, platform-computed variable exposed to scripts as `$<scope>.<key>`
      * (e.g. `$s.name`). Its value is derived from the resource, never stored or
      * editable — the resolver injects it on every run. Kept here so the editor and
-     * the scheduler's [dev.tracedown.scheduler.variables.VariableResolver] agree on
-     * exactly which locked keys exist per scope.
+     * the [ScriptVariableResolver] agree on exactly which locked keys exist per
+     * scope.
      */
     data class Computed(val key: String, val description: String)
 

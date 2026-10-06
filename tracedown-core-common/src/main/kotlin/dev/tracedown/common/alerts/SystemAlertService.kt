@@ -97,6 +97,16 @@ object SystemAlertService {
     const val SCHEDULER_ERROR = "scheduler_error"
 
     /**
+     * A probe tick was withheld because a variable its script uses exists but
+     * will not decrypt — the platform key was changed or the organization's
+     * encryption key is gone. Sending the run without it would have reported
+     * the target as failing; nothing is wrong with the target or the script.
+     * The fault is in the platform's key material, which only the operator
+     * can repair; the scheduler's log names the variable.
+     */
+    const val VARIABLE_UNREADABLE = "variable_unreadable"
+
+    /**
      * A registered outbox consumer stopped advancing its cursor while behind the
      * head of the log, for longer than the purge job is willing to wait. The
      * purge no longer holds the log back for it, so events it never read will
