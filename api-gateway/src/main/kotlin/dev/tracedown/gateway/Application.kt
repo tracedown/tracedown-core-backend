@@ -5,7 +5,6 @@ import dev.tracedown.common.domain.DomainVerifier
 import dev.tracedown.common.domain.HttpDnsDomainVerifier
 import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.common.config.DatabaseFactory
-import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.redis.RedisFactory
 import dev.tracedown.common.variables.VariableLimits
@@ -18,7 +17,6 @@ import dev.tracedown.gateway.cli.OrgBootstrap
 import dev.tracedown.gateway.cli.RewrapBodyStores
 import dev.tracedown.gateway.cli.RewrapOrgKeys
 import dev.tracedown.gateway.jobs.SecretReencryption
-import dev.tracedown.common.agents.DegradationRule
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.onboarding.OrgService
 import dev.tracedown.gateway.controllers.services.ServiceController
@@ -30,9 +28,8 @@ import dev.tracedown.gateway.routes.publicapi.publicApiRoutes
 import dev.tracedown.gateway.controllers.apikeys.ApiKeyController
 import dev.tracedown.gateway.util.ApiNamespace
 import dev.tracedown.gateway.util.ApiRateLimit
-import dev.tracedown.gateway.routes.v1.agents.AgentHealthResponse
-import dev.tracedown.gateway.routes.v1.agents.AgentStatus
 import dev.tracedown.gateway.routes.v1.agents.agentRoutes
+import dev.tracedown.gateway.routes.v1.agents.registerAgentBulkHandlers
 import dev.tracedown.gateway.routes.v1.bulk.BulkDispatcher
 import dev.tracedown.gateway.routes.v1.bulk.bulkRoutes
 import dev.tracedown.gateway.routes.v1.apikeys.apiKeyRoutes
@@ -342,28 +339,7 @@ fun Application.module() {
         val pfs = dev.tracedown.common.pfs.PfsParams(page = 1, pageSize = 100)
         bulkJson.encodeToJsonElement(WorkspaceController.list(orgId, principal.userId, pfs))
     }
-    BulkDispatcher.get("/agents/health") { _, _ ->
-        val health = transaction {
-            val rows = ProbeAgents.selectAll()
-                .where { ProbeAgents.isActive eq true }
-                .toList()
-            val verdicts = DegradationRule.verdicts(rows.map { it[ProbeAgents.id] })
-            val statuses = rows.map { row ->
-                val verdict = verdicts[row[ProbeAgents.id]] ?: DegradationRule.UNKNOWN
-                AgentStatus(
-                    agentSlug = row[ProbeAgents.slug],
-                    status = row[ProbeAgents.lastStatus],
-                    lastCheck = row[ProbeAgents.lastPing].toString(),
-                    lastResponseMs = row[ProbeAgents.lastPongDeltaMs],
-                    degraded = verdict.degraded,
-                    baselineMs = verdict.baselineMs,
-                    degradedThresholdMs = verdict.thresholdMs,
-                )
-            }
-            AgentHealthResponse(statuses = statuses)
-        }
-        bulkJson.encodeToJsonElement(health)
-    }
+    registerAgentBulkHandlers()
 
     install(Resources)
 

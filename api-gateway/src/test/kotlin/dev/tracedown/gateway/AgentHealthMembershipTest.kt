@@ -3,6 +3,7 @@ package dev.tracedown.gateway
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import dev.tracedown.common.alerts.SystemAlertService.DEGRADED_RTT_MS
+import dev.tracedown.common.agents.AgentVisibility
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.AgentHealthChecks
@@ -12,8 +13,11 @@ import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.SessionStatus
 import dev.tracedown.common.models.Sessions
 import dev.tracedown.common.models.Users
+import dev.tracedown.gateway.context.AuthPrincipal
 import dev.tracedown.gateway.controllers.auth.AuthController
 import dev.tracedown.gateway.routes.v1.agents.agentRoutes
+import dev.tracedown.gateway.routes.v1.agents.registerAgentBulkHandlers
+import dev.tracedown.gateway.routes.v1.bulk.BulkDispatcher
 import dev.tracedown.gateway.util.ApiException
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -28,6 +32,7 @@ import io.ktor.server.resources.Resources
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -47,6 +52,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import org.testcontainers.junit.jupiter.Container
 import org.testcontainers.junit.jupiter.Testcontainers
 import org.testcontainers.postgresql.PostgreSQLContainer
@@ -374,5 +380,56 @@ class AgentHealthMembershipTest {
             assertEquals(HttpStatusCode.BadRequest, status, body)
             assertTrue(ErrorCodes.NO_ORG_SELECTED in body, "expected no_org_selected: $body")
         }
+    }
+
+    // ── The bulk copy: the dashboard's resync and fallback poll ─────────
+
+    /** `GET /agents/health` as a `POST /bulk` sub-request answers it. */
+    private fun bulkHealth(userId: UUID, orgId: UUID?): String = runBlocking {
+        registerAgentBulkHandlers()
+        val principal = AuthPrincipal(userId, UUID.randomUUID(), "u@t.dev", orgId)
+        BulkDispatcher.dispatch("GET", "/agents/health", null, principal).toString()
+    }
+
+    /**
+     * The bulk handler used to read every active agent with no org, no
+     * membership and no [AgentVisibility] check, so a reconnect swapped an
+     * organization's own agents for the whole fleet.
+     */
+    @Test
+    fun `the bulk roster narrows through the installed visibility filter`() {
+        val owner = newUser()
+        val orgId = newOrg(owner)
+        newAgentWithRounds("agent-bulk-hidden", listOf(10))
+        AgentVisibility.install { _, _, slugs -> slugs.filter { it != "agent-bulk-hidden" }.toSet() }
+        try {
+            val body = bulkHealth(owner, orgId)
+            assertTrue("agent-membership-test" in body, "the visible agent should be listed: $body")
+            assertFalse("agent-bulk-hidden" in body, "a filtered agent must not be listed: $body")
+        } finally {
+            AgentVisibility.install(null)
+        }
+    }
+
+    @Test
+    fun `the bulk roster refuses a non-member and a session with no org`() {
+        val owner = newUser()
+        val orgId = newOrg(owner)
+        val stranger = newUser()
+        val forbidden = assertThrows<ApiException> { bulkHealth(stranger, orgId) }
+        assertEquals(HttpStatusCode.Forbidden, forbidden.status)
+        assertEquals(ErrorCodes.NOT_ORG_MEMBER, forbidden.code)
+        val noOrg = assertThrows<ApiException> { bulkHealth(owner, null) }
+        assertEquals(HttpStatusCode.BadRequest, noOrg.status)
+        assertEquals(ErrorCodes.NO_ORG_SELECTED, noOrg.code)
+    }
+
+    @Test
+    fun `the bulk roster leaves out a deleted agent`() {
+        val owner = newUser()
+        val orgId = newOrg(owner)
+        val agentId = newAgentWithRounds("agent-bulk-deleted", listOf(10))
+        transaction(db) { ProbeAgents.update({ ProbeAgents.id eq agentId }) { it[deleted] = true } }
+        assertFalse("agent-bulk-deleted" in bulkHealth(owner, orgId))
     }
 }

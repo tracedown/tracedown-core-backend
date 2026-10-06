@@ -2,19 +2,25 @@ package dev.tracedown.gateway.routes.v1.agents
 
 import dev.tracedown.common.agents.AgentVisibility
 import dev.tracedown.common.agents.DegradationRule
+import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.gateway.routes.v1
 import dev.tracedown.gateway.routes.v1.auth.requireAuthWithOrg
+import dev.tracedown.gateway.routes.v1.bulk.BulkDispatcher
+import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.requireCachedPermissions
 import io.ktor.resources.Resource
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.resources.get
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.encodeToJsonElement
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import java.util.UUID
 
 /**
  * One agent's liveness.
@@ -80,33 +86,52 @@ fun Route.agentRoutes() {
      */
     get<Agents.Health> {
         val (principal, orgId) = requireAuthWithOrg(call)
-
-        val statuses = transaction {
-            // 403 not_org_member if the membership is gone; a session carrying
-            // no org at all was already a 400 from requireAuthWithOrg above.
-            requireCachedPermissions(orgId, principal.userId)
-
-            val rows = ProbeAgents.selectAll()
-                .where { (ProbeAgents.isActive eq true) and (ProbeAgents.deleted eq false) }
-                .toList()
-            val visible = AgentVisibility.visible(orgId, principal.userId, rows.map { it[ProbeAgents.slug] })
-            val shown = rows.filter { it[ProbeAgents.slug] in visible }
-            // One statement for the whole roster — this feed is polled.
-            val verdicts = DegradationRule.verdicts(shown.map { it[ProbeAgents.id] })
-            shown.map { row ->
-                val verdict = verdicts[row[ProbeAgents.id]] ?: DegradationRule.UNKNOWN
-                AgentStatus(
-                    agentSlug = row[ProbeAgents.slug],
-                    status = row[ProbeAgents.lastStatus],
-                    lastCheck = row[ProbeAgents.lastPing].toString(),
-                    lastResponseMs = row[ProbeAgents.lastPongDeltaMs],
-                    degraded = verdict.degraded,
-                    baselineMs = verdict.baselineMs,
-                    degradedThresholdMs = verdict.thresholdMs,
-                )
-            }
-        }
-
-        call.respond(AgentHealthResponse(statuses = statuses))
+        call.respond(agentHealthFor(orgId, principal.userId))
     }
+}
+
+/**
+ * The same roster for a `POST /bulk` sub-request, which the dashboard's
+ * resync and fallback poll go through. It is registered here, beside the
+ * route, so the two cannot drift: the bulk copy once read every active agent
+ * with no org, membership or [AgentVisibility] check, and a reconnect swapped
+ * the caller's own agents for the whole fleet.
+ */
+fun registerAgentBulkHandlers() {
+    BulkDispatcher.get("/agents/health") { principal, _ ->
+        val orgId = principal.organizationId ?: throw BadRequestException(ErrorCodes.NO_ORG_SELECTED)
+        bulkJson.encodeToJsonElement(agentHealthFor(orgId, principal.userId))
+    }
+}
+
+private val bulkJson = Json { encodeDefaults = true }
+
+/** The agents [userId] may see in [orgId], with their liveness. 403 when not a member. */
+internal fun agentHealthFor(orgId: UUID, userId: UUID): AgentHealthResponse {
+    val statuses = transaction {
+        // 403 not_org_member if the membership is gone; a session carrying
+        // no org at all was already a 400 before this was reached.
+        requireCachedPermissions(orgId, userId)
+
+        val rows = ProbeAgents.selectAll()
+            .where { (ProbeAgents.isActive eq true) and (ProbeAgents.deleted eq false) }
+            .toList()
+        val visible = AgentVisibility.visible(orgId, userId, rows.map { it[ProbeAgents.slug] })
+        val shown = rows.filter { it[ProbeAgents.slug] in visible }
+        // One statement for the whole roster — this feed is polled.
+        val verdicts = DegradationRule.verdicts(shown.map { it[ProbeAgents.id] })
+        shown.map { row ->
+            val verdict = verdicts[row[ProbeAgents.id]] ?: DegradationRule.UNKNOWN
+            AgentStatus(
+                agentSlug = row[ProbeAgents.slug],
+                status = row[ProbeAgents.lastStatus],
+                lastCheck = row[ProbeAgents.lastPing].toString(),
+                lastResponseMs = row[ProbeAgents.lastPongDeltaMs],
+                degraded = verdict.degraded,
+                baselineMs = verdict.baselineMs,
+                degradedThresholdMs = verdict.thresholdMs,
+            )
+        }
+    }
+    return AgentHealthResponse(statuses = statuses)
 }
