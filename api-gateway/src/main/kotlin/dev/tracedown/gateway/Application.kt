@@ -59,6 +59,7 @@ import dev.tracedown.gateway.routes.v1.workspaces.workspaceRoutes
 import dev.tracedown.gateway.routes.internal.internalAgentRoutes
 import dev.tracedown.gateway.routes.internal.internalHealthTokenRoutes
 import dev.tracedown.gateway.util.ApiException
+import dev.tracedown.gateway.util.isClientDisconnect
 import dev.tracedown.gateway.util.AppConfig
 import dev.tracedown.common.health.databaseCheck
 import dev.tracedown.common.health.readinessRoute
@@ -474,6 +475,12 @@ fun Application.module() {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to cause.code))
         }
         exception<Throwable> { call, cause ->
+            // The client hung up mid-call: nothing failed, and nobody is left
+            // to answer. Not an error, so neither logged as one nor reported.
+            if (isClientDisconnect(cause)) {
+                log.debug("Client closed the connection during {} {}", call.request.httpMethod.value, call.request.uri)
+                return@exception
+            }
             log.error("Unhandled exception", cause)
             // Report the unhandled error to any registered observer (default no-op).
             // The handled exceptions above never reach here, so they are excluded.
