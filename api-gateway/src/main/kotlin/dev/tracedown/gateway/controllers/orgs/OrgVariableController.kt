@@ -19,6 +19,8 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
+import dev.tracedown.gateway.util.isUniqueViolation
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.VariableCrypto
@@ -103,18 +105,25 @@ object OrgVariableController {
                 else -> request.value to null
             }
 
-            OrgVariables.insert {
-                it[OrgVariables.id] = id
-                it[organizationId] = orgId
-                it[createdBy] = userId
-                it[key] = request.key
-                it[value] = storedValue
-                it[OrgVariables.secret] = secret
-                it[OrgVariables.encrypted] = encrypted
-                it[valueIv] = iv
-                it[deleted] = false
-                it[createdAt] = now
-                it[updatedAt] = now
+            // The check above does not stop two creates that race it; the
+            // unique index over live keys does, and its refusal is the same 409.
+            try {
+                OrgVariables.insert {
+                    it[OrgVariables.id] = id
+                    it[organizationId] = orgId
+                    it[createdBy] = userId
+                    it[key] = request.key
+                    it[value] = storedValue
+                    it[OrgVariables.secret] = secret
+                    it[OrgVariables.encrypted] = encrypted
+                    it[valueIv] = iv
+                    it[deleted] = false
+                    it[createdAt] = now
+                    it[updatedAt] = now
+                }
+            } catch (e: ExposedSQLException) {
+                if (isUniqueViolation(e)) throw ConflictException()
+                throw e
             }
 
             OutboxEmit.emitResourceEvent(

@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.cli
 
 import at.favre.lib.crypto.bcrypt.BCrypt
+import dev.tracedown.common.agents.AgentSlugs
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.AgentBootstrapTokens
@@ -48,6 +49,10 @@ object AgentBootstrap {
         val slug = args.getOrNull(idx + 1)
         if (slug == null || slug.startsWith("--")) {
             System.err.println("Usage: --agent-bootstrap <slug> [--label <label>]")
+            exitProcess(1)
+        }
+        if (!AgentSlugs.isValid(slug)) {
+            System.err.println("Invalid slug '$slug': lowercase letters, digits and hyphens, starting with a letter or digit, 64 characters at most")
             exitProcess(1)
         }
 

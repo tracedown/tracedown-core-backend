@@ -42,6 +42,8 @@ import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.gateway.util.ConflictException
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
+import dev.tracedown.gateway.util.isUniqueViolation
 import dev.tracedown.gateway.util.DeletionCascade
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
@@ -325,17 +327,24 @@ object ProjectController {
                 else -> request.value to null
             }
 
-            ProjectVariables.insert {
-                it[ProjectVariables.id] = id
-                it[ProjectVariables.projectId] = projectId
-                it[createdBy] = userId
-                it[ProjectVariables.key] = key
-                it[value] = storedValue
-                it[ProjectVariables.secret] = secret
-                it[ProjectVariables.encrypted] = encrypted
-                it[valueIv] = iv
-                it[createdAt] = now
-                it[updatedAt] = now
+            // The check above does not stop two creates that race it; the
+            // unique index over live keys does, and its refusal is the same 409.
+            try {
+                ProjectVariables.insert {
+                    it[ProjectVariables.id] = id
+                    it[ProjectVariables.projectId] = projectId
+                    it[createdBy] = userId
+                    it[ProjectVariables.key] = key
+                    it[value] = storedValue
+                    it[ProjectVariables.secret] = secret
+                    it[ProjectVariables.encrypted] = encrypted
+                    it[valueIv] = iv
+                    it[createdAt] = now
+                    it[updatedAt] = now
+                }
+            } catch (e: ExposedSQLException) {
+                if (isUniqueViolation(e)) throw ConflictException()
+                throw e
             }
 
             OutboxEmit.emitResourceEvent(
@@ -410,11 +419,14 @@ object ProjectController {
             }
 
             val now = Instant.now()
-            ProjectVariables.update({ ProjectVariables.id eq varId }) {
+            // Only a live row: two deletes that race the read above must not
+            // both apply, and the second answers as if the row were gone.
+            val updated = ProjectVariables.update({ (ProjectVariables.id eq varId) and (ProjectVariables.deleted eq false) }) {
                 it[deleted] = true
                 it[deletedAt] = now
                 it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
+            if (updated == 0) throw NotFoundException()
             OutboxEmit.emitResourceEvent(
                 "resource.variable.deleted", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "project"); put("parentId", projectId.toString()) },

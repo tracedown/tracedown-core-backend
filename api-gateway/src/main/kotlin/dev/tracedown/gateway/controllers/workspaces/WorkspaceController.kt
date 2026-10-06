@@ -38,6 +38,8 @@ import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.common.variables.SystemVariables
 import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.gateway.util.ConflictException
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
+import dev.tracedown.gateway.util.isUniqueViolation
 import dev.tracedown.gateway.util.DeletionCascade
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
@@ -295,17 +297,24 @@ object WorkspaceController {
                 else -> request.value to null
             }
 
-            WorkspaceVariables.insert {
-                it[WorkspaceVariables.id] = id
-                it[WorkspaceVariables.workspaceId] = workspaceId
-                it[createdBy] = userId
-                it[WorkspaceVariables.key] = key
-                it[value] = storedValue
-                it[WorkspaceVariables.secret] = secret
-                it[WorkspaceVariables.encrypted] = encrypted
-                it[valueIv] = iv
-                it[createdAt] = now
-                it[updatedAt] = now
+            // The check above does not stop two creates that race it; the
+            // unique index over live keys does, and its refusal is the same 409.
+            try {
+                WorkspaceVariables.insert {
+                    it[WorkspaceVariables.id] = id
+                    it[WorkspaceVariables.workspaceId] = workspaceId
+                    it[createdBy] = userId
+                    it[WorkspaceVariables.key] = key
+                    it[value] = storedValue
+                    it[WorkspaceVariables.secret] = secret
+                    it[WorkspaceVariables.encrypted] = encrypted
+                    it[valueIv] = iv
+                    it[createdAt] = now
+                    it[updatedAt] = now
+                }
+            } catch (e: ExposedSQLException) {
+                if (isUniqueViolation(e)) throw ConflictException()
+                throw e
             }
 
             OutboxEmit.emitResourceEvent(
@@ -378,11 +387,14 @@ object WorkspaceController {
             }
 
             val now = Instant.now()
-            WorkspaceVariables.update({ WorkspaceVariables.id eq varId }) {
+            // Only a live row: two deletes that race the read above must not
+            // both apply, and the second answers as if the row were gone.
+            val updated = WorkspaceVariables.update({ (WorkspaceVariables.id eq varId) and (WorkspaceVariables.deleted eq false) }) {
                 it[deleted] = true
                 it[deletedAt] = now
                 it[purgeAfter] = DeletionRetention.purgeAfter(now)
             }
+            if (updated == 0) throw NotFoundException()
             OutboxEmit.emitResourceEvent(
                 "resource.variable.deleted", "variable", varId,
                 buildJsonObject { put("id", varId.toString()); put("orgId", orgId.toString()); put("scope", "workspace"); put("parentId", workspaceId.toString()) },

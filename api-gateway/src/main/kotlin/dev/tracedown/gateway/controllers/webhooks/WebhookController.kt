@@ -26,6 +26,7 @@ import dev.tracedown.gateway.data.webhooks.WebhookBindingSummary
 import dev.tracedown.gateway.data.webhooks.WebhookSummary
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
+import dev.tracedown.gateway.util.isUniqueViolation
 import dev.tracedown.gateway.util.ForbiddenException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.fieldError
@@ -295,11 +296,6 @@ object WebhookController {
             it[createdAt] = now
         }
     }
-
-    /** Whether [e] is Postgres refusing a duplicate key (23505), anywhere in its causes. */
-    private fun isUniqueViolation(e: ExposedSQLException): Boolean =
-        generateSequence<Throwable>(e) { cause -> cause.cause?.takeIf { it !== cause } }
-            .any { (it as? java.sql.SQLException)?.sqlState == "23505" }
 
     /** Updates a binding's enabled state. Requires webhooks.write. */
     fun updateBinding(orgId: UUID, bindingId: UUID, enabled: Boolean, userId: UUID): WebhookBindingSummary {

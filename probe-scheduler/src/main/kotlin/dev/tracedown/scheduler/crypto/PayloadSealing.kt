@@ -94,7 +94,8 @@ class PayloadSealing(
      */
     private fun sealingStateFor(agentSlug: String): SealingState? = transaction {
         val agent = ProbeAgents.selectAll()
-            .where { ProbeAgents.slug eq agentSlug }
+            // Live only: a decommissioned agent may share the slug.
+            .where { (ProbeAgents.slug eq agentSlug) and (ProbeAgents.deleted eq false) }
             .limit(1)
             .firstOrNull() ?: return@transaction null
 

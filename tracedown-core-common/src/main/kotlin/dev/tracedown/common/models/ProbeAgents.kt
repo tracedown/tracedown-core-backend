@@ -6,7 +6,8 @@ import org.jetbrains.exposed.v1.javatime.timestamp
 
 object ProbeAgents : Table("probe_agents") {
     val id = long("id").autoIncrement()
-    val slug = varchar("slug", 64).uniqueIndex()
+    /** Unique among live agents only (`ux_probe_agents_live_slug`): a decommissioned agent keeps its slug. */
+    val slug = varchar("slug", 64)
     val label = varchar("label", 64)
     val agentUri = varchar("agent_uri", 255)
     val publicKey = text("public_key")

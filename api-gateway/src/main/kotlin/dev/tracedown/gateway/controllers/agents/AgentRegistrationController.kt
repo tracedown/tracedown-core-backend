@@ -84,9 +84,11 @@ object AgentRegistrationController {
             val slug = tokenRow[AgentBootstrapTokens.slug]
             val label = tokenRow[AgentBootstrapTokens.label]
 
-            // Check slug uniqueness (agent may have been partially registered).
+            // Check slug uniqueness among live agents (one may have been
+            // partially registered). A decommissioned agent keeps its slug for
+            // history and does not hold it.
             val existing = ProbeAgents.selectAll()
-                .where { ProbeAgents.slug eq slug }
+                .where { (ProbeAgents.slug eq slug) and (ProbeAgents.deleted eq false) }
                 .firstOrNull()
             if (existing != null) {
                 throw BadRequestException(ErrorCodes.ALREADY_EXISTS)

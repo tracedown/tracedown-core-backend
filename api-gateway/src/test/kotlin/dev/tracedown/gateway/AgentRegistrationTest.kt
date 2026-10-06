@@ -5,6 +5,7 @@ import com.typesafe.config.ConfigFactory
 import dev.tracedown.common.config.DatabaseFactory
 import dev.tracedown.common.models.AgentBootstrapTokens
 import dev.tracedown.common.models.AgentCertificates
+import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.CaRoot
 import dev.tracedown.common.models.OrgUsers
 import dev.tracedown.common.models.Organizations
@@ -23,6 +24,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.flywaydb.core.Flyway
+import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -374,8 +376,11 @@ class AgentRegistrationTest {
         { Json.encodeToString(kotlinx.serialization.serializer<String>(), it) }
 
     /** Registers [slug] at [agentUri]; returns the agent's key and its issued certificate. */
-    private fun registerAt(slug: String, agentUri: String): Pair<java.security.KeyPair, X509Certificate> {
-        val token = createToken(slug)
+    private fun registerAt(slug: String, agentUri: String): Pair<java.security.KeyPair, X509Certificate> =
+        registerWith(createToken(slug), slug, agentUri)
+
+    /** Registers [slug] at [agentUri] on the bootstrap token [token]. */
+    private fun registerWith(token: String, slug: String, agentUri: String): Pair<java.security.KeyPair, X509Certificate> {
         val keyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(3072, SecureRandom()) }.generateKeyPair()
         val body = """{"bootstrapToken":"$token","csrPem":${csrJsonOf(generateCsr(keyPair, slug))},"agentUri":"$agentUri"}"""
         val response = post("/internal/agents/register", body)
@@ -428,6 +433,81 @@ class AgentRegistrationTest {
 
         val pem = Json.parseToJsonElement(response.body()).jsonObject["certificatePem"]!!.jsonPrimitive.content
         assertEquals(listOf("renew-runner", "renew.example.com"), sansOf(parseCert(pem), 2))
+    }
+
+    // ── A decommissioned agent's slug ──
+
+    /**
+     * A decommissioned agent keeps its slug — history goes on naming the agent
+     * that ran each probe — but no longer holds it: the slug is unique among
+     * live agents only, so the same name can be enrolled again, and every
+     * lookup by slug finds the live agent rather than the old one.
+     */
+    @Test
+    @Order(20)
+    fun `a decommissioned slug enrols again, keeps the old row, and lookups find the new agent`() {
+        val session = newOwnerSession()
+        val slug = "reused-runner"
+
+        registerAt(slug, "https://reused-old.example.com:8443")
+        val oldId = agentIdOf(slug)
+        val decommissioned = send("DELETE", "/api/v1/agents/$slug", session)
+        assertEquals(200, decommissioned.statusCode(), decommissioned.body())
+
+        // Issued a token through the API, then enrolled on it.
+        val issued = post("/api/v1/agents/bootstrap-token", """{"slug":"$slug"}""", bearer = session)
+        assertEquals(200, issued.statusCode(), "A decommissioned slug must be issued a token. Body: ${issued.body()}")
+        val token = Json.parseToJsonElement(issued.body()).jsonObject["token"]!!.jsonPrimitive.content
+        registerWith(token, slug, "https://reused-new.example.com:8443")
+        val newId = agentIdOf(slug)
+        assertNotEquals(oldId, newId)
+
+        val rows = transaction {
+            ProbeAgents.selectAll().where { ProbeAgents.slug eq slug }
+                .associate { it[ProbeAgents.id] to it[ProbeAgents.deleted] }
+        }
+        assertEquals(mapOf(oldId to true, newId to false), rows, "the old row keeps its slug, unchanged")
+
+        // A second live agent of the slug is refused, by the check and by the index.
+        val taken = post("/api/v1/agents/bootstrap-token", """{"slug":"$slug"}""", bearer = session)
+        assertEquals(409, taken.statusCode(), taken.body())
+
+        // The health history by slug is the live agent's.
+        transaction {
+            for ((agent, result) in listOf(oldId to "wrong_token", newId to "pass")) {
+                AgentHealthChecks.insert {
+                    it[AgentHealthChecks.id] = UUID.randomUUID()
+                    it[challengeId] = "c-${UUID.randomUUID()}"
+                    it[probeAgentId] = agent
+                    it[challengedAt] = Instant.now()
+                    it[AgentHealthChecks.result] = result
+                    it[createdAt] = Instant.now()
+                }
+            }
+        }
+        val checks = send("GET", "/api/v1/agents/$slug/checks", session)
+        assertEquals(200, checks.statusCode(), checks.body())
+        assertTrue(checks.body().contains("\"pass\"") && !checks.body().contains("wrong_token"), checks.body())
+
+        // Decommissioning it again is the live one's, and the slug is free once more.
+        assertEquals(200, send("DELETE", "/api/v1/agents/$slug", session).statusCode())
+        assertTrue(transaction { ProbeAgents.selectAll().where { ProbeAgents.id eq newId }.single()[ProbeAgents.deleted] })
+        assertEquals(404, send("DELETE", "/api/v1/agents/$slug", session).statusCode())
+        assertEquals(200, post("/api/v1/agents/bootstrap-token", """{"slug":"$slug"}""", bearer = session).statusCode())
+    }
+
+    /** The live agent of [slug]. */
+    private fun agentIdOf(slug: String): Long = transaction {
+        ProbeAgents.selectAll().where { (ProbeAgents.slug eq slug) and (ProbeAgents.deleted eq false) }.single()[ProbeAgents.id]
+    }
+
+    private fun send(method: String, path: String, bearer: String): HttpResponse<String> {
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create("http://localhost:$serverPort$path"))
+            .header("Authorization", "Bearer $bearer")
+            .method(method, HttpRequest.BodyPublishers.noBody())
+            .build()
+        return httpClient.send(request, HttpResponse.BodyHandlers.ofString())
     }
 
     private fun parseCert(pem: String): X509Certificate =

@@ -15,6 +15,7 @@ import dev.tracedown.common.models.AgentHealthChecks
 import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.agents.AgentEnrolmentAddress
+import dev.tracedown.common.agents.AgentSlugs
 import dev.tracedown.common.agents.FleetAudience
 import dev.tracedown.common.storage.BodyStoreService
 import dev.tracedown.common.storage.BodyStoreSummary
@@ -133,7 +134,6 @@ data class AgentHealthCheck(
 
 private const val TOKEN_BYTES = 32
 private const val TOKEN_TTL_HOURS = 1L
-private val SLUG_RE = Regex("^[a-z0-9][a-z0-9-]{0,63}$")
 
 /**
  * @OpenAPITag Agents
@@ -221,7 +221,7 @@ fun Route.agentAdminRoutes() {
         val (principal, orgId) = requireAuthWithOrg(call)
         val body = tryReceive<CreateBootstrapTokenRequest>(call)
         val slug = body.slug.trim()
-        if (!SLUG_RE.matches(slug)) throw BadRequestException(ErrorCodes.FIELD_INVALID)
+        if (!AgentSlugs.isValid(slug)) throw BadRequestException(ErrorCodes.FIELD_INVALID)
         val label = body.label?.trim()?.ifBlank { null } ?: slug
         val bodyStoreId = body.bodyStoreId?.let {
             runCatching { UUID.fromString(it) }.getOrNull() ?: throw BadRequestException(ErrorCodes.INVALID_UUID)
@@ -248,9 +248,11 @@ fun Route.agentAdminRoutes() {
             requireOrgWrite(orgId, principal.userId) { it.settings }
             // Registration refuses a slug that is already an agent, so a token
             // for one can never be redeemed — refuse it here, where the person
-            // asking can still pick another name. Deleted agents do not hold
-            // their slug (it is renamed to free it), so any row counts.
-            val taken = ProbeAgents.selectAll().where { ProbeAgents.slug eq slug }.empty().not()
+            // asking can still pick another name. A decommissioned agent keeps
+            // its slug for history but does not hold it: only a live one counts.
+            val taken = ProbeAgents.selectAll()
+                .where { (ProbeAgents.slug eq slug) and (ProbeAgents.deleted eq false) }
+                .empty().not()
             if (taken) throw ConflictException(ErrorCodes.AGENT_SLUG_TAKEN)
             BodyStoreService.checkTokenAssignment(
                 orgId, slug, bodyStoreId, InterceptorContext(orgId = orgId, userId = principal.userId),
@@ -317,7 +319,7 @@ fun Route.agentAdminRoutes() {
             requireOrgRead(orgId, principal.userId) { it.settings }
             if (!AgentVisibility.canSee(orgId, principal.userId, resource.parent.slug)) throw NotFoundException()
             val agentId = ProbeAgents.selectAll()
-                .where { ProbeAgents.slug eq resource.parent.slug }
+                .where { (ProbeAgents.slug eq resource.parent.slug) and (ProbeAgents.deleted eq false) }
                 .firstOrNull()?.get(ProbeAgents.id) ?: throw NotFoundException()
             AgentHealthChecks.selectAll()
                 .where { (AgentHealthChecks.probeAgentId eq agentId) and (AgentHealthChecks.challengedAt greaterEq cutoff) }
@@ -351,18 +353,16 @@ fun Route.agentAdminRoutes() {
                 .firstOrNull() ?: throw NotFoundException()
             val agentId = agent[ProbeAgents.id]
 
-            // Free the slug (unique index) for future re-bootstraps; keep it
-            // recognizable in audit/history joins. varchar(64): trim the base
-            // so the suffix always fits.
+            // The slug stays as it was, so history keeps naming the agent that
+            // ran each probe; it is unique among live agents only, so the same
+            // slug can be enrolled again.
             // No purge date, because there is no three-tier deletion here:
             // `probe_agents` carries a bare `deleted` flag and nothing else. A
             // decommissioned agent is kept on purpose — probe_results point at
             // it, and history has to keep naming the agent that ran the probe.
-            val freedSlug = "${resource.slug.take(45)}-deleted-${Instant.now().epochSecond}"
             ProbeAgents.update({ ProbeAgents.id eq agentId }) {
                 it[isActive] = false
                 it[deleted] = true
-                it[slug] = freedSlug
                 // A decommissioned agent holds no store, so the store can be removed.
                 it[bodyStoreId] = null
             }
