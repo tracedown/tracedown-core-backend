@@ -14,8 +14,9 @@ import java.util.UUID
  *
  * A script is "covered" when every call URL's host is provably owned by the
  * org: exact domain match, or a wildcard-enabled domain suffix that isn't
- * excluded. Hosts that can't be resolved at dispatch time (URLs built from
- * `$$runVars`) count as uncovered — ownership can't be proven.
+ * excluded. Hosts that can't be resolved before the run (URLs built from
+ * `$$runVars`, or from a variable with no value) count as uncovered —
+ * ownership can't be proven.
  */
 object DomainPolicy {
 
@@ -28,26 +29,18 @@ object DomainPolicy {
     /** Minimum schedule interval in minutes when any target is unverified. */
     const val MIN_INTERVAL_MINUTES = 5
 
-    private val CALL_RE = Regex("""\b(?:get|post|put|patch|delete)\s*\(\s*"([^"]+)"""")
-
     // `includes(...)` is a substring content-oracle: against a domain the org
     // doesn't own it turns probes into a scraping primitive, so it is forbidden
     // whenever any target is unverified (spec §18.4). Detected textually, in step
     // with the rest of this policy — a stray match is failed safe (blocked).
     private val INCLUDES_RE = Regex("""\bincludes\s*\(""")
 
-    // Idents may be dotted: raw scripts carry scoped refs ($p.baseUrl), the
-    // scheduler's rewritten scripts carry underscored ones ($p_baseUrl) —
-    // the caller's vars map decides which keys exist. Only the bare `$name`
-    // form is substituted, as dispatch only resolves that form: a braced
-    // `${...}` stays as written, and its host unresolved.
-    private val VAR_RE = Regex("""\$([a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_])|\$([a-zA-Z_])""")
-
     /**
      * [unverifiedHosts] names what keeps [covered] false: each target host no
-     * verified domain covers, or the raw URL when its host could not be
-     * resolved (a variable with no value) or was built from a concealed one. Distinct, in script order, empty
-     * when covered — the client shows them beside the setting they restrict.
+     * verified domain covers, or the URL as written when its host could not be
+     * resolved (a variable with no value) or was built from a concealed one.
+     * Distinct, in script order, empty when covered — the client shows them
+     * beside the setting they restrict.
      */
     data class Evaluation(
         val covered: Boolean,
@@ -57,7 +50,11 @@ object DomainPolicy {
     )
 
     /**
-     * Must be called within a transaction. `vars` is a flat name→value map.
+     * Must be called within a transaction. [vars] is keyed as injected
+     * (`p_baseUrl`), and the script's calls, targets and references are read by
+     * [ProbeTargetPolicy] — the same reading the address policy makes — so the
+     * raw script at save time and the rewritten one at dispatch judge the same
+     * hosts.
      *
      * [concealed] names the entries of [vars] whose values the caller of the
      * evaluation may not be shown (decrypted variables). They are used to judge
@@ -72,13 +69,18 @@ object DomainPolicy {
         concealed: Set<String> = emptySet(),
     ): Evaluation {
         val usesIncludes = INCLUDES_RE.containsMatchIn(script)
-        val urls = CALL_RE.findAll(script).map { it.groupValues[1] }.toList()
+        val urls = ProbeTargetPolicy.targetUrls(script)
         if (urls.isEmpty()) return Evaluation(covered = true, callCount = 0, usesIncludes = usesIncludes)
 
-        val hosts = urls.map { hostOf(substituteVars(it, vars)) }
+        val hosts = urls.map { hostOf(it, vars) }
         if (hosts.any { it == null }) {
             val unresolved = urls.filterIndexed { i, _ -> hosts[i] == null }.distinct()
-            return Evaluation(covered = false, callCount = urls.size, usesIncludes = usesIncludes, unverifiedHosts = unresolved)
+            return Evaluation(
+                covered = false,
+                callCount = urls.size,
+                usesIncludes = usesIncludes,
+                unverifiedHosts = unresolved,
+            )
         }
 
         val domains = verifiedDomains(orgId)
@@ -91,8 +93,7 @@ object DomainPolicy {
             .filter { i -> domains.none { covers(hosts[i]!!, it.first, it.second, it.third) } }
             .map { i ->
                 val host = hosts[i]!!
-                if (concealed.isEmpty() || ProbeTargetPolicy.hostOf(substituteVars(urls[i], shown)) == host) host
-                else urls[i]
+                if (concealed.isEmpty() || hostOf(urls[i], shown) == host) host else urls[i]
             }
             .distinct()
         return Evaluation(
@@ -125,23 +126,9 @@ object DomainPolicy {
             }
             .map { Triple(it[OrgDomains.domain], it[OrgDomains.wildcardEnabled], it[OrgDomains.exceptions] ?: emptyList()) }
 
-    /** Replaces each bare `$ident` with its resolved value; anything else is left as written. */
-    private fun substituteVars(url: String, vars: Map<String, String>): String {
-        return VAR_RE.replace(url) { m ->
-            val name = m.groupValues[1].ifEmpty { m.groupValues[2] }
-            vars[name] ?: m.value
-        }
-    }
-
-    /** Extracts the lowercase host; null when unresolvable (leftover `$`). */
-    private fun hostOf(url: String): String? {
-        if (url.contains('$')) return null
-        return try {
-            java.net.URI(url).host?.lowercase()
-        } catch (_: Exception) {
-            null
-        }
-    }
+    /** The host [url] targets once [vars] are substituted; null while it is still assembled at runtime. */
+    private fun hostOf(url: String, vars: Map<String, String>): String? =
+        ProbeTargetPolicy.hostOf(ProbeTargetPolicy.substituteVars(url, vars))
 
     /**
      * Whether a verified [domain] row covers [host]: an exact match, or — with

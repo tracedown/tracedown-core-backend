@@ -16,17 +16,33 @@ object SkippedProbeAlert {
     /** Prefix of the reasons the unverified-domain rule writes (spec §18.4). */
     const val UNVERIFIED_PREFIX = "unverified_"
 
+    /**
+     * Prefix of the reasons a target decision writes: the probe-target policy
+     * (`target_private_address`, `target_malformed`, …) and the do-not-probe
+     * record (`target_opted_out`).
+     */
+    const val TARGET_PREFIX = "target_"
+
     /** The target publishes the do-not-probe record. */
     const val TARGET_OPTED_OUT = "target_opted_out"
+
+    /** A variable the script uses will not decrypt. */
+    const val VARIABLE_UNREADABLE = "variable_unreadable"
 
     /** The alert type for [reason], or null when the skip warrants none. */
     fun alertType(reason: String): String? = when {
         // A tick the unverified-domain policy withheld (§18.4).
         reason.startsWith(UNVERIFIED_PREFIX) -> null
-        // The target's own operator declined. Nothing is broken, nobody needs
-        // paging, and the org's remedy — verify the domain, if the zone is
-        // theirs — is not an incident response.
-        reason == TARGET_OPTED_OUT -> null
+        // A decision about the script's target: the address is one this
+        // install does not probe, or the target's own operator declined.
+        // Nothing is broken and nobody needs paging — the skipped row names
+        // the rule, and the remedy is in the script or the domain settings,
+        // not an incident response.
+        reason.startsWith(TARGET_PREFIX) -> null
+        // The run was withheld because the platform could not read a variable
+        // it needs. The operator's key material, not the org's settings and
+        // not capacity.
+        reason == VARIABLE_UNREADABLE -> SystemAlertService.VARIABLE_UNREADABLE
         // A tick that found no executor to run on is a fleet-health problem;
         // telling the org to "reduce probe frequency" would send them the wrong
         // way.

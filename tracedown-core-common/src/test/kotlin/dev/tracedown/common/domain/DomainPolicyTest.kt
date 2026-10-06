@@ -40,7 +40,7 @@ class DomainPolicyTest {
     @Test
     fun `a braced reference is not resolved`() {
         val url = "https://${'$'}{p.host}/health"
-        val e = DomainPolicy.evaluate("""get("$url")""", mapOf("p.host" to "example.org"), org)
+        val e = DomainPolicy.evaluate("""get("$url")""", mapOf("p_host" to "example.org"), org)
         assertFalse(e.covered)
         assertEquals(listOf(url), e.unverifiedHosts)
     }

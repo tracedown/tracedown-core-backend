@@ -1,5 +1,9 @@
 package dev.tracedown.gateway.controllers.services
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import dev.tracedown.common.errors.ErrorCodes
@@ -38,6 +42,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import org.slf4j.LoggerFactory
 import org.testcontainers.junit.jupiter.Container
 import org.testcontainers.junit.jupiter.Testcontainers
 import java.time.Instant
@@ -336,10 +341,10 @@ class EncryptedVariableTargetTest {
     }
 
     @Test
-    fun `a braced reference is never resolved, as dispatch never resolves it`() {
-        // `$p.key` is the only form the scheduler substitutes; the save-time
-        // checks used to resolve `${p.key}` as well, and passed a host that
-        // dispatch would then find unresolved.
+    fun `braces with no reference inside are not a reference`() {
+        // Lace's braced form is `${$p.key}`. The save-time checks used to
+        // resolve `${p.key}` as well — a spelling Lace leaves as text, so the
+        // host they passed was not the one the agent is sent to.
         val k = key("baseUrl")
         transaction {
             ProjectVariables.insert {
@@ -386,6 +391,165 @@ class EncryptedVariableTargetTest {
             }
         }
         save(serviceId, """get("${D}p.$k/health").expect(status: 200)""")
-        assertTrue(ServiceController.get(orgId, serviceId, ownerId).unverifiedTargets == listOf("plain.example.net"))
+        assertEquals(listOf("plain.example.net"), ServiceController.get(orgId, serviceId, ownerId).unverifiedTargets)
+    }
+
+    @Test
+    fun `a braced reference is judged on its value, as dispatch judges it`() {
+        for (kind in Kind.entries) {
+            val k = key("host")
+            val privateService = seedService()
+            seedVariable("project", k, "http://10.0.0.5", kind, privateService)
+            assertEquals(
+                ErrorCodes.BLOCKED_PROBE_TARGET,
+                refusal(privateService, """get("${D}{${D}p.$k}/health").expect(status: 200)""").code,
+                "$kind",
+            )
+            val p = key("host")
+            val publicService = seedService()
+            seedVariable("project", p, "https://example.org", kind, publicService)
+            assertEquals(2, save(publicService, """get("${D}{${D}p.$p}/health").expect(status: 200)""").version, "$kind")
+        }
+    }
+
+    @Test
+    fun `a subdomain built from a variable is judged on its value`() {
+        // Four calls, so this saves only when every host is seen to be on the
+        // verified domain. The dotted form used to be read greedily — as a
+        // variable named `s.sub.verified.example` — and so never resolved.
+        val serviceId = seedService()
+        seedVariable("service", "sub", "api", Kind.VARIABLE, serviceId)
+        val script = listOf(
+            """get("https://${D}{${D}s.sub}.verified.example/a").expect(status: 200)""",
+            """get("https://${D}s.sub.verified.example/b").expect(status: 200)""",
+            """get("https://${D}{${D}s.sub}.verified.example/c").expect(status: 200)""",
+            """get("https://${D}s.sub.verified.example/d").expect(status: 200)""",
+        ).joinToString("\n")
+
+        save(serviceId, script)
+
+        assertEquals(emptyList<String>(), ServiceController.get(orgId, serviceId, ownerId).unverifiedTargets)
+    }
+
+    @Test
+    fun `computed variables win over a stored one, as at dispatch`() {
+        // `$s.name` is the service's name on every run, whatever a stored
+        // variable called `name` holds — so it is judged as the name here too.
+        val serviceId = seedService()
+        seedVariable("service", "name", "10.0.0.5", Kind.VARIABLE, serviceId)
+
+        val summary = save(serviceId, """get("http://${D}s.name.example.com/").expect(status: 200)""")
+
+        assertEquals(2, summary.version)
+        val host = "svc-$serviceId.example.com"
+        assertEquals(listOf(host), ServiceController.get(orgId, serviceId, ownerId).unverifiedTargets)
+    }
+
+    @Test
+    fun `an organization with no key and a legacy value with no IV are unresolved`() {
+        // A legacy value stored without its IV.
+        val legacyService = seedService()
+        val legacy = key("legacy")
+        val (stored, _) = VariableCrypto.encrypt("https://example.org")
+        insertRaw("project", legacy, stored, null, secret = false, serviceId = legacyService)
+        assertEquals(
+            ErrorCodes.BLOCKED_PROBE_TARGET,
+            refusal(legacyService, """get("${D}p.$legacy/health").expect(status: 200)""").code,
+        )
+
+        // An envelope value under an organization that never had a key.
+        val (otherOrg, otherProject) = transaction {
+            val org = UUID.randomUUID()
+            Organizations.insert {
+                it[id] = org
+                it[name] = "keyless-org"
+                it[Organizations.ownerId] = EncryptedVariableTargetTest.ownerId
+                it[createdAt] = NOW
+            }
+            OrgUsers.insert {
+                it[id] = UUID.randomUUID()
+                it[organizationId] = org
+                it[userId] = ownerId
+                it[status] = "active"
+                it[joinedAt] = NOW
+                it[inviteToken] = "t-${UUID.randomUUID()}"
+            }
+            val ws = UUID.randomUUID()
+            Workspaces.insert {
+                it[id] = ws
+                it[organizationId] = org
+                it[name] = "keyless-ws"
+                it[createdAt] = NOW
+            }
+            val proj = UUID.randomUUID()
+            Projects.insert {
+                it[id] = proj
+                it[Projects.workspaceId] = ws
+                it[name] = "keyless-proj"
+                it[createdAt] = NOW
+            }
+            org to proj
+        }
+        val serviceId = UUID.randomUUID()
+        transaction {
+            Services.insert {
+                it[id] = serviceId
+                it[Services.projectId] = otherProject
+                it[name] = "svc-$serviceId"
+                it[script] = ""
+                it[version] = 1
+                it[isActive] = false
+                it[schedule] = "*/5 * * * *"
+                it[createdAt] = NOW
+            }
+            ProjectVariables.insert {
+                it[id] = UUID.randomUUID()
+                it[ProjectVariables.projectId] = otherProject
+                it[ProjectVariables.key] = "host"
+                // Encrypted for the org that has a key; this one has none.
+                it[value] = VariableCrypto.encrypt(orgId, "https://example.org", "project", "host")
+                it[valueIv] = null
+                it[secret] = true
+                it[encrypted] = true
+                it[createdAt] = NOW
+                it[updatedAt] = NOW
+            }
+        }
+        val e = assertThrows<ApiException> {
+            ServiceController.update(
+                otherOrg, serviceId,
+                UpdateServiceRequest(script = """get("${D}p.host/health").expect(status: 200)""", version = 1),
+                ownerId,
+            )
+        }
+        assertEquals(ErrorCodes.BLOCKED_PROBE_TARGET, e.code)
+    }
+
+    @Test
+    fun `no log line carries a decrypted target`() {
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        val logger = LoggerFactory.getLogger("dev.tracedown") as Logger
+        val previous = logger.level
+        logger.level = Level.DEBUG
+        logger.addAppender(appender)
+        try {
+            val serviceId = seedService()
+            val k = key("host")
+            seedVariable("project", k, "http://10.0.0.5", Kind.SECRET, serviceId)
+            refusal(serviceId, """get("${D}p.$k/health").expect(status: 200)""")
+            val moved = key("moved")
+            insertRaw(
+                "project", moved,
+                transaction { VariableCrypto.encrypt(orgId, "http://10.9.9.9", "project", "elsewhere") },
+                null, secret = true, serviceId = serviceId,
+            )
+            refusal(serviceId, """get("${D}p.$moved/health").expect(status: 200)""")
+        } finally {
+            logger.detachAppender(appender)
+            logger.level = previous
+        }
+        val lines = appender.list.map { it.formattedMessage + (it.throwableProxy?.message ?: "") }
+        assertTrue(lines.any { "rejected" in it && "${D}p." in it }, lines.toString())
+        assertTrue(lines.none { "10.0.0.5" in it || "10.9.9.9" in it }, lines.toString())
     }
 }

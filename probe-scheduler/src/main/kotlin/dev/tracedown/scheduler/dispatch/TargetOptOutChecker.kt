@@ -1,5 +1,6 @@
 package dev.tracedown.scheduler.dispatch
 
+import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.domain.TargetOptOut
 import dev.tracedown.common.domain.dns.TxtLookup
 import io.lettuce.core.SetArgs
@@ -24,6 +25,10 @@ import org.slf4j.LoggerFactory
  * takes for a newly published record to be honoured, which is the trade the
  * TTL makes.
  *
+ * The cache is keyed by the SHA-256 of the host, never the host itself, and
+ * nothing logged here names one: a host can be built from a decrypted
+ * variable.
+ *
  * **A Redis outage falls through to the resolver.** The cache is an
  * optimisation, never a gate: dispatch must keep working when Redis does not,
  * and neither a read nor a write failure may propagate out of here.
@@ -41,7 +46,7 @@ class TargetOptOutChecker(
 
     /** Whether [host], or a parent of it, asks not to be probed. */
     fun optedOut(host: String): Boolean {
-        val key = "$CACHE_PREFIX$host"
+        val key = cacheKey(host)
         when (cached(key)) {
             CACHED_YES -> return true
             CACHED_NO -> return false
@@ -54,7 +59,7 @@ class TargetOptOutChecker(
     private fun cached(key: String): String? = try {
         redis?.get(key)
     } catch (e: Exception) {
-        log.debug("target opt-out cache unavailable for {}: {}", key, e.message)
+        log.debug("target opt-out cache unavailable: {}", e.javaClass.simpleName)
         null
     }
 
@@ -62,13 +67,19 @@ class TargetOptOutChecker(
         try {
             redis?.set(key, if (answer) CACHED_YES else CACHED_NO, SetArgs().ex(ttlSeconds))
         } catch (e: Exception) {
-            log.debug("target opt-out cache write failed for {}: {}", key, e.message)
+            log.debug("target opt-out cache write failed: {}", e.javaClass.simpleName)
         }
     }
 
     companion object {
-        /** Redis A key prefix; the rest of the key is the host asked about. */
+        /** Redis A key prefix; the rest of the key is the SHA-256 of the host asked about. */
         const val CACHE_PREFIX = "target_optout:"
+
+        /**
+         * The cache key for [host]. Hashed: the host may have been built from a
+         * decrypted variable, and Redis A is persisted to disk.
+         */
+        fun cacheKey(host: String): String = CACHE_PREFIX + TokenHasher.sha256Hex(host)
 
         /** How long an answer — either answer — is reused. */
         const val CACHE_TTL_SECONDS = 3600L

@@ -6,12 +6,12 @@ import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Workspaces
+import dev.tracedown.common.variables.ScriptVariableResolver
 import dev.tracedown.scheduler.config.SchedulerConfig
 import dev.tracedown.scheduler.results.ResultPublisher
 import dev.tracedown.scheduler.results.ResultRedactor
 import dev.tracedown.scheduler.results.ScriptEndpointKeys
 import dev.tracedown.scheduler.scheduling.QuartzManager
-import dev.tracedown.scheduler.variables.VariableResolver
 import dev.tracedown.scheduler.window.ServiceWindowEvaluator
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -55,6 +55,14 @@ const val SKIP_UNVERIFIED_THROTTLE = "unverified_throttle"
  * raises no alert for it, and the history says who decided.
  */
 const val SKIP_TARGET_OPTED_OUT = "target_opted_out"
+
+/**
+ * Skip reason for a tick withheld because a variable the script uses exists
+ * but its value will not decrypt (the platform key changed, the organization's
+ * key is gone). Unlike the reasons above it is a fault — the operator's, not
+ * the target's or the script's — and the ingestor raises it as one.
+ */
+const val SKIP_VARIABLE_UNREADABLE = "variable_unreadable"
 /** `body_not_stored_reason` for a body the §18.4 unverified-domain rule withheld. */
 const val BODIES_WITHHELD_UNVERIFIED = "unverifiedTarget"
 
@@ -363,7 +371,28 @@ class DispatchQueue(
             }
 
             // Resolve scoped variables and rewrite $s.key → $s_key in script
-            val (script, variables, secretValues) = VariableResolver.resolve(serviceId, rawScript)
+            val resolution = ScriptVariableResolver.resolve(serviceId, rawScript)
+            val script = resolution.script
+            val variables = resolution.variables
+            val secretValues = resolution.secretValues
+
+            // A variable the script uses exists but will not decrypt. Running
+            // without it would send `null` in its place — an `Authorization:
+            // Bearer null` that fails as if the target were down, or a host
+            // that is not the one configured — so nothing is sent. The fault
+            // is the platform's key material, not the target: a skipped row
+            // naming it, which the ingestor raises to the operator. The
+            // resolver warns about each variable, at most hourly; this would
+            // repeat it every tick.
+            if (resolution.unreadable.isNotEmpty()) {
+                log.debug(
+                    "service {} uses variables that will not decrypt ({}) — skipping",
+                    serviceId, resolution.unreadable.joinToString(),
+                )
+                recordSkipped(serviceId, SKIP_VARIABLE_UNREADABLE, Instant.now())
+                accounted.set(true)
+                return
+            }
 
             // Name the endpoint each call belongs to, from the very script this
             // tick is about to run — a later edit cannot retro-label a result
@@ -406,13 +435,16 @@ class DispatchQueue(
             // operates the zone: a host covered by a verified domain is never
             // asked, because there the org is the operator and a record in its
             // own zone cannot be someone else refusing.
-            val optedOutHost = targetOptOut?.let { checker ->
-                val hosts = ProbeTargetPolicy.targetUrls(script)
-                    .map { ProbeTargetPolicy.substituteVars(it, resolvedVars) }
-                    // A host still assembled at runtime names no zone to ask;
-                    // ProbeTargetPolicy already refuses those where it matters.
-                    .mapNotNull { ProbeTargetPolicy.hostOf(it) }
-                    .distinct()
+            // Named in the log by the call as written: the host may have been
+            // built from a decrypted value.
+            val optedOutCall = targetOptOut?.let { checker ->
+                // Each call as written, with the host it reaches. A host still
+                // assembled at runtime names no zone to ask; ProbeTargetPolicy
+                // already refuses those where it matters.
+                val calls = ProbeTargetPolicy.targetUrls(script).mapNotNull { url ->
+                    ProbeTargetPolicy.hostOf(ProbeTargetPolicy.substituteVars(url, resolvedVars))?.let { url to it }
+                }
+                val hosts = calls.map { it.second }.distinct()
                 if (hosts.isEmpty()) {
                     null
                 } else {
@@ -421,12 +453,13 @@ class DispatchQueue(
                     // holding a database connection.
                     val unowned = transaction { hosts.filterNot { DomainPolicy.verifiedCovers(it, ctx.orgId) } }
                     unowned.firstOrNull { checker.optedOut(it) }
+                        ?.let { host -> calls.first { it.second == host }.first }
                 }
             }
-            if (optedOutHost != null) {
+            if (optedOutCall != null) {
                 log.info(
-                    "service {} targets {}, which publishes the do-not-probe record — skipping",
-                    serviceId, optedOutHost,
+                    "service {} calls {}, whose host publishes the do-not-probe record — skipping",
+                    serviceId, optedOutCall,
                 )
                 // A skipped row for the same reason the address policy writes
                 // one: nothing was learned about the target, and a synthetic

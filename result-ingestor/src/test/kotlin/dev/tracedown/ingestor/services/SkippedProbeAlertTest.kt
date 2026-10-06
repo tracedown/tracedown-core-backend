@@ -19,6 +19,22 @@ class SkippedProbeAlertTest {
     }
 
     @Test
+    fun `a target the address policy refuses raises nothing`() {
+        // These used to fall through to "the platform is over capacity".
+        for (reason in listOf(
+            "target_private_address", "target_internal_host", "target_malformed",
+            "target_dynamic_host", "target_scheme_not_http", "target_blocked",
+        )) {
+            assertNull(SkippedProbeAlert.alertType(reason), reason)
+        }
+    }
+
+    @Test
+    fun `a variable that will not decrypt is the operator's fault, not capacity`() {
+        assertEquals(SystemAlertService.VARIABLE_UNREADABLE, SkippedProbeAlert.alertType("variable_unreadable"))
+    }
+
+    @Test
     fun `a tick the unverified-domain rule withheld raises nothing`() {
         assertNull(SkippedProbeAlert.alertType("unverified_includes"))
         assertNull(SkippedProbeAlert.alertType("unverified_max_calls"))

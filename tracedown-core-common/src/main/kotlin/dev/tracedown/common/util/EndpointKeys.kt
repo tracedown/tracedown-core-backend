@@ -1,5 +1,7 @@
 package dev.tracedown.common.util
 
+import dev.tracedown.common.variables.ScriptReferences
+
 /**
  * Derives the identity of an **endpoint** from a probe script.
  *
@@ -42,23 +44,6 @@ object EndpointKeys {
 
     /** Template recorded for a URL that is not a string literal. */
     const val EXPRESSION_TEMPLATE = "{expr}"
-
-    /**
-     * The scope letters the platform's variable scoping uses: a user writes
-     * `$o.key` / `$w.key` / `$p.key` / `$s.key` and the scheduler rewrites each
-     * to a plain Lace identifier (`$s_key`) before the script is executed.
-     *
-     * The rewrite is what makes a scoped reference interpolate at all — the
-     * §3.5 grammar's identifier has no dot in it, so `$foo.bar` interpolates
-     * `$foo` and leaves `.bar` as text. [template] therefore treats a dotted
-     * name as one reference **only** for these four letters, exactly mirroring
-     * the rewrite, and leaves `$foo.bar` split the way a run would see it.
-     */
-    private val SCOPE_LETTERS = setOf("o", "w", "p", "s")
-
-    private fun isNameStart(c: Char) = c == '_' || c in 'a'..'z' || c in 'A'..'Z'
-
-    private fun isNameChar(c: Char) = isNameStart(c) || c in '0'..'9'
 
     /**
      * The URL template of a call, from the body of its URL string literal.
@@ -154,13 +139,10 @@ object EndpointKeys {
 
     /**
      * Rewrites every §3.5 reference in a string body to `{name}`, leaving
-     * everything else byte for byte.
-     *
-     * The forms, in the order the canonical executor matches them:
-     * `${$$run}`, `${$run}`, `$$run`, `$run`, each name being
-     * `[A-Za-z_][A-Za-z0-9_]*` with an optional `.name` suffix for the four
-     * scope letters (see [SCOPE_LETTERS]). A `$` that begins none of them is
-     * literal text: `$1`, `$/`, a trailing `$`, `$$` before a digit.
+     * everything else byte for byte. What counts as a reference, and where one
+     * ends, is [ScriptReferences]'s — the same reader the scheduler's rewrite
+     * and the target policies use. A `$` that begins no reference is literal
+     * text: `$1`, `$/`, a trailing `$`, `$$` before a digit.
      *
      * `\$` is a §2.2 escape that yields a literal `$` but, per §3.5,
      * **does not prevent interpolation** — the executor scans the unescaped
@@ -169,73 +151,8 @@ object EndpointKeys {
      * normally, which also makes this function agree with itself whether it is
      * handed raw source or a lexed value.
      */
-    private fun interpolationPlaceholders(s: String): String {
-        val out = StringBuilder(s.length)
-        var i = 0
-        while (i < s.length) {
-            val c = s[i]
-            if (c == '\\' && i + 1 < s.length && s[i + 1] == '$') {
-                // The escape is consumed; the `$` behind it is still a `$`.
-                i++
-                continue
-            }
-            if (c != '$') {
-                out.append(c)
-                i++
-                continue
-            }
-            val match = matchReference(s, i)
-            if (match == null) {
-                out.append('$')
-                i++
-            } else {
-                out.append('{').append(match.name).append('}')
-                i = match.end
-            }
-        }
-        return out.toString()
-    }
-
-    private class Reference(val name: String, val end: Int)
-
-    /** Matches one reference starting at the `$` in [i], or null if that `$` is text. */
-    private fun matchReference(s: String, i: Int): Reference? {
-        // `${$name}` / `${$$name}` — the braced forms, which exist so a name
-        // can sit next to other text (`${$host}name`).
-        if (i + 1 < s.length && s[i + 1] == '{') {
-            var j = i + 2
-            if (j >= s.length || s[j] != '$') return null
-            j++
-            if (j < s.length && s[j] == '$') j++
-            val name = readName(s, j) ?: return null
-            val after = j + name.length
-            if (after >= s.length || s[after] != '}') return null
-            return Reference(name, after + 1)
-        }
-        // `$$name`, then `$name`.
-        var j = i + 1
-        if (j < s.length && s[j] == '$') j++
-        val name = readName(s, j) ?: return null
-        return Reference(name, j + name.length)
-    }
-
-    /**
-     * Reads an identifier at [start], plus a `.name` suffix when the
-     * identifier is one of the scope letters. Null when no identifier begins
-     * there.
-     */
-    private fun readName(s: String, start: Int): String? {
-        if (start >= s.length || !isNameStart(s[start])) return null
-        var end = start + 1
-        while (end < s.length && isNameChar(s[end])) end++
-        val head = s.substring(start, end)
-        if (head !in SCOPE_LETTERS || end >= s.length || s[end] != '.') return head
-        var tail = end + 1
-        if (tail >= s.length || !isNameStart(s[tail])) return head
-        tail++
-        while (tail < s.length && isNameChar(s[tail])) tail++
-        return s.substring(start, tail)
-    }
+    private fun interpolationPlaceholders(s: String): String =
+        ScriptReferences.replace(s.replace("\\$", "$")) { "{${it.name}}" }
 
     // ── Casing ──────────────────────────────────────────────────────────
 
