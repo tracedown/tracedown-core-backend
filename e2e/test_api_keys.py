@@ -8,6 +8,7 @@ Depends on test_service_lifecycle having run first (uses h.admin_token).
 """
 
 import time
+import urllib.request
 
 import test_helpers as h
 
@@ -205,24 +206,47 @@ def test_public_api_run_and_results():
     if not _flow_svc:
         h.skip_test("No service -- the create step must run first")
 
-    status, body = h.api("POST", f"{_PUBLIC}/services/{_flow_svc}/run", token=_flow_key)
-    h.assert_status(status, 202, f"body={body}")
-    requested_at = body.get("requestedAt")
-    assert requested_at, f"Expected requestedAt, got {body}"
+    # The script is judged as a save would judge it — with a read key, too:
+    # it changes nothing.
+    status, body = h.api("POST", f"{_PUBLIC}/scripts/validate",
+                         {"script": 'get("http://testbin:20780/status/200").expect(status: 200)',
+                          "serviceId": _flow_svc}, _flow_read_key)
+    h.assert_status(status, 200, f"body={body}")
+    assert body.get("valid") is True, f"Expected the script to validate, got {body}"
 
-    result = None
+    # Asked for under an Idempotency-Key, and asked again: one run, one handle.
+    idem = {"Idempotency-Key": f"e2e-run-{int(time.time())}"}
+    status, body = h.api("POST", f"{_PUBLIC}/services/{_flow_svc}/run", token=_flow_key, headers=idem)
+    h.assert_status(status, 202, f"body={body}")
+    run_id = body.get("runId")
+    assert run_id and body.get("requestedAt"), f"Expected runId and requestedAt, got {body}"
+    status, again = h.api("POST", f"{_PUBLIC}/services/{_flow_svc}/run", token=_flow_key, headers=idem)
+    h.assert_status(status, 202, f"body={again}")
+    assert again.get("runId") == run_id, f"A repeat under the same key must be the same run: {body} / {again}"
+
+    # Followed by its id until it settles.
+    run = None
     for i in range(20):
-        status, body = h.api("GET", f"{_PUBLIC}/services/{_flow_svc}/results?pageSize=10&since={requested_at}",
-                             token=_flow_key)
+        status, body = h.api("GET", f"{_PUBLIC}/services/{_flow_svc}/runs/{run_id}", token=_flow_read_key)
         h.assert_status(status, 200, f"body={body}")
-        if body.get("items"):
-            result = body["items"][0]
-            print(f"  Result listed {i * 2}s after the run")
+        if body.get("state") != "pending":
+            run = body
+            print(f"  Run settled ({body.get('state')}) {i * 2}s after it was asked for")
             break
         time.sleep(2)
-    assert result is not None, "No result appeared within 40s of the run"
+    assert run is not None, "The run was still pending 40s after it was asked for"
+    assert run.get("state") == "done", f"Expected the run done, got {run}"
+    result = run.get("result") or {}
+    assert result.get("id") == run_id, f"The result must be filed under the run's id: {run}"
+    assert result.get("trigger") == "manual", f"Expected a manual run, got {run}"
 
-    status, body = h.api("GET", f"{_PUBLIC}/services/{_flow_svc}/results/{result['id']}", token=_flow_key)
+    # The results list finds it by trigger, under the same id.
+    status, body = h.api("GET", f"{_PUBLIC}/services/{_flow_svc}/results?trigger=manual&pageSize=10",
+                         token=_flow_key)
+    h.assert_status(status, 200, f"body={body}")
+    assert any(r.get("id") == run_id for r in body.get("items", [])), f"Run {run_id} not listed: {body}"
+
+    status, body = h.api("GET", f"{_PUBLIC}/services/{_flow_svc}/results/{run_id}", token=_flow_key)
     h.assert_status(status, 200, f"body={body}")
     steps = body.get("steps", [])
     assert steps, f"Expected the result to carry its steps, got {body}"
@@ -230,17 +254,25 @@ def test_public_api_run_and_results():
     # A stored body is text in the response, never a link to where it is kept.
     with_body = next((s for s in steps if s.get("hasBody")), None)
     assert with_body is not None, f"The service saves bodies, but no step stored one: {steps}"
-    status, body = h.api("GET",
-                         f"{_PUBLIC}/services/{_flow_svc}/results/{result['id']}/steps/{with_body['id']}/body",
-                         token=_flow_key)
+    body_path = f"{_PUBLIC}/services/{_flow_svc}/results/{run_id}/steps/{with_body['id']}/body"
+    status, body = h.api("GET", body_path, token=_flow_key)
     h.assert_status(status, 200, f"body={body}")
     assert "content" in body and "url" not in body, f"Expected content and no url, got {body}"
     assert "public-api-e2e" in body["content"], f"Expected the probed body, got {body}"
-    print("  Step body returned as content")
+
+    # And as the bytes themselves, as a download.
+    req = urllib.request.Request(f"{h.GATEWAY_URL}{body_path}/raw",
+                                 headers={"Authorization": f"Bearer {_flow_key}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        assert resp.status == 200, f"Expected 200 for the raw body, got {resp.status}"
+        assert resp.headers.get("Content-Disposition", "").startswith("attachment"), dict(resp.headers)
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff", dict(resp.headers)
+        assert b"public-api-e2e" in resp.read(), "Expected the probed body's bytes"
+    print("  Step body returned as content and as a download")
 
     status, body = h.api("GET", f"{_PUBLIC}/services/{_flow_svc}/metrics/history", token=_flow_key)
     h.assert_status(status, 200, f"body={body}")
-    print(f"  Result {result['id'][:8]}... read with {len(steps)} step(s)")
+    print(f"  Result {run_id[:8]}... read with {len(steps)} step(s)")
 
 
 @h.log_test("Public API: delete what the key built", reset_db_before=False)

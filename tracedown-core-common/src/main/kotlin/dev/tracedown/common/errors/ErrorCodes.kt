@@ -149,9 +149,27 @@ object ErrorCodes {
     /** A run was asked for a service that has no script to run. */
     const val SCRIPT_MISSING = "script_missing"
 
+    // ── Idempotent requests ──
+    /** An `Idempotency-Key` already used with a different request (method, path or body). */
+    const val IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
+    /** A request with that `Idempotency-Key` is still being answered. */
+    const val IDEMPOTENCY_IN_PROGRESS = "idempotency_in_progress"
+    /** The store that remembers `Idempotency-Key`s is not answering, so the request cannot be made safely. */
+    const val IDEMPOTENCY_UNAVAILABLE = "idempotency_unavailable"
+    /** The request with that `Idempotency-Key` may or may not have taken effect, so it is not made again. */
+    const val IDEMPOTENCY_OUTCOME_UNKNOWN = "idempotency_outcome_unknown"
+    /** The organization's budget for remembered answers is spent for now; a request with a new key would not be remembered. */
+    const val IDEMPOTENCY_LIMIT_REACHED = "idempotency_limit_reached"
+
     // ── Webhook bindings ──
     /** The webhook is already bound to that resource. */
     const val BINDING_EXISTS = "binding_exists"
+
+    // ── Event feed ──
+    /** The cursor points before events the platform no longer keeps; `details.oldest` is where to start again. */
+    const val CURSOR_EXPIRED = "cursor_expired"
+    /** The key already has as many event reads waiting as it may; one has to return first. */
+    const val TOO_MANY_EVENT_POLLS = "too_many_event_polls"
 
     // ── General ──
     const val INTERNAL_ERROR = "internal_error"

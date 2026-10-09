@@ -4,6 +4,7 @@ import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.domain.DomainVerifier
+import dev.tracedown.common.domain.VerificationResult
 import dev.tracedown.common.domain.dns.DnsProviderProfiles
 import dev.tracedown.common.models.OrgDomains
 import dev.tracedown.common.pfs.Page
@@ -209,24 +210,26 @@ object DomainController {
      * Requires domains.write.
      */
     fun verify(orgId: UUID, domainId: UUID, userId: UUID): VerifyDomainResponse {
+        // The check goes out to the network — DNS, the claimant's web server —
+        // so it runs with no transaction open, as the reverify job's does: a
+        // slow answer must not hold one (the pool ends a transaction left idle).
+        val (domain, challenge, type) = transaction {
+            requireOrgWrite(orgId, userId) { it.domains }
+            val row = liveDomain(orgId, domainId) ?: throw NotFoundException()
+            Triple(row[OrgDomains.domain], row[OrgDomains.challenge], row[OrgDomains.verificationType])
+        }
+
+        val result = verifyWithin(domain, challenge, type)
+
         return transaction {
             requireOrgWrite(orgId, userId) { it.domains }
-
-            val row = OrgDomains.selectAll()
-                .where {
-                    (OrgDomains.id eq domainId) and
-                    (OrgDomains.organizationId eq orgId) and
-                    (OrgDomains.deleted eq false)
-                }
-                .firstOrNull() ?: throw NotFoundException()
-
-            val domain = row[OrgDomains.domain]
-            val challenge = row[OrgDomains.challenge]
-            val type = row[OrgDomains.verificationType]
+            // Still the same claim: deleted meanwhile, or challenged afresh, and
+            // this answer is about something that is no longer asked.
+            val row = liveDomain(orgId, domainId) ?: throw NotFoundException()
+            if (row[OrgDomains.challenge] != challenge) {
+                return@transaction VerifyDomainResponse(verified = false, status = row[OrgDomains.status], error = "The challenge changed during the check")
+            }
             val now = Instant.now()
-
-            val result = verifier.verify(domain, challenge, type)
-
             if (result.verified) {
                 OrgDomains.update({ OrgDomains.id eq domainId }) {
                     it[status] = "verified"
@@ -244,6 +247,30 @@ object DomainController {
             }
         }
     }
+
+    /** How long one verification may take, whatever the verifier's own timeouts do. */
+    private const val VERIFY_TIMEOUT_SECONDS = 30L
+
+    /** Runs the verifier with a bound on the whole call: a lookup that never answers fails the attempt. */
+    private fun verifyWithin(domain: String, challenge: String, type: String): VerificationResult {
+        val future = java.util.concurrent.CompletableFuture.supplyAsync { verifier.verify(domain, challenge, type) }
+        return try {
+            future.get(VERIFY_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: java.util.concurrent.TimeoutException) {
+            future.cancel(true)
+            VerificationResult(verified = false, error = "The check did not finish within $VERIFY_TIMEOUT_SECONDS seconds")
+        } catch (e: java.util.concurrent.ExecutionException) {
+            throw e.cause ?: e
+        }
+    }
+
+    private fun liveDomain(orgId: UUID, domainId: UUID) = OrgDomains.selectAll()
+        .where {
+            (OrgDomains.id eq domainId) and
+                (OrgDomains.organizationId eq orgId) and
+                (OrgDomains.deleted eq false)
+        }
+        .firstOrNull()
 
     // ── Internals ──
 

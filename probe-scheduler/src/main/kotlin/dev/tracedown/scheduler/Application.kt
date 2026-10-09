@@ -74,6 +74,11 @@ fun Application.module() {
     // Variable decryption
     VariableCrypto.init(config.aesKey)
     dev.tracedown.common.realtime.RealtimePublisher.init { redis }
+    // Wake the event feed's waiting reads once what this process wrote to the
+    // outbox has committed.
+    dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
+        redis.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
+    }
 
     // mTLS client certificate
     val certService = SchedulerCertService(config.aesKey)
@@ -201,7 +206,7 @@ fun Application.module() {
     val pubSubConn = RedisFactory.createPubSubConnection(config.redisAUrl)
 
     // Schedule sync — bootstrap from DB, subscribe to nudge, then sweep periodically
-    val syncService = ScheduleSyncService(quartzManager, config.consistencySweepIntervalSeconds, pubSubConn)
+    val syncService = ScheduleSyncService(quartzManager, config.consistencySweepIntervalSeconds, pubSubConn, claims = redis)
     syncService.bootstrap()
     syncService.startPubSub()
 
@@ -224,9 +229,11 @@ fun Application.module() {
 
     // Shutdown hooks
     monitor.subscribe(io.ktor.server.application.ApplicationStopped) {
+        // Stop hearing run requests first: one that arrived after the queue
+        // closed would be claimed here and then dropped.
+        syncService.stop()
         dispatchQueue.close()
         executionBackend.close()
-        syncService.stop()
         quartzManager.shutdown()
         // Closes every per-agent client the factory built (shared by dispatch
         // and health challenges).

@@ -47,9 +47,8 @@ object PendingBodyDeletion {
      * object exists for. The conflict is now the database's to resolve.
      *
      * A failure that reaches the caller is a doomed transaction either way. The
-     * retention passes therefore record in a transaction of their own, so the
-     * page they are working on survives; the purge records inside its unit's
-     * transaction, whose failure is already caught and retried on the next run.
+     * retention passes and the purge therefore record in a transaction of
+     * their own, so the page they are working on survives.
      */
     fun record(uris: Collection<String>, error: String?) {
         if (uris.isEmpty()) return

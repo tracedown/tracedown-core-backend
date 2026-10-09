@@ -4,6 +4,11 @@ import at.favre.lib.crypto.bcrypt.BCrypt
 import io.ktor.server.response.respond
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.routing.get
+import io.ktor.server.routing.post
+import dev.tracedown.common.models.RunRequests
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import org.junit.jupiter.api.assertThrows
 import dev.tracedown.gateway.util.ApiException
@@ -37,6 +42,12 @@ import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.interceptors.Interceptors
 import dev.tracedown.gateway.controllers.orgs.GroupController
+import dev.tracedown.gateway.controllers.notifications.NotificationTemplateController
+import dev.tracedown.gateway.controllers.presets.RulePresetController
+import dev.tracedown.gateway.data.notifications.CreateNotificationTemplateRequest
+import dev.tracedown.gateway.data.presets.CreateRulePresetRequest
+import dev.tracedown.common.models.SystemAlerts
+import kotlinx.serialization.json.JsonPrimitive
 import dev.tracedown.gateway.controllers.orgs.OrgVariableController
 import dev.tracedown.gateway.controllers.orgs.ResourceAccessController
 import dev.tracedown.gateway.controllers.projects.ProjectController
@@ -52,8 +63,19 @@ import dev.tracedown.gateway.data.silences.CreateSilenceRequest
 import dev.tracedown.gateway.data.webhooks.CreateWebhookRequest
 import dev.tracedown.gateway.data.webhooks.WebhookBindingRequest
 import dev.tracedown.gateway.data.workspaces.CreateWorkspaceRequest
+import dev.tracedown.gateway.data.workspaces.UpdateWorkspaceRequest
+import dev.tracedown.gateway.data.services.UpdateServiceRequest
 import dev.tracedown.gateway.routes.publicapi.PublicApi
 import dev.tracedown.gateway.util.ApiRateLimit
+import dev.tracedown.gateway.util.Idempotency
+import dev.tracedown.gateway.controllers.runs.RunRequestController
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
+import io.ktor.server.request.receiveText
+import io.ktor.server.response.respondText
+import io.ktor.server.routing.routing
+import org.jetbrains.exposed.v1.jdbc.select
 import io.ktor.http.HttpMethod
 import io.ktor.server.application.pluginOrNull
 import io.ktor.server.config.HoconApplicationConfig
@@ -147,6 +169,48 @@ class ApiKeyResourcesTest {
         /** One window for the whole run, so no budget resets mid-test. */
         private const val ONE_WINDOW = "315360000"
 
+        /** Calls the host route `/test/flaky` has taken. */
+        private val flakyCalls = AtomicInteger(0)
+
+        /** Completed when `/test/slow` is entered; it answers once [slowRelease] is. */
+        @Volatile private var slowEntered = CompletableDeferred<Unit>()
+        @Volatile private var slowRelease = CompletableDeferred<Unit>()
+
+        /** Calls `/test/hangup` has taken; it then waits on [hangupRelease]. */
+        private val hangupCalls = AtomicInteger(0)
+        @Volatile private var hangupRelease = CompletableDeferred<Unit>()
+
+        /** Calls `/test/broken-write` and `/test/big` have taken. */
+        private val brokenWriteCalls = AtomicInteger(0)
+        private val bigCalls = AtomicInteger(0)
+
+        /**
+         * A scheduler as far as Redis can tell: subscribed to the run channel,
+         * so a run asked for is heard (and stays pending) rather than settled
+         * at once as undelivered. Nothing runs it.
+         */
+        private var fakeScheduler: io.lettuce.core.pubsub.StatefulRedisPubSubConnection<String, String>? = null
+
+        fun listenForRuns() {
+            fakeScheduler = dev.tracedown.common.redis.RedisFactory.createPubSubConnection(TestRedis.url).also {
+                it.sync().subscribe(dev.tracedown.common.runs.RunTrigger.RUN_CHANNEL)
+            }
+        }
+
+        fun stopListeningForRuns() {
+            fakeScheduler?.close()
+            fakeScheduler = null
+        }
+
+        /** An answer whose bytes can be read once — by whoever records it — and then fail the engine's write. */
+        private class BreakingContent(private val payload: ByteArray) : io.ktor.http.content.OutgoingContent.ByteArrayContent() {
+            private val reads = AtomicInteger(0)
+            override val contentType: io.ktor.http.ContentType = io.ktor.http.ContentType.Application.Json
+            override val contentLength: Long = payload.size.toLong()
+            override fun bytes(): ByteArray =
+                if (reads.incrementAndGet() == 1) payload else throw java.io.IOException("the engine's write fails")
+        }
+
         /** Hands each test its own client address, from two documentation ranges. */
         private val addresses = AtomicInteger(0)
 
@@ -173,6 +237,33 @@ class ApiKeyResourcesTest {
             PublicApi.routes(tag = "Test") {
                 get("/test/bare/{code}") {
                     call.respond(HttpStatusCode.fromValue(call.parameters["code"]!!.toInt()))
+                }
+                // Fails its first call with a server error, answers after that.
+                post("/test/flaky") {
+                    if (flakyCalls.incrementAndGet() == 1) throw IllegalStateException("the first call fails")
+                    call.respond(mapOf("n" to flakyCalls.get()))
+                }
+                // Does its work, then waits — long enough for its client to go away.
+                post("/test/hangup") {
+                    hangupCalls.incrementAndGet()
+                    hangupRelease.await()
+                    call.respond(mapOf("ok" to true))
+                }
+                // Does its work; its answer is recorded, and then the write fails.
+                post("/test/broken-write") {
+                    val n = brokenWriteCalls.incrementAndGet()
+                    call.respond(BreakingContent("""{"n":$n}""".toByteArray()))
+                }
+                // Answers more than an idempotent answer may keep.
+                post("/test/big") {
+                    val n = bigCalls.incrementAndGet()
+                    call.respond(mapOf("n" to n.toString(), "padding" to "x".repeat(300 * 1024)))
+                }
+                // Answers once told to, so a second call can arrive while it waits.
+                post("/test/slow") {
+                    slowEntered.complete(Unit)
+                    slowRelease.await()
+                    call.respond(mapOf("ok" to true))
                 }
             }
 
@@ -217,10 +308,13 @@ class ApiKeyResourcesTest {
             // so nothing else can take it between choosing and binding.
             server = embeddedServer(Netty, env, configure = {
                 connector { port = 0 }
+                // As the gateway runs (system.conf).
+                responseWriteTimeoutSeconds = ProbeResultController.ENGINE_WRITE_TIMEOUT_SECONDS
             })
             server.start(wait = false)
             serverPort = runBlocking { server.engine.resolvedConnectors().first().port }
             awaitReady()
+            listenForRuns()
         }
 
         /** Waits until the gateway answers, rather than for a fixed time. */
@@ -240,6 +334,8 @@ class ApiKeyResourcesTest {
         @AfterAll
         @JvmStatic
         fun teardown() {
+            stopListeningForRuns()
+            hangupRelease.complete(Unit)
             server.stop(1000, 5000)
             PublicApi.clearAll()
             Interceptors.clearAll()
@@ -253,6 +349,9 @@ class ApiKeyResourcesTest {
 
     /** A script that validates and names nothing anyone has to verify. */
     private val SCRIPT = "get(\"https://example.com\").expect(status: 200)"
+
+    /** [SCRIPT] as it is written inside a JSON string. */
+    private val ESCAPED_SCRIPT = SCRIPT.replace("\"", "\\\"")
     private val jsonType = "application/json".toMediaType()
 
     // ── Fixtures ──
@@ -292,6 +391,16 @@ class ApiKeyResourcesTest {
         /** Bound to nothing. */
         val spareWebhook: UUID,
         val binding: UUID,
+        /** An organization-wide script preset. */
+        val preset: UUID,
+        /** A notification template bound to [project]. */
+        val template: UUID,
+        /** A notification template bound to nothing. */
+        val spareTemplate: UUID,
+        /** A system alert of the organization. */
+        val alert: UUID,
+        /** A run asked for on [service], by its handle. */
+        val run: UUID,
     )
 
     private fun newOwner(): Account = transaction {
@@ -391,6 +500,23 @@ class ApiKeyResourcesTest {
         val spare = WebhookController.create(o, CreateWebhookRequest(name = "Spare hook", url = "https://example.com/spare"), u).id
         val binding = WebhookController.createBinding(o, "service", svcId, WebhookBindingRequest(webhook), u).id
         GroupController.createGroup(o, "Fixture group", u)
+        val preset = RulePresetController.create(o, u, CreateRulePresetRequest("Fixture preset", SCRIPT)).id
+        val template = NotificationTemplateController.create(
+            o, CreateNotificationTemplateRequest("Fixture template", "\${s.name} is \${trigger}", listOf(proj.toString())), u,
+        ).id
+        val spareTemplate = NotificationTemplateController.create(o, CreateNotificationTemplateRequest("Spare template", "Spare"), u).id
+        val alert = UUID.randomUUID()
+        transaction {
+            SystemAlerts.insert {
+                it[id] = alert
+                it[organizationId] = o
+                it[alertType] = "agent_down"
+                it[subject] = "fixture-agent"
+                it[severity] = "warning"
+                it[createdAt] = Instant.now().minusSeconds(120)
+                it[lastSeenAt] = Instant.now().minusSeconds(60)
+            }
+        }
         ResourceAccessController.upsert(o, "service", svcId, UpsertAccessRequest("user", grantee.userId.toString(), 2), u)
 
         val resultId = UUID.randomUUID()
@@ -427,6 +553,8 @@ class ApiKeyResourcesTest {
             }
         }
 
+        val run = ServiceController.triggerRun(o, svcId, u).runId
+
         val ownerSession = login(owner, address)
         val memberSession = login(member, address)
         return Fx(
@@ -442,6 +570,9 @@ class ApiKeyResourcesTest {
             silence = UUID.fromString(silence),
             webhook = UUID.fromString(webhook), spareWebhook = UUID.fromString(spare),
             binding = UUID.fromString(binding),
+            preset = UUID.fromString(preset), template = UUID.fromString(template),
+            spareTemplate = UUID.fromString(spareTemplate), alert = alert,
+            run = run,
         )
     }
 
@@ -508,6 +639,8 @@ class ApiKeyResourcesTest {
          * address, a result without storage locations). Identity otherwise.
          */
         val twinView: (JsonElement?) -> JsonElement? = { it },
+        /** A write a read-only key may make all the same: it changes nothing. */
+        val readKeyAllowed: Boolean = false,
     )
 
     /** A page whose items keep only [keys], in the public route's order of fields. */
@@ -537,6 +670,27 @@ class ApiKeyResourcesTest {
         if (calls == null) o else JsonObject(o + ("rawResult" to JsonObject(raw + ("calls" to JsonArray(calls)))))
     }
 
+    /** A dashboard list as the public page of it: the first page, at the default size. */
+    private val asFirstPage: (JsonElement?) -> JsonElement? = { element ->
+        val items = element as JsonArray
+        JsonObject(mapOf(
+            "items" to items, "total" to JsonPrimitive(items.size),
+            "page" to JsonPrimitive(1), "pageSize" to JsonPrimitive(50),
+        ))
+    }
+
+    /** The dashboard's banner list as the public alert page: public names, not dismissed. */
+    private val asAlertPage: (JsonElement?) -> JsonElement? = { element ->
+        asFirstPage(JsonArray((element as JsonArray).map { item ->
+            val a = item.jsonObject
+            JsonObject(mapOf(
+                "id" to a["id"]!!, "type" to a["alertType"]!!, "subject" to a["subject"]!!, "severity" to a["severity"]!!,
+                "data" to (a["data"] ?: JsonNull), "firstSeenAt" to a["createdAt"]!!, "lastSeenAt" to a["lastSeenAt"]!!,
+                "dismissedAt" to JsonNull,
+            ))
+        }))
+    }
+
     private fun hasFields(vararg names: String): (JsonElement?) -> Unit = { element ->
         val o = element as JsonObject
         names.forEach { assertTrue(it in o, "Expected field '$it' in $o") }
@@ -563,6 +717,13 @@ class ApiKeyResourcesTest {
     }
 
     private val anything: (JsonElement?) -> Unit = { }
+
+    /** A validation request for [script], against [serviceId] when given. */
+    private fun validateBody(script: String, serviceId: UUID? = null): String =
+        kotlinx.serialization.json.buildJsonObject {
+            put("script", kotlinx.serialization.json.JsonPrimitive(script))
+            serviceId?.let { put("serviceId", kotlinx.serialization.json.JsonPrimitive(it.toString())) }
+        }.toString()
 
     private val v1 = "/api/v1"
 
@@ -615,7 +776,16 @@ class ApiKeyResourcesTest {
         Case("PATCH", "/services/{id}/toggle", { "/services/${it.service}/toggle" }, { "$v1/services/${it.service}/toggle" },
             { """{"isActive":false}""" }, shape = hasFields("id", "isActive")),
         Case("POST", "/services/{id}/run", { "/services/${it.service}/run" }, { "$v1/services/${it.service}/run" },
-            status = 202, shape = { e -> assertEquals("true", e!!.jsonObject.str("ok")); Instant.parse(e.jsonObject.str("requestedAt")) }),
+            status = 202, shape = { e ->
+                assertEquals("true", e!!.jsonObject.str("ok"))
+                Instant.parse(e.jsonObject.str("requestedAt"))
+                UUID.fromString(e.jsonObject.str("runId"))
+            }),
+        Case("GET", "/services/{id}/runs/{runId}", { "/services/${it.service}/runs/${it.run}" }, null,
+            shape = { e ->
+                hasFields("runId", "state", "requestedAt", "result", "reason")(e)
+                assertEquals("pending", e!!.jsonObject.str("state"))
+            }),
         Case("GET", "/services/{id}/agents", { "/services/${it.service}/agents" }, { "$v1/services/${it.service}/agents" },
             shape = array()),
         Case("PUT", "/services/{id}/agents", { "/services/${it.service}/agents" }, { "$v1/services/${it.service}/agents" },
@@ -695,6 +865,19 @@ class ApiKeyResourcesTest {
                 assertFalse("url" in o, "A public step body must never carry a url: $o")
                 assertEquals(setOf("content", "contentType", "encoding"), o.keys)
             }),
+        // The fixture's body is JSON text, so the raw bytes parse as the body itself.
+        Case("GET", "/services/{id}/results/{resultId}/steps/{stepId}/body/raw",
+            { "/services/${it.service}/results/${it.result}/steps/${it.step}/body/raw" }, null,
+            shape = { e -> assertTrue(e is JsonObject && "fixture" in e, "Expected the stored bytes, got $e") }),
+
+        // Scripts
+        Case("POST", "/scripts/validate", { "/scripts/validate" }, null,
+            { validateBody(SCRIPT, it.service) },
+            readKeyAllowed = true,
+            shape = { e ->
+                hasFields("valid", "errors", "targets", "limits")(e)
+                assertEquals("true", e!!.jsonObject.str("valid"), "$e")
+            }),
 
         // Metrics — service
         Case("GET", "/services/{id}/metrics", { "/services/${it.service}/metrics" }, { "$v1/services/${it.service}/metrics" },
@@ -760,6 +943,50 @@ class ApiKeyResourcesTest {
             { """{"enabled":false}""" }, shape = { e -> hasFields("id", "enabled")(e); assertEquals("false", e!!.jsonObject.str("enabled")) }),
         Case("DELETE", "/webhooks/bindings/{id}", { "/webhooks/bindings/${it.binding}" }, { "$v1/webhooks/bindings/${it.binding}" },
             shape = ok),
+
+        // Presets
+        Case("GET", "/presets", { "/presets" }, { "$v1/rule-presets" },
+            shape = page("id", "name", "script", "scope"), twinView = asFirstPage),
+        Case("POST", "/presets", { "/presets" }, { "$v1/rule-presets" }, { """{"name":"Made by key","script":"get(\"https://example.com\").expect(status: 200)"}""" },
+            shape = hasFields("id", "name", "script", "scope")),
+        Case("GET", "/presets/{id}", { "/presets/${it.preset}" }, { "$v1/rule-presets/${it.preset}" },
+            shape = hasFields("id", "name", "script", "scope")),
+        Case("PATCH", "/presets/{id}", { "/presets/${it.preset}" }, { "$v1/rule-presets/${it.preset}" },
+            { """{"name":"Renamed"}""" }, shape = { e -> hasFields("id", "name")(e); assertEquals("Renamed", e!!.jsonObject.str("name")) }),
+        Case("DELETE", "/presets/{id}", { "/presets/${it.preset}" }, { "$v1/rule-presets/${it.preset}" }, shape = ok),
+
+        // Notification templates
+        Case("GET", "/notification-templates", { "/notification-templates" }, { "$v1/notification-templates" },
+            shape = page("id", "name", "text", "projectIds")),
+        Case("POST", "/notification-templates", { "/notification-templates" }, { "$v1/notification-templates" },
+            { """{"name":"Made by key","text":"${'$'}{s.name} changed"}""" }, shape = hasFields("id", "name", "text")),
+        Case("GET", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}" }, shape = hasFields("id", "name", "text", "projectIds")),
+        Case("PATCH", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}" }, { """{"text":"Changed"}""" }, shape = hasFields("id", "text")),
+        Case("DELETE", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}" }, shape = ok),
+        // No dashboard twin: the dashboard lists a project's templates with a
+        // PFS filter, and binds with a POST — see the tests of their own below.
+        Case("GET", "/projects/{id}/notification-templates", { "/projects/${it.project}/notification-templates" }, null,
+            shape = { e -> page("id", "name")(e); assertEquals(1, e!!.jsonObject["items"]!!.jsonArray.size) }),
+        Case("PUT", "/projects/{id}/notification-templates/{templateId}",
+            { "/projects/${it.project}/notification-templates/${it.spareTemplate}" }, null,
+            shape = { e -> hasFields("id", "projectIds")(e); assertTrue(e!!.jsonObject["projectIds"]!!.jsonArray.isNotEmpty()) }),
+        Case("DELETE", "/projects/{id}/notification-templates/{templateId}",
+            { "/projects/${it.project}/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}/projects/${it.project}" },
+            shape = { e -> hasFields("id", "projectIds")(e); assertTrue(e!!.jsonObject["projectIds"]!!.jsonArray.isEmpty()) }),
+
+        // Alerts
+        Case("GET", "/alerts", { "/alerts" }, { "$v1/system-alerts" },
+            shape = pageExactly("id", "type", "subject", "severity", "data", "firstSeenAt", "lastSeenAt", "dismissedAt"),
+            twinView = asAlertPage),
+        Case("POST", "/alerts/{id}/dismiss", { "/alerts/${it.alert}/dismiss" }, { "$v1/system-alerts/${it.alert}/dismiss" },
+            shape = ok),
+
+        // Events: no dashboard twin — see the feed's tests below.
+        Case("GET", "/events", { "/events" }, null, shape = hasFields("items", "next")),
     )
 
     /**
@@ -784,7 +1011,7 @@ class ApiKeyResourcesTest {
         // A read-only key: refused anything but a read, before the handler.
         val (readStatus, readRaw) = send(address, case.method, publicPath, fx.readKey, body)
         declaredOrSuccess(readStatus, readRaw)
-        if (isRead) {
+        if (isRead || case.readKeyAllowed) {
             assertEquals(case.status, readStatus, "Read-only key on ${case.method} ${case.route}: $readRaw")
         } else {
             assertEquals(403, readStatus, "Read-only key on ${case.method} ${case.route}: $readRaw")
@@ -1073,30 +1300,30 @@ class ApiKeyResourcesTest {
         val step = stepAt(fx, "file://${root.resolve("body.json")}", store)
         val o = fx.owner
 
-        runBlocking {
-            // Every place the store has in the gate, held by reads that have not
-            // finished answering.
-            val release = CompletableDeferred<Unit>()
-            val holders = (1..2).map {
-                val inside = CompletableDeferred<Unit>()
-                launch(Dispatchers.IO) {
-                    ProbeResultController.readStepBody(o.orgId, fx.service, fx.result, step, o.userId) {
-                        inside.complete(Unit)
-                        release.await()
+        // Every place the store has in the gate, held by reads that are
+        // inside the store (a read holds its places until it has read).
+        val entered = java.util.concurrent.CountDownLatch(2)
+        val release = java.util.concurrent.CountDownLatch(1)
+        withGate(wait = 10.seconds, deadline = 30.seconds) {
+            ProbeResultController.storeClient = { _ -> blockingClient(entered, release) }
+            runBlocking {
+                val holders = (1..2).map {
+                    launch(Dispatchers.IO) {
+                        ProbeResultController.readStepBody(o.orgId, fx.service, fx.result, step, o.userId) { }
                     }
-                } to inside
-            }
-            holders.forEach { it.second.await() }
+                }
+                assertTrue(entered.await(10, java.util.concurrent.TimeUnit.SECONDS), "Both reads should be inside the store")
 
-            // A third waits for a place, and its caller goes away.
-            val waiter = launch(Dispatchers.IO) {
-                ProbeResultController.readStepBody(o.orgId, fx.service, fx.result, step, o.userId) { }
+                // A third waits for a place, and its caller goes away.
+                val waiter = launch(Dispatchers.IO) {
+                    ProbeResultController.readStepBody(o.orgId, fx.service, fx.result, step, o.userId) { }
+                }
+                delay(300)
+                assertTrue(waiter.isActive, "The third read should be waiting for the store's place in the gate")
+                waiter.cancelAndJoin()
+                release.countDown()
+                holders.forEach { it.join() }
             }
-            delay(300)
-            assertTrue(waiter.isActive, "The third read should be waiting for the store's place in the gate")
-            waiter.cancelAndJoin()
-            release.complete(Unit)
-            holders.forEach { it.first.join() }
         }
 
         assertNull(
@@ -1340,7 +1567,7 @@ class ApiKeyResourcesTest {
         val fx = fixtures(address)
         val (status, raw) = send(address, "GET", "${PublicApi.V1}/agents", fx.readKey)
         assertEquals(200, status, raw)
-        Json.parseToJsonElement(raw).jsonArray.forEach { assertEquals(setOf("slug", "label"), it.jsonObject.keys) }
+        Json.parseToJsonElement(raw).jsonArray.forEach { assertEquals(setOf("slug", "label", "status", "lastCheckAt"), it.jsonObject.keys) }
 
         val (refused, refusedRaw) = send(address, "PUT", "${PublicApi.V1}/services/${fx.service}/agents", fx.writeKey, """{"slugs":["no-such-agent"]}""")
         assertEquals(400, refused, refusedRaw)
@@ -1729,7 +1956,7 @@ class ApiKeyResourcesTest {
             return listOf("$at: $actual where the schema allows $types")
         }
         val errors = mutableListOf<String>()
-        s["enum"]?.jsonArray?.let { allowed -> if (value !is JsonNull && value !in allowed) errors += "$at: $value not in $allowed" }
+        s["enum"]?.jsonArray?.let { allowed -> if (value !in allowed) errors += "$at: $value not in $allowed" }
         if (value is JsonObject) {
             s["required"]?.jsonArray?.forEach { r -> if (r.jsonPrimitive.content !in value) errors += "$at: missing ${r.jsonPrimitive.content}" }
             val properties = s["properties"]?.jsonObject ?: JsonObject(emptyMap())
@@ -1816,27 +2043,27 @@ class ApiKeyResourcesTest {
             ProbeResultController.init(stubClient(size = 1, actual = 1))
             ProbeResultController.storeClient = { stubClient(size = 1, actual = 1) }
             runBlocking {
-                val release = CompletableDeferred<Unit>()
+                val release = java.util.concurrent.CountDownLatch(1)
                 val holders = mutableListOf<kotlinx.coroutines.Job>()
-                suspend fun hold(fx: Fx, step: UUID) {
-                    val inside = CompletableDeferred<Unit>()
-                    holders += launch(Dispatchers.IO) {
-                        ProbeResultController.readStepBody(fx.owner.orgId, fx.service, fx.result, step, fx.owner.userId) {
-                            inside.complete(Unit)
-                            release.await()
+                try {
+                    // Organization A: two default-store reads held inside the
+                    // store (a read keeps its places until it has read); a
+                    // third waits, then 503.
+                    val a = orgs[0]
+                    val enteredA = java.util.concurrent.CountDownLatch(2)
+                    ProbeResultController.init(blockingClient(enteredA, release))
+                    repeat(2) {
+                        holders += launch(Dispatchers.IO) {
+                            ProbeResultController.readStepBody(a.owner.orgId, a.service, a.result, a.step, a.owner.userId) { }
                         }
                     }
-                    inside.await()
-                }
-                try {
-                    // Organization A: two default-store reads held; a third waits, then 503.
-                    val a = orgs[0]
-                    repeat(2) { hold(a, a.step) }
+                    assertTrue(enteredA.await(10, java.util.concurrent.TimeUnit.SECONDS), "Both reads should be inside the store")
                     expectStatusAsync(503) { ProbeResultController.readStepBody(a.owner.orgId, a.service, a.result, a.step, a.owner.userId) { } }
                     // Organization B is not held up by A.
                     val b = orgs[1]
+                    ProbeResultController.init(stubClient(size = 1, actual = 1))
                     ProbeResultController.readStepBody(b.owner.orgId, b.service, b.result, b.step, b.owner.userId) { assertNotNull(it) }
-                    release.complete(Unit)
+                    release.countDown()
                     holders.forEach { it.join() }
                     holders.clear()
 
@@ -1880,12 +2107,23 @@ class ApiKeyResourcesTest {
                     open.countDown()
                     parked.forEach { it.join() }
                 } finally {
-                    release.complete(Unit)
+                    release.countDown()
                 }
             }
             orgs.forEach { assertEquals(ProbeResultController.idleGate, ProbeResultController.gateState(it.owner.orgId)) }
         }
     }
+
+    /** A store client whose reads wait inside the store: each counts [entered] down, then waits for [release]. */
+    private fun blockingClient(entered: java.util.concurrent.CountDownLatch, release: java.util.concurrent.CountDownLatch) =
+        object : BodyStorageClient() {
+            override fun sizeOf(uri: String): Long? = 1
+            override fun readBytes(uri: String, maxBytes: Long): BodyStorageClient.StoredBody {
+                entered.countDown()
+                release.await()
+                return BodyStorageClient.StoredBody.Found(byteArrayOf('a'.code.toByte()), "text/plain")
+            }
+        }
 
     private suspend fun expectStatusAsync(status: Int, block: suspend () -> Unit) {
         val e = try {
@@ -2001,8 +2239,10 @@ class ApiKeyResourcesTest {
             runBlocking {
                 ProbeResultController.readStepBody(o.orgId, fx.service, fx.result, fx.step, o.userId) {
                     val inside = ProbeResultController.gateState(o.orgId)
+                    // Its bytes stay reserved while it is answered; its place
+                    // went back once it had read.
                     assertEquals(ProbeResultController.idleGate.byteUnits - 24, inside.byteUnits)
-                    assertEquals(ProbeResultController.idleGate.reads - 1, inside.reads)
+                    assertEquals(ProbeResultController.idleGate.reads, inside.reads)
                 }
             }
             assertEquals(ProbeResultController.idleGate, ProbeResultController.gateState(o.orgId))
@@ -2021,8 +2261,11 @@ class ApiKeyResourcesTest {
             assertEquals(200, status, raw)
             val inside = seen.get()
             assertNotNull(inside, "The answer was not sent through the gate")
+            // The bytes stay reserved while the answer is written; the places
+            // went back when the read was done, so a slow client holds none.
             assertEquals(ProbeResultController.idleGate.byteUnits - 24, inside!!.byteUnits)
-            assertEquals(ProbeResultController.idleGate.orgReads - 1, inside.orgReads)
+            assertEquals(ProbeResultController.idleGate.orgReads, inside.orgReads)
+            assertEquals(ProbeResultController.idleGate.reads, inside.reads)
         } finally {
             ProbeResultController.insideGateProbe = null
         }
@@ -2134,6 +2377,2139 @@ class ApiKeyResourcesTest {
         }
     }
 
+    // ── Presets ──
+
+    @Test
+    fun `a service made from a preset starts with its script, copied`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val (status, raw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"From preset","presetId":"${fx.preset}"}""",
+        )
+        assertEquals(200, status, raw)
+        val made = obj(raw)
+        assertEquals(SCRIPT, made.str("script"))
+        assertEquals("true", made.str("isActive"), "A preset's script switches the service on, as a script does")
+
+        // Copied: changing the preset later does not reach the service.
+        RulePresetController.update(fx.owner.orgId, fx.owner.userId, fx.preset,
+            dev.tracedown.gateway.data.presets.UpdateRulePresetRequest(script = "get(\"https://example.com/changed\").expect(status: 200)"))
+        val again = obj(send(address, "GET", "${PublicApi.V1}/services/${made.str("id")}", fx.readKey).second)
+        assertEquals(SCRIPT, again.str("script"))
+
+        // Not both.
+        val (bothStatus, bothRaw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"Both","script":"$ESCAPED_SCRIPT","presetId":"${fx.preset}"}""",
+        )
+        assertEquals(400, bothStatus, bothRaw)
+        assertEquals("presetId", obj(bothRaw)["details"]!!.jsonObject.str("field"))
+
+        // A workspace's preset is for services in that workspace only, and a
+        // refused create leaves nothing behind.
+        val otherWs = UUID.fromString(WorkspaceController.create(fx.owner.orgId, CreateWorkspaceRequest("Other WS"), fx.owner.userId).id)
+        val scoped = RulePresetController.create(fx.owner.orgId, fx.owner.userId,
+            CreateRulePresetRequest("Other's preset", SCRIPT, otherWs.toString())).id
+        val (wrongStatus, wrongRaw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"Wrong workspace","presetId":"$scoped"}""",
+        )
+        assertEquals(404, wrongStatus, wrongRaw)
+        assertEquals("presetId", obj(wrongRaw)["details"]!!.jsonObject.str("field"))
+        val names = obj(send(address, "GET", "${PublicApi.V1}/services?projectId=${fx.project}", fx.readKey).second)["items"]!!
+            .jsonArray.map { it.jsonObject.str("name") }
+        assertFalse("Wrong workspace" in names, "A refused create left a service behind: $names")
+    }
+
+    @Test
+    fun `a workspace's preset is read only by those who may see the workspace`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val scoped = RulePresetController.create(fx.owner.orgId, fx.owner.userId,
+            CreateRulePresetRequest("Workspace preset", SCRIPT, fx.workspace.toString())).id
+
+        assertEquals(200, send(address, "GET", "${PublicApi.V1}/presets/$scoped", fx.readKey).first)
+        val (keyStatus, keyRaw) = send(address, "GET", "${PublicApi.V1}/presets/$scoped", fx.memberKey)
+        val (sessionStatus, sessionRaw) = send(address, "GET", "/api/v1/rule-presets/$scoped", fx.memberSession)
+        assertEquals(404, keyStatus, keyRaw)
+        assertEquals(sessionStatus, keyStatus, sessionRaw)
+
+        val listed = obj(send(address, "GET", "${PublicApi.V1}/presets?workspaceId=${fx.workspace}", fx.memberKey).second)
+        assertEquals(listOf(fx.preset.toString()), listed["items"]!!.jsonArray.map { it.jsonObject.str("id") })
+        val ownerListed = obj(send(address, "GET", "${PublicApi.V1}/presets?workspaceId=${fx.workspace}", fx.readKey).second)
+        assertEquals(setOf(fx.preset.toString(), scoped), ownerListed["items"]!!.jsonArray.map { it.jsonObject.str("id") }.toSet())
+    }
+
+    // ── Notification templates ──
+
+    @Test
+    fun `binding a template twice binds it once, and only for those who may change notifications`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val path = "${PublicApi.V1}/projects/${fx.project}/notification-templates/${fx.spareTemplate}"
+        repeat(2) {
+            val (status, raw) = send(address, "PUT", path, fx.writeKey)
+            assertEquals(200, status, raw)
+            assertEquals(listOf(fx.project.toString()), obj(raw)["projectIds"]!!.jsonArray.map { it.jsonPrimitive.content })
+        }
+        val bound = obj(send(address, "GET", "${PublicApi.V1}/projects/${fx.project}/notification-templates", fx.readKey).second)
+        assertEquals(setOf(fx.template.toString(), fx.spareTemplate.toString()),
+            bound["items"]!!.jsonArray.map { it.jsonObject.str("id") }.toSet())
+
+        // A member without the section: what their session is told by the
+        // dashboard's binding and list.
+        val (keyStatus, keyRaw) = send(address, "PUT", path, fx.memberKey)
+        val (sessionStatus, sessionRaw) = send(
+            address, "POST", "/api/v1/notification-templates/${fx.spareTemplate}/projects", fx.memberSession,
+            """{"projectId":"${fx.project}"}""",
+        )
+        assertEquals(403, keyStatus, keyRaw)
+        assertEquals(sessionStatus to errorOf(sessionRaw), keyStatus to errorOf(keyRaw))
+        val (listStatus, listRaw) = send(address, "GET", "${PublicApi.V1}/projects/${fx.project}/notification-templates", fx.memberKey)
+        val (twinStatus, twinRaw) = send(address, "GET", "/api/v1/notification-templates", fx.memberSession)
+        assertEquals(403, listStatus, listRaw)
+        assertEquals(twinStatus to errorOf(twinRaw), listStatus to errorOf(listRaw))
+    }
+
+    @Test
+    fun `a workspace preset the caller cannot see is not there for them, to read, change, delete or use`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val scoped = RulePresetController.create(fx.owner.orgId, fx.owner.userId,
+            CreateRulePresetRequest("Hidden preset", SCRIPT, fx.workspace.toString())).id
+        for ((method, body) in listOf("GET" to null, "PATCH" to """{"name":"Mine now"}""", "DELETE" to null)) {
+            val (status, raw) = send(address, method, "${PublicApi.V1}/presets/$scoped", fx.memberKey, body)
+            assertEquals(404, status, "$method: $raw")
+            assertEquals(Json.parseToJsonElement("""{"error":"not_found"}"""), parse(raw), "$method: $raw")
+        }
+        assertEquals("Hidden preset", RulePresetController.get(fx.owner.orgId, fx.owner.userId, UUID.fromString(scoped)).name)
+
+        // Naming it for a service is 404 too — naming the field it came in.
+        val (status, raw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"Unknown preset","presetId":"${UUID.randomUUID()}"}""",
+        )
+        assertEquals(404, status, raw)
+        assertEquals("presetId", obj(raw)["details"]!!.jsonObject.str("field"))
+
+        // A change is checked as a save is, naming what is wrong.
+        for ((body, field) in listOf("""{"name":"  "}""" to "name", """{"script":"not lace"}""" to "script")) {
+            val (badStatus, badRaw) = send(address, "PATCH", "${PublicApi.V1}/presets/${fx.preset}", fx.writeKey, body)
+            assertEquals(400, badStatus, badRaw)
+            assertEquals(field, obj(badRaw)["details"]!!.jsonObject.str("field"), badRaw)
+        }
+    }
+
+    @Test
+    fun `template names are unique even when two writes race, and binding races to one binding`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+        try {
+            val creates = (1..8).map {
+                pool.submit<Int> { send(address, "POST", "${PublicApi.V1}/notification-templates", fx.writeKey, """{"name":"Raced","text":"x"}""").first }
+            }.map { it.get() }
+            assertEquals(1, creates.count { it == 200 }, "$creates")
+            assertTrue(creates.filter { it != 200 }.all { it == 409 }, "$creates")
+
+            val path = "${PublicApi.V1}/projects/${fx.project}/notification-templates/${fx.spareTemplate}"
+            val binds = (1..8).map { pool.submit<Int> { send(address, "PUT", path, fx.writeKey).first } }.map { it.get() }
+            assertEquals(List(8) { 200 }, binds)
+            val bound = transaction {
+                dev.tracedown.common.models.ProjectNotificationTemplates.selectAll().where {
+                    dev.tracedown.common.models.ProjectNotificationTemplates.notificationTemplateId eq fx.spareTemplate
+                }.count()
+            }
+            assertEquals(1L, bound)
+
+            // A rename onto another's name is 409, and a blank field is named.
+            val (renameStatus, renameRaw) = send(address, "PATCH", "${PublicApi.V1}/notification-templates/${fx.spareTemplate}",
+                fx.writeKey, """{"name":"Fixture template"}""")
+            assertEquals(409, renameStatus, renameRaw)
+            val (blankStatus, blankRaw) = send(address, "PATCH", "${PublicApi.V1}/notification-templates/${fx.spareTemplate}",
+                fx.writeKey, """{"text":"  "}""")
+            assertEquals(400, blankStatus, blankRaw)
+            assertEquals("text", obj(blankRaw)["details"]!!.jsonObject.str("field"))
+        } finally {
+            pool.shutdownNow()
+        }
+
+        // A project's list is that project's templates only.
+        val otherProject = UUID.fromString(ProjectController.create(fx.owner.orgId, fx.workspace,
+            CreateProjectRequest(fx.workspace.toString(), "Template-less"), fx.owner.userId).id)
+        val listed = obj(send(address, "GET", "${PublicApi.V1}/projects/$otherProject/notification-templates", fx.readKey).second)
+        assertEquals(0, listed["items"]!!.jsonArray.size, listed.toString())
+        val ownList = obj(send(address, "GET", "${PublicApi.V1}/projects/${fx.project}/notification-templates", fx.readKey).second)
+        assertEquals(setOf(fx.template.toString(), fx.spareTemplate.toString()),
+            ownList["items"]!!.jsonArray.map { it.jsonObject.str("id") }.toSet())
+    }
+
+    // ── Alerts ──
+
+    @Test
+    fun `the warning log shows every episode, with the caller's own dismissal`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        fun alerts(query: String) = obj(send(address, "GET", "${PublicApi.V1}/alerts$query", fx.writeKey).second)["items"]!!
+            .jsonArray.map { it.jsonObject }
+
+        assertEquals(listOf(fx.alert.toString()), alerts("").map { it.str("id") })
+        assertTrue(alerts("?state=all").single()["dismissedAt"] is JsonNull)
+
+        assertEquals(200, send(address, "POST", "${PublicApi.V1}/alerts/${fx.alert}/dismiss", fx.writeKey).first)
+        assertEquals(emptyList<JsonObject>(), alerts(""), "A dismissed alert is not active for its dismisser")
+        Instant.parse(alerts("?state=all").single().str("dismissedAt"))
+
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/alerts?state=open", fx.writeKey)
+        assertEquals(400, status, raw)
+        assertEquals("state", obj(raw)["details"]!!.jsonObject.str("field"))
+    }
+
+    // ── The event feed ──
+
+    private fun events(address: String, key: String, query: String = ""): JsonObject {
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/events$query", key)
+        assertEquals(200, status, raw)
+        return obj(raw)
+    }
+
+    private fun JsonObject.types(): List<String> = this["items"]!!.jsonArray.map { it.jsonObject.str("type") }
+
+    /** A recorded result's outbox row, as the result ingestor writes it. */
+    private fun recordResult(
+        fx: Fx,
+        status: String,
+        previous: String?,
+        service: UUID = fx.service,
+        project: UUID = fx.project,
+        workspace: UUID = fx.workspace,
+    ): UUID {
+        val resultId = UUID.randomUUID()
+        transaction {
+            Outbox.insert {
+                it[id] = UUID.randomUUID()
+                it[Outbox.organizationId] = fx.owner.orgId
+                it[aggregateType] = "probe_result"
+                it[aggregateId] = resultId
+                it[eventType] = if (status == "skipped") "probe_result.skipped" else "probe_result.created"
+                it[payload] = kotlinx.serialization.json.buildJsonObject {
+                    put("resultId", JsonPrimitive(resultId.toString()))
+                    put("serviceId", JsonPrimitive(service.toString()))
+                    put("projectId", JsonPrimitive(project.toString()))
+                    put("workspaceId", JsonPrimitive(workspace.toString()))
+                    put("organizationId", JsonPrimitive(fx.owner.orgId.toString()))
+                    put("status", JsonPrimitive(status))
+                    if (status == "skipped") {
+                        put("reason", JsonPrimitive("dispatch_queue_full"))
+                    } else {
+                        put("runDurationMs", JsonPrimitive(12))
+                        put("statusChanged", JsonPrimitive(previous != status))
+                        previous?.let { put("previousStatus", JsonPrimitive(it)) }
+                    }
+                }
+                it[published] = false
+                it[createdAt] = Instant.now()
+            }
+        }
+        return resultId
+    }
+
+    /** A read key for [fx]'s grantee, who holds write on its service and nothing else. */
+    private fun granteeKey(fx: Fx, address: String): String = mintKey(login(fx.grantee, address), "read", address)
+
+    @Test
+    fun `each key reads only the events of what its user may see, and never a variable's value`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val granteeSession = login(fx.grantee, address)
+        val granteeKey = mintKey(granteeSession, "read", address)
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+        val start = mapOf(
+            "owner" to events(address, fx.readKey).str("next"),
+            "member" to events(address, fx.memberKey).str("next"),
+            "grantee" to events(address, granteeKey).str("next"),
+        )
+
+        // In the grantee's reach: their service, and — as the dashboard lets
+        // them see the parents of what they hold — its project and workspace.
+        WorkspaceController.update(o, fx.workspace, UpdateWorkspaceRequest("Feed WS"), u)
+        ProjectController.createVariable(o, fx.project, CreateVariableRequest("PROJ_SECRET", "project-secret-value", "secret"), u)
+        ServiceController.update(o, fx.service, UpdateServiceRequest(name = "Feed service"), u)
+        ServiceController.createVariable(o, fx.service, CreateVariableRequest("SVC_PLAIN", "service-plain-value"), u)
+        val resultId = recordResult(fx, "failure", "success")
+        val skippedId = recordResult(fx, "skipped", null)
+        // A run asked for that no scheduler hears settles at once, as skipped.
+        stopListeningForRuns()
+        val settledRun = try {
+            ServiceController.triggerRun(o, fx.service, u).runId
+        } finally {
+            listenForRuns()
+        }
+        // Out of it: a project of another workspace, which they hold nothing in.
+        // (One in the same workspace is not: holding a service lets them read
+        // its workspace, and a workspace's readers read its projects.)
+        val otherWs = UUID.fromString(WorkspaceController.create(o, CreateWorkspaceRequest("Other WS"), u).id)
+        val other = UUID.fromString(ProjectController.create(o, otherWs, CreateProjectRequest(otherWs.toString(), "Other project"), u).id)
+        ProjectController.createVariable(o, other, CreateVariableRequest("OTHER_VAR", "other-value"), u)
+        val otherService = UUID.fromString(
+            ServiceController.create(o, other, CreateServiceRequest(projectId = other.toString(), name = "Other service"), u).id,
+        )
+        recordResult(fx, "success", null, service = otherService, project = other, workspace = otherWs)
+        // And the warning log, which takes the settings section.
+        dev.tracedown.common.alerts.SystemAlertService.raise(o, "agent_down", "feed-agent-${o.toString().take(8)}")
+
+        val (ownerStatus, ownerRaw) = send(address, "GET", "${PublicApi.V1}/events?after=${start["owner"]}", fx.readKey)
+        assertEquals(200, ownerStatus, ownerRaw)
+        val owner = obj(ownerRaw)
+        assertEquals(
+            listOf("workspace.updated", "variable.created", "service.updated", "variable.created",
+                "result.recorded", "service.status_changed", "result.recorded", "run.settled",
+                "workspace.created", "project.created", "variable.created", "service.created", "result.recorded",
+                "service.status_changed", "alert.raised"),
+            owner.types(),
+        )
+        val grantee = events(address, granteeKey, "?after=${start["grantee"]}")
+        assertEquals(
+            listOf("workspace.updated", "variable.created", "service.updated", "variable.created", "result.recorded",
+                "service.status_changed", "result.recorded", "run.settled"),
+            grantee.types(),
+        )
+        val seen = grantee["items"]!!.jsonArray.map { it.jsonObject }
+        assertFalse(seen.any { listOf(otherWs, other, otherService).any { id -> id.toString() in it.toString() } },
+            "The grantee was told about a project they hold nothing in: $grantee")
+        // What their session is told by the dashboard, for the same two projects.
+        assertEquals(200, send(address, "GET", "/api/v1/projects/${fx.project}/variables", granteeSession).first)
+        assertEquals(404, send(address, "GET", "/api/v1/projects/$other/variables", granteeSession).first)
+
+        val member = events(address, fx.memberKey, "?after=${start["member"]}")
+        assertEquals(emptyList<String>(), member.types(), "A member with no grant saw: $member")
+        assertTrue(member.str("next") != start["member"], "An empty read still moves the cursor")
+
+        for (raw in listOf(ownerRaw, grantee.toString())) {
+            assertFalse(listOf("project-secret-value", "service-plain-value", "other-value").any { it in raw },
+                "A variable's value reached the feed: $raw")
+        }
+        val items = owner["items"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("PROJ_SECRET", "SVC_PLAIN", "OTHER_VAR"),
+            items.filter { it.str("type") == "variable.created" }.map { it["data"]!!.jsonObject.str("key") })
+        // Every type carries exactly the data the description lists for it.
+        for (item in items) {
+            assertEquals(
+                dev.tracedown.gateway.controllers.events.EventTypes.DATA.getValue(item.str("type")).toSet(),
+                item["data"]!!.jsonObject.keys, "data of $item",
+            )
+        }
+        val skipped = items.single { it.str("type") == "result.recorded" && it["data"]!!.jsonObject.str("resultId") == skippedId.toString() }
+        assertEquals("skipped", skipped["data"]!!.jsonObject.str("status"))
+        assertEquals("dispatch_queue_full", skipped["data"]!!.jsonObject.str("reason"))
+        assertTrue(skipped["data"]!!.jsonObject["runDurationMs"] is JsonNull)
+        val run = items.single { it.str("type") == "run.settled" }["data"]!!.jsonObject
+        assertEquals(settledRun.toString(), run.str("runId"))
+        assertEquals(fx.service.toString(), run.str("serviceId"))
+        assertEquals("skipped", run.str("state"))
+        assertEquals("run_not_delivered", run.str("reason"))
+        assertTrue(run["status"] is JsonNull, run.toString())
+        val alert = items.single { it.str("type") == "alert.raised" }
+        assertEquals("agent_down", alert["data"]!!.jsonObject.str("type"))
+        val result = items.first { it.str("type") == "result.recorded" }
+        assertEquals(resultId.toString(), result["data"]!!.jsonObject.str("resultId"))
+        assertEquals(fx.service.toString(), result["resource"]!!.jsonObject.str("id"))
+        val changed = items.first { it.str("type") == "service.status_changed" }
+        assertEquals("success", changed["data"]!!.jsonObject.str("previousStatus"))
+        assertTrue(items.last { it.str("type") == "service.status_changed" }["data"]!!.jsonObject["previousStatus"] is JsonNull)
+
+        // Narrowed by type, and the same position reads the same events again.
+        val narrowed = events(address, fx.readKey, "?after=${start["owner"]}&types=alert.raised,project.created")
+        assertEquals(listOf("project.created", "alert.raised"), narrowed.types())
+        assertEquals(owner.str("next"), narrowed.str("next"))
+        val paged = events(address, fx.readKey, "?after=${start["owner"]}&limit=2")
+        assertEquals(listOf("workspace.updated", "variable.created"), paged.types())
+        assertEquals(owner.types().drop(2), events(address, fx.readKey, "?after=${paged.str("next")}").types())
+
+        // The answer fits the schema the description gives it.
+        val doc = obj(send(address, "GET", PublicApi.DESCRIPTION_PATH, null).second)
+        val schema = doc["paths"]!!.jsonObject["${PublicApi.V1}/events"]!!.jsonObject["get"]!!.jsonObject["responses"]!!
+            .jsonObject["200"]!!.jsonObject["content"]!!.jsonObject["application/json"]!!.jsonObject["schema"]!!
+        assertConforms(schema, owner, doc["components"]!!.jsonObject["schemas"]!!.jsonObject)
+    }
+
+    // ── The feed, while a read waits ──
+
+    /**
+     * Runs [action] just before the read's look number [look] (1-based) — so a
+     * test changes the world between two looks of one read, without sleeping
+     * and hoping the read is where it should be. Uninstalls itself.
+     */
+    private fun beforeLook(look: Int, action: () -> Unit) {
+        val count = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = {
+            if (count.incrementAndGet() == look) {
+                action()
+                dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = null
+            }
+        }
+    }
+
+    private fun clearLookHook() {
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = null
+    }
+
+    @Test
+    fun `a grant withdrawn while a read waits stops delivery at once`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val granteeKey = granteeKey(fx, address)
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+
+        // While the grant holds, the grantee is told.
+        val before = events(address, granteeKey).str("next")
+        ServiceController.update(o, fx.service, UpdateServiceRequest(name = "Still granted"), u)
+        val granted = events(address, granteeKey, "?after=$before")
+        assertEquals(listOf("service.updated"), granted.types())
+
+        // Between a read's first look and its second, the grant goes and a
+        // change is made: the second look does not show it.
+        val cursor = granted.str("next")
+        try {
+            beforeLook(2) {
+                ResourceAccessController.remove(o, "service", fx.service, "user", fx.grantee.userId.toString(), u)
+                ServiceController.update(o, fx.service, UpdateServiceRequest(name = "No longer granted"), u)
+            }
+            val after = events(address, granteeKey, "?after=$cursor&wait=2")
+            assertEquals(emptyList<String>(), after.types(), "Delivered after the grant was withdrawn: $after")
+        } finally {
+            clearLookHook()
+        }
+
+        // The owner, reading from the same place, is told.
+        assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `a waiting read returns as soon as an event arrives`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val looked = CompletableDeferred<Unit>()
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = { looked.complete(Unit) }
+        try {
+            val waiting = java.util.concurrent.CompletableFuture.supplyAsync {
+                events(address, fx.readKey, "?after=$cursor&wait=25")
+            }
+            runBlocking { looked.await() }
+            clearLookHook()
+            val started = System.nanoTime()
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Wake up"), fx.owner.userId)
+            val page = waiting.get(30, java.util.concurrent.TimeUnit.SECONDS)
+            val elapsed = Duration.ofNanos(System.nanoTime() - started)
+            assertEquals(listOf("service.updated"), page.types())
+            // Woken by the commit's nudge, not by the read's own schedule (its
+            // next look would be over 12 seconds away).
+            assertTrue(elapsed < Duration.ofSeconds(4), "The read took $elapsed to see the event")
+        } finally {
+            clearLookHook()
+        }
+
+        // And with nothing to report, it answers empty when the wait is up.
+        val quiet = System.nanoTime()
+        val next = events(address, fx.readKey).str("next")
+        val empty = events(address, fx.readKey, "?after=$next&wait=1")
+        assertEquals(emptyList<String>(), empty.types())
+        assertTrue(Duration.ofNanos(System.nanoTime() - quiet) >= Duration.ofMillis(900))
+    }
+
+    /** [fx]'s organization's last outbox row, as a position. */
+    private fun lastPosition(fx: Fx): dev.tracedown.gateway.util.EventCursor.Position.At = transaction {
+        Outbox.selectAll().where { Outbox.organizationId eq fx.owner.orgId }
+            .map { dev.tracedown.gateway.util.EventCursor.Position.At(it[Outbox.xid]!!, it[Outbox.seq]) }
+            .max()
+    }
+
+    private fun setMark(xid: Long, seq: Long) = transaction {
+        dev.tracedown.common.models.OutboxRetention.update({ dev.tracedown.common.models.OutboxRetention.id eq 1 }) {
+            it[purgedXid] = xid
+            it[purgedSeq] = seq
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a cursor older than what is kept is refused with where to start again, also while it waits`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Kept"), fx.owner.userId)
+        val purged = lastPosition(fx)
+        try {
+            setMark(purged.xid, purged.seq)
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
+            assertEquals(410, status, raw)
+            assertEquals("cursor_expired", errorOf(raw))
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            assertEquals(purged, dev.tracedown.gateway.util.EventCursor.decode(fx.owner.orgId, oldest))
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+
+            // A read whose first look was fine is told at its second, when the
+            // purge passed it in between.
+            setMark(0, 0)
+            val from = events(address, fx.readKey).str("next")
+            beforeLook(2) {
+                ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Purged past"), fx.owner.userId)
+                val passed = lastPosition(fx)
+                setMark(passed.xid, passed.seq)
+            }
+            val (waitStatus, waitRaw) = send(address, "GET", "${PublicApi.V1}/events?after=$from&wait=2", fx.readKey)
+            assertEquals(410, waitStatus, waitRaw)
+            assertEquals("cursor_expired", errorOf(waitRaw))
+        } finally {
+            clearLookHook()
+            setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a quiet organization's cursor keeps up, so another's purged rows do not expire it`() {
+        val address = nextAddress()
+        val quiet = fixtures(address)
+        val busy = fixtures(nextAddress())
+        val first = events(address, quiet.readKey).str("next")
+        ServiceController.update(busy.owner.orgId, busy.service, UpdateServiceRequest(name = "Busy"), busy.owner.userId)
+        // An empty read moves the cursor up to everything settled.
+        val refreshed = events(address, quiet.readKey, "?after=$first")
+        assertEquals(emptyList<String>(), refreshed.types())
+        assertTrue(refreshed.str("next") != first)
+        val purged = lastPosition(busy)
+        try {
+            setMark(purged.xid, purged.seq)
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=${refreshed.str("next")}", quiet.readKey).first)
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$first", quiet.readKey).first)
+        } finally {
+            setMark(0, 0)
+        }
+    }
+
+    private val At = dev.tracedown.gateway.util.EventCursor.Position::At
+
+    /** The oldest transaction open now, and the next id to be given out. */
+    private fun horizonNow(): Pair<Long, Long> = transaction {
+        var out = 0L to 0L
+        exec("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint, pg_snapshot_xmax(pg_current_snapshot())::text::bigint") { rs ->
+            rs.next(); out = rs.getLong(1) to rs.getLong(2)
+        }
+        out
+    }
+
+    private fun markNow(): dev.tracedown.gateway.util.EventCursor.Position.At = transaction {
+        dev.tracedown.common.models.OutboxRetention.selectAll().single().let {
+            At(it[dev.tracedown.common.models.OutboxRetention.purgedXid], it[dev.tracedown.common.models.OutboxRetention.purgedSeq])
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a cursor from another history is refused, and the feed starts again from the present`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val (horizon, xmax) = horizonNow()
+        // A row of another history: written by a transaction this database has not reached.
+        transaction {
+            exec(
+                "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id, xid) " +
+                    "VALUES (gen_random_uuid(), 'workspace', '${fx.workspace}', 'resource.workspace.updated', " +
+                    "'{\"id\":\"${fx.workspace}\",\"orgId\":\"${fx.owner.orgId}\"}'::jsonb, false, now(), '${fx.owner.orgId}', ${xmax + 1_000_000})",
+            )
+        }
+        try {
+            // Past the horizon: no position this history handed out.
+            val beyond = dev.tracedown.gateway.util.EventCursor.encode(fx.owner.orgId, At(horizon + 1_000, 0))
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$beyond", fx.readKey)
+            assertEquals(410, status, raw)
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            // The fresh start is a cursor that works.
+            events(address, fx.readKey, "?after=$oldest")
+            assertTrue(markNow() >= At(horizon - 1, Long.MAX_VALUE), "the mark starts at the present: ${markNow()}")
+            // The other history's row lost its place: never delivered, never counted.
+            val stray = transaction {
+                Outbox.selectAll().where { Outbox.organizationId eq fx.owner.orgId }.map { it[Outbox.xid] }.filter { it == null }
+            }
+            assertEquals(1, stray.size)
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "After the move"), fx.owner.userId)
+            assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=$oldest").types())
+        } finally {
+            setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a database that went back in time is noticed by the horizon it has seen`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        try {
+            // A horizon seen before, far above today's: what a restore looks like from here.
+            redis.sync().set("feed:hw", Long.MAX_VALUE.div(4).toString())
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
+            assertEquals(410, status, raw)
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            assertTrue(redis.sync().get("feed:hw")!!.toLong() < Long.MAX_VALUE / 4, "the high-water mark starts again")
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+            // Seen once, settled: the next read is ordinary.
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+        } finally {
+            redis.close()
+            setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a key with no budget left is refused before any work, and a refused cursor is paid for`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        val cursor = events(address, key).str("next")
+
+        // A refusal that reads the mark is a request's worth of work.
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Past it"), fx.owner.userId)
+        val passed = lastPosition(fx)
+        try {
+            setMark(passed.xid, passed.seq)
+            var before = budgetLeft(key)
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$cursor&wait=2", key).first)
+            assertEquals(2L, before - budgetLeft(key), "the refused first look was charged")
+            before = budgetLeft(key)
+            val foreign = fixtures(nextAddress()).let { events(nextAddress(), it.readKey).str("next") }
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$foreign&wait=2", key).first)
+            assertEquals(2L, before - budgetLeft(key), "a cursor that does not open was charged")
+        } finally {
+            setMark(0, 0)
+        }
+
+        // Spent out: refused at the door — no look, and nothing more spent.
+        val digest = dev.tracedown.common.auth.TokenHasher.sha256Hex(key)
+        val window = System.currentTimeMillis() / 1000 / ONE_WINDOW.toLong()
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        val looks = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = { looks.incrementAndGet() }
+        try {
+            redis.sync().set("rate:api:$digest:$window", "1000000")
+            repeat(3) {
+                val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", key)
+                assertEquals(429, status, raw)
+                assertEquals("rate_limited", errorOf(raw))
+            }
+            assertEquals(0, looks.get(), "a refused read looked at the feed")
+            assertEquals("1000000", redis.sync().get("rate:api:$digest:$window"), "a refused read spent budget")
+        } finally {
+            clearLookHook()
+            redis.sync().del("rate:api:$digest:$window")
+            redis.close()
+        }
+    }
+
+    /**
+     * Opens a transaction on a connection of its own that writes an outbox row
+     * for [fx]. With [xidFirst], the transaction takes its id before anything
+     * else is written — so its row's `seq` comes after rows written meanwhile.
+     */
+    private fun openWrite(fx: Fx, name: String, xidFirst: Boolean = false): Pair<java.sql.Connection, () -> Unit> {
+        val connection = java.sql.DriverManager.getConnection(postgres.jdbcUrl, postgres.username, postgres.password)
+        connection.autoCommit = false
+        val insert = {
+            connection.prepareStatement(
+                "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id) " +
+                    "VALUES (?, 'workspace', ?, 'resource.workspace.updated', ?::jsonb, false, now(), ?)",
+            ).use { stmt ->
+                stmt.setObject(1, UUID.randomUUID())
+                stmt.setObject(2, fx.workspace)
+                stmt.setString(3, """{"id":"${fx.workspace}","orgId":"${fx.owner.orgId}","name":"$name"}""")
+                stmt.setObject(4, fx.owner.orgId)
+                stmt.executeUpdate()
+            }
+            Unit
+        }
+        if (xidFirst) {
+            connection.prepareStatement("SELECT pg_current_xact_id()").use { it.executeQuery().close() }
+        } else {
+            insert()
+        }
+        return connection to insert
+    }
+
+    @Test
+    fun `a row whose transaction commits late is not passed over, however late`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val (late, _) = openWrite(fx, "late")
+        try {
+            // Written and committed after the open one: its row is readable, the
+            // open one's is not yet.
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "On time"), fx.owner.userId)
+            repeat(2) {
+                val held = events(address, fx.readKey, "?after=$cursor")
+                assertEquals(emptyList<String>(), held.types(), "Read past a transaction still open: $held")
+                assertEquals(cursor, held.str("next"))
+            }
+            late.commit()
+        } finally {
+            late.close()
+        }
+        assertEquals(listOf("workspace.updated", "service.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `rows come in the order of their transactions, not of their numbers`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        // The open transaction has its id first; its row is written last, so
+        // its `seq` is after the other row's.
+        val (early, insert) = openWrite(fx, "early", xidFirst = true)
+        try {
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Numbered first"), fx.owner.userId)
+            insert()
+            early.commit()
+        } finally {
+            early.close()
+        }
+        val page = events(address, fx.readKey, "?after=$cursor")
+        assertEquals(listOf("workspace.updated", "service.updated"), page.types())
+        // And a read from between them gives the second only.
+        val first = events(address, fx.readKey, "?after=$cursor&limit=1")
+        assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=${first.str("next")}").types())
+    }
+
+    @Test
+    fun `reading from now takes in a row whose transaction is still open`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val (inFlight, _) = openWrite(fx, "in flight")
+        val cursor = try {
+            events(address, fx.readKey).str("next").also { inFlight.commit() }
+        } finally {
+            inFlight.close()
+        }
+        assertEquals(listOf("workspace.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `a key revoked, or a second factor required, while a read waits is refused on the next look`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        try {
+            beforeLook(2) {
+                transaction {
+                    dev.tracedown.common.models.ApiKeys.update({
+                        dev.tracedown.common.models.ApiKeys.keyHash eq dev.tracedown.common.auth.TokenHasher.sha256Hex(key)
+                    }) { it[revoked] = true }
+                }
+            }
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?wait=2", key)
+            assertEquals(401, status, raw)
+            assertEquals("api_key_revoked", errorOf(raw))
+
+            // A member (not the owner, whom the rule does not stop) whose
+            // organization starts requiring a second factor mid-read.
+            val memberKey = fx.memberKey
+            setOrgSettings(fx, fx.member, 1)
+            beforeLook(2) {
+                transaction {
+                    Organizations.update({ Organizations.id eq fx.owner.orgId }) { it[totpRequired] = true }
+                    dev.tracedown.common.auth.PermissionCacheService.recomputeForOrg(fx.owner.orgId)
+                }
+            }
+            val (totpStatus, totpRaw) = send(address, "GET", "${PublicApi.V1}/events?wait=2", memberKey)
+            assertEquals(403, totpStatus, totpRaw)
+            assertEquals("totp_enrollment_required", errorOf(totpRaw))
+        } finally {
+            clearLookHook()
+            transaction { Organizations.update({ Organizations.id eq fx.owner.orgId }) { it[totpRequired] = false } }
+        }
+    }
+
+    /** Gives [account] [level] on [fx]'s organization's settings section, as the permission screens do. */
+    private fun setOrgSettings(fx: Fx, account: Account, level: Short) {
+        transaction {
+            OrgUsers.update({ (OrgUsers.organizationId eq fx.owner.orgId) and (OrgUsers.userId eq account.userId) }) {
+                it[orgSettings] = level
+            }
+            dev.tracedown.common.auth.PermissionCacheService.recomputeForOrg(fx.owner.orgId)
+        }
+    }
+
+    @Test
+    fun `a cursor is sealed to its organization and to the key it was sealed under`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val other = fixtures(nextAddress())
+        val cursor = events(address, fx.readKey).str("next")
+        // Sealed: the position it names is nowhere in it in the clear.
+        val position = dev.tracedown.gateway.util.EventCursor.decode(fx.owner.orgId, cursor)!!
+        val sealed = java.util.Base64.getUrlDecoder().decode(cursor.removePrefix("ev2."))
+        val seqBytes = java.nio.ByteBuffer.allocate(8).putLong(position.seq).array()
+        assertFalse(sealed.toList().windowed(8).any { it == seqBytes.toList() }, "The cursor shows its position: $cursor")
+        // Another organization's key: a cursor that does not open there, 410.
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", other.readKey)
+        assertEquals(410, status, raw)
+        assertEquals("cursor_expired", errorOf(raw))
+        // Not a cursor at all: 400, naming it.
+        val (badStatus, badRaw) = send(address, "GET", "${PublicApi.V1}/events?after=ev2.abc", fx.readKey)
+        assertEquals(400, badStatus, badRaw)
+        assertEquals("after", obj(badRaw)["details"]!!.jsonObject.str("field"))
+        // The same position, asked twice, is the same cursor.
+        assertEquals(events(address, fx.readKey, "?after=$cursor").str("next"), events(address, fx.readKey, "?after=$cursor").str("next"))
+    }
+
+    /** Requests a read and gives back its status, error and `details.bound`. */
+    private fun bounded(address: String, key: String, query: String): Triple<Int, String?, String?> {
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/events$query", key)
+        val bound = (parse(raw) as? JsonObject)?.get("details")?.jsonObject?.get("bound")?.jsonPrimitive?.content
+        return Triple(status, errorOf(raw), bound)
+    }
+
+    @Test
+    fun `reads open are bounded per key, user and organization, and in this process without Redis`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val held = CompletableDeferred<Unit>()
+        val looks = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = {
+            if (looks.incrementAndGet() == 2) held.complete(Unit)
+        }
+        try {
+            val open = (1..2).map {
+                java.util.concurrent.CompletableFuture.supplyAsync { events(address, fx.readKey, "?after=$cursor&wait=3") }
+            }
+            runBlocking { held.await() }
+            val request = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/events?after=$cursor")
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.readKey}").build()
+            client.newCall(request).execute().use { response ->
+                assertEquals(429, response.code)
+                val body = obj(response.body.string())
+                assertEquals("too_many_event_polls", body.str("error"))
+                assertEquals("key", body["details"]!!.jsonObject.str("bound"))
+                assertNotNull(response.header("Retry-After"))
+            }
+            // Another key of the same user is not held back by this one's.
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.writeKey).first)
+            open.forEach { it.get(20, java.util.concurrent.TimeUnit.SECONDS) }
+        } finally {
+            clearLookHook()
+        }
+
+        // The user's and the organization's bounds, as Redis counts them.
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        try {
+            val future = (System.currentTimeMillis() + 60_000).toDouble()
+            val userKey = "events:polls:user:${fx.owner.userId}"
+            repeat(dev.tracedown.gateway.util.EventPollSlots.PER_USER) { redis.sync().zadd(userKey, future, "held-$it") }
+            assertEquals("user", bounded(address, fx.readKey, "?after=$cursor").third)
+            redis.sync().del(userKey)
+            val orgKey = "events:polls:org:${fx.owner.orgId}"
+            repeat(dev.tracedown.gateway.util.EventPollSlots.PER_ORG) { redis.sync().zadd(orgKey, future, "held-$it") }
+            assertEquals("org", bounded(address, fx.readKey, "?after=$cursor").third)
+            redis.sync().del(orgKey)
+            assertEquals(200, bounded(address, fx.readKey, "?after=$cursor").first)
+        } finally {
+            redis.close()
+        }
+
+        // Without Redis, the key is still held to its bound in this process.
+        val redisProvider = dev.tracedown.gateway.util.EventPollSlots.provider()
+        dev.tracedown.gateway.util.EventPollSlots.init { error("Redis is away") }
+        val again = CompletableDeferred<Unit>()
+        val count = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = {
+            if (count.incrementAndGet() == 2) again.complete(Unit)
+        }
+        try {
+            val open = (1..2).map {
+                java.util.concurrent.CompletableFuture.supplyAsync { events(address, fx.readKey, "?after=$cursor&wait=3") }
+            }
+            runBlocking { again.await() }
+            assertEquals(Triple(429, "too_many_event_polls", "key"), bounded(address, fx.readKey, "?after=$cursor"))
+            open.forEach { it.get(20, java.util.concurrent.TimeUnit.SECONDS) }
+        } finally {
+            clearLookHook()
+            dev.tracedown.gateway.util.EventPollSlots.init(redisProvider)
+        }
+    }
+
+    /** What is left of [key]'s request budget, after spending one unit to ask. */
+    private fun budgetLeft(key: String): Long =
+        dev.tracedown.gateway.util.ApiRateLimit.spend(dev.tracedown.common.auth.TokenHasher.sha256Hex(key))!!.remaining.toLong()
+
+    @Test
+    fun `a read spends the budget for every look after the first and for every answer it does not wait for`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        val cursor = events(address, key).str("next")
+
+        // wait=0: one request.
+        var before = budgetLeft(key)
+        events(address, key, "?after=$cursor")
+        assertEquals(2L, before - budgetLeft(key))
+
+        // Waiting with nothing to find: three looks, the first free.
+        before = budgetLeft(key)
+        val quiet = events(address, key, "?after=$cursor&wait=2")
+        assertEquals(emptyList<String>(), quiet.types())
+        assertEquals(3L, before - budgetLeft(key), "two looks after the first")
+
+        // Waiting, with events already there: answered at once, one request.
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "There already"), fx.owner.userId)
+        before = budgetLeft(key)
+        assertEquals(listOf("service.updated"), events(address, key, "?after=${quiet.str("next")}&wait=5").types())
+        assertEquals(2L, before - budgetLeft(key))
+    }
+
+    /** Writes [count] outbox rows of [fx]'s workspace's updates, for [fx]'s organization, in one statement. */
+    private fun workspaceUpdates(fx: Fx, count: Int) = transaction {
+        exec(
+            "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id) " +
+                "SELECT gen_random_uuid(), 'workspace', '${fx.workspace}', 'resource.workspace.updated', " +
+                "'{\"id\":\"${fx.workspace}\",\"orgId\":\"${fx.owner.orgId}\"}'::jsonb, false, now(), '${fx.owner.orgId}' " +
+                "FROM generate_series(1, $count)",
+        )
+    }
+
+    @Test
+    fun `more says whether a read stopped short, whether or not it found anything`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val memberStart = events(address, fx.memberKey).str("next")
+        val ownerStart = events(address, fx.readKey).str("next")
+        workspaceUpdates(fx, dev.tracedown.gateway.controllers.events.EventFeedController.SCAN_ROWS + 1)
+
+        // The member sees none of it: a full look of nothing, then the rest.
+        val first = events(address, fx.memberKey, "?after=$memberStart")
+        assertEquals(emptyList<String>(), first.types())
+        assertEquals("true", first.str("more"))
+        val second = events(address, fx.memberKey, "?after=${first.str("next")}")
+        assertEquals(emptyList<String>(), second.types())
+        assertEquals("false", second.str("more"))
+
+        // The owner sees all of it, a page at a time.
+        val page = events(address, fx.readKey, "?after=$ownerStart&limit=100")
+        assertEquals(100, page.types().size)
+        assertEquals("true", page.str("more"))
+        var next = page.str("next")
+        var seen = 100
+        while (true) {
+            val more = events(address, fx.readKey, "?after=$next&limit=100")
+            seen += more.types().size
+            next = more.str("next")
+            if (more.str("more") == "false") break
+        }
+        assertEquals(dev.tracedown.gateway.controllers.events.EventFeedController.SCAN_ROWS + 1, seen)
+    }
+
+    @Test
+    fun `an event is shown by what the database says it is about, never by what its row claims`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val granteeKey = granteeKey(fx, address)
+        val other = fixtures(nextAddress())
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+        // A service of another workspace of the same organization, out of the grantee's reach.
+        val hiddenWs = UUID.fromString(WorkspaceController.create(o, CreateWorkspaceRequest("Hidden WS"), u).id)
+        val hiddenProject = UUID.fromString(ProjectController.create(o, hiddenWs, CreateProjectRequest(hiddenWs.toString(), "Hidden"), u).id)
+        val hidden = UUID.fromString(ServiceController.create(o, hiddenProject, CreateServiceRequest(projectId = hiddenProject.toString(), name = "Hidden"), u).id)
+        val start = events(address, granteeKey).str("next")
+        val ownerStart = events(address, fx.readKey).str("next")
+
+        // A row naming the hidden service under the grantee's own project and workspace.
+        recordResult(fx, "failure", "success", service = hidden)
+        // A row of this organization naming another organization's service.
+        recordResult(fx, "failure", "success", service = other.service, project = other.project, workspace = other.workspace)
+        // And another organization's own row.
+        ServiceController.update(other.owner.orgId, other.service, UpdateServiceRequest(name = "Theirs"), other.owner.userId)
+
+        assertEquals(emptyList<String>(), events(address, granteeKey, "?after=$start").types())
+        // The owner may see the hidden service; never the other organization's.
+        val owner = events(address, fx.readKey, "?after=$ownerStart")
+        assertEquals(listOf("result.recorded", "service.status_changed"), owner.types())
+        val result = owner["items"]!!.jsonArray.first().jsonObject
+        assertEquals(hidden.toString(), result["resource"]!!.jsonObject.str("id"))
+        assertEquals(hiddenProject.toString(), result["data"]!!.jsonObject.str("projectId"), "the project the database names")
+        // A status change's id is an id of its own, stable from read to read.
+        val statusId = owner["items"]!!.jsonArray[1].jsonObject.str("id")
+        UUID.fromString(statusId)
+        assertEquals(statusId, events(address, fx.readKey, "?after=$ownerStart")["items"]!!.jsonArray[1].jsonObject.str("id"))
+    }
+
+    @Test
+    fun `organization variables need the settings section to read, and alerts need it to write`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+        setOrgSettings(fx, fx.member, 1)
+        val start = events(address, fx.memberKey).str("next")
+        OrgVariableController.create(o, CreateVariableRequest("ORG_SEEN", "org-value"), u)
+        dev.tracedown.common.alerts.SystemAlertService.raise(o, "agent_down", "settings-read-${o.toString().take(8)}")
+        // Settings read: the organization's variable, not the alert.
+        val read = events(address, fx.memberKey, "?after=$start")
+        assertEquals(listOf("variable.created"), read.types())
+        assertEquals("org", read["items"]!!.jsonArray.single().jsonObject["data"]!!.jsonObject.str("scope"))
+        // Settings write: the alert too.
+        setOrgSettings(fx, fx.member, 2)
+        assertEquals(listOf("variable.created", "alert.raised"), events(address, fx.memberKey, "?after=$start").types())
+        // No settings at all: neither.
+        setOrgSettings(fx, fx.member, 0)
+        assertEquals(emptyList<String>(), events(address, fx.memberKey, "?after=$start").types())
+    }
+
+    @Test
+    fun `the feed's parameters are named when they are wrong`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        for ((query, field) in listOf(
+            "?wait=31" to "wait", "?wait=soon" to "wait", "?limit=0" to "limit", "?limit=101" to "limit",
+            "?types=result.recorded,result.deleted" to "types", "?after=not-a-cursor" to "after", "?after=" to "after",
+        )) {
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events$query", fx.readKey)
+            assertEquals(400, status, "$query: $raw")
+            assertEquals(field, obj(raw)["details"]!!.jsonObject.str("field"), query)
+        }
+    }
+
+    // ── Run handles ──
+
+    /** A result row of [fx]'s service under [id], as the ingestor writes one. */
+    private fun insertResult(
+        fx: Fx,
+        id: UUID,
+        status: String,
+        trigger: String = "schedule",
+        startedAt: Instant = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS),
+        raw: String = """{"outcome":"$status"}""",
+        runId: UUID? = null,
+    ): UUID {
+        transaction {
+            ProbeResults.insert {
+                it[ProbeResults.id] = id
+                it[serviceId] = fx.service
+                it[projectId] = fx.project
+                it[workspaceId] = fx.workspace
+                it[organizationId] = fx.owner.orgId
+                it[ProbeResults.startedAt] = startedAt
+                it[ProbeResults.status] = status
+                it[runDurationMs] = 1
+                it[ProbeResults.trigger] = trigger
+                it[ProbeResults.runId] = runId
+                it[rawResult] = Json.parseToJsonElement(raw).jsonObject
+            }
+        }
+        return id
+    }
+
+    @Test
+    fun `a run is followed by its id, from pending to the result filed under it`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val (status, raw) = send(address, "POST", "${PublicApi.V1}/services/${fx.service}/run", fx.writeKey)
+        assertEquals(202, status, raw)
+        val runId = UUID.fromString(obj(raw).str("runId"))
+        val runPath = "${PublicApi.V1}/services/${fx.service}/runs/$runId"
+
+        // Recorded before the scheduler is told, so it is pending from the
+        // moment it is handed out — with who asked, and through which key.
+        val pending = obj(send(address, "GET", runPath, fx.readKey).second)
+        assertEquals("pending", pending.str("state"))
+        assertEquals(obj(raw).str("requestedAt"), pending.str("requestedAt"))
+        assertTrue(pending["result"] is JsonNull, pending.toString())
+        val keyId = UUID.fromString(obj(send(address, "GET", "${PublicApi.V1}/key", fx.writeKey).second).str("id"))
+        transaction {
+            val row = RunRequests.selectAll().where { RunRequests.id eq runId }.single()
+            assertEquals(fx.owner.userId, row[RunRequests.requestedBy])
+            assertEquals(keyId, row[RunRequests.apiKeyId])
+            assertEquals(fx.owner.orgId, row[RunRequests.organizationId])
+            assertNotNull(row[RunRequests.purgeAfter], "kept as long as the result window keeps results")
+        }
+
+        // The result the scheduler files under the run's id settles it, whether
+        // or not the request was marked (an ingestor from before run handles
+        // does not mark it).
+        insertResult(fx, runId, "success", trigger = "manual")
+        val done = obj(send(address, "GET", runPath, fx.readKey).second)
+        assertEquals("done", done.str("state"), done.toString())
+        assertEquals(runId.toString(), done["result"]!!.jsonObject.str("id"))
+        assertEquals("manual", done["result"]!!.jsonObject.str("trigger"))
+        assertTrue(done["reason"] is JsonNull, done.toString())
+        val listed = obj(send(address, "GET", "${PublicApi.V1}/services/${fx.service}/results?trigger=manual", fx.readKey).second)
+        assertEquals(listOf(runId.toString()), listed["items"]!!.jsonArray.map { it.jsonObject.str("id") })
+
+        // A run that was not made answers with why.
+        val skippedRun = ServiceController.triggerRun(fx.owner.orgId, fx.service, fx.owner.userId).runId
+        insertResult(fx, skippedRun, "skipped", trigger = "manual", raw = """{"outcome":"skipped","reason":"run_already_running","elapsedMs":0}""")
+        val skipped = obj(send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/$skippedRun", fx.readKey).second)
+        assertEquals("skipped", skipped.str("state"))
+        assertEquals("run_already_running", skipped.str("reason"))
+
+        // Nothing within the bound: the request was lost. A late result still settles it.
+        val lost = ServiceController.triggerRun(fx.owner.orgId, fx.service, fx.owner.userId).runId
+        transaction {
+            RunRequests.update({ RunRequests.id eq lost }) {
+                it[requestedAt] = Instant.now().minusSeconds(3600).truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+            }
+        }
+        val lostPath = "${PublicApi.V1}/services/${fx.service}/runs/$lost"
+        assertEquals("expired", obj(send(address, "GET", lostPath, fx.readKey).second).str("state"))
+        insertResult(fx, lost, "failure", trigger = "manual")
+        assertEquals("done", obj(send(address, "GET", lostPath, fx.readKey).second).str("state"))
+
+        // An id that is not a run of this service is not found, nor is any
+        // run of a service the caller may not see — as its results are not.
+        val other = ServiceController.create(fx.owner.orgId, fx.project, CreateServiceRequest(projectId = fx.project.toString(), name = "Other"), fx.owner.userId)
+        assertEquals(404, send(address, "GET", "${PublicApi.V1}/services/${other.id}/runs/$runId", fx.readKey).first)
+        assertEquals(404, send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/${UUID.randomUUID()}", fx.readKey).first)
+        val (memberStatus, memberRaw) = send(address, "GET", runPath, fx.memberKey)
+        assertEquals(404, memberStatus, memberRaw)
+        assertEquals("not_found", errorOf(memberRaw))
+        assertEquals(memberStatus, send(address, "GET", "/api/v1/services/${fx.service}/results", fx.memberSession).first)
+        assertEquals(400, send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/not-an-id", fx.readKey).first)
+    }
+
+    @Test
+    fun `the dashboard's run is recorded under an id too, and keeps its answer`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val before = transaction { RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.count() }
+        val (status, raw) = send(address, "POST", "/api/v1/services/${fx.service}/run", fx.ownerSession)
+        assertEquals(202, status, raw)
+        assertEquals(Json.parseToJsonElement("""{"ok":true}"""), Json.parseToJsonElement(raw))
+        transaction {
+            val rows = RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.toList()
+            assertEquals(before + 1, rows.size.toLong())
+            // A session's request names no key.
+            assertTrue(rows.any { it[RunRequests.apiKeyId] == null && it[RunRequests.requestedBy] == fx.owner.userId })
+        }
+    }
+
+    // ── Result filters ──
+
+    @Test
+    fun `results are filtered by time, status and trigger, in either order, and a refused filter is named`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val base = Instant.now().minusSeconds(7200).truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+        val a = insertResult(fx, UUID.randomUUID(), "failure", "schedule", base)
+        val b = insertResult(fx, UUID.randomUUID(), "success", "manual", base.plusSeconds(60))
+        val c = insertResult(fx, UUID.randomUUID(), "timeout", "schedule", base.plusSeconds(120))
+        val until = base.plusSeconds(120)
+        fun ids(query: String): List<UUID> {
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/services/${fx.service}/results?$query", fx.readKey)
+            assertEquals(200, status, "$query: $raw")
+            return obj(raw)["items"]!!.jsonArray.map { UUID.fromString(it.jsonObject.str("id")) }
+        }
+
+        assertEquals(listOf(c, b, a), ids("since=$base&until=$until"))
+        assertEquals(listOf(a, b, c), ids("since=$base&until=$until&order=asc"))
+        assertEquals(listOf(c, b, a), ids("since=$base&until=$until&order=desc"))
+        // `until` is inclusive, and floored to the second as `since` is.
+        assertEquals(listOf(b, a), ids("since=$base&until=${base.plusSeconds(60).plusMillis(700)}"))
+        assertEquals(listOf(c, a), ids("since=$base&until=$until&status=failure,timeout"))
+        assertEquals(listOf(c, a), ids("since=$base&until=$until&status=failure&status=timeout"))
+        assertEquals(listOf(b), ids("since=$base&until=$until&trigger=manual"))
+        assertEquals(listOf(a, c), ids("since=$base&until=$until&trigger=schedule&order=asc"))
+        assertEquals(emptyList<UUID>(), ids("since=$base&until=$until&status=skipped"))
+
+        for ((query, field) in listOf(
+            "status=bogus" to "status",
+            "status=success,," to "status",
+            "trigger=cron" to "trigger",
+            "order=sideways" to "order",
+            "until=yesterday" to "until",
+            "since=$until&until=$base" to "until",
+        )) {
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/services/${fx.service}/results?$query", fx.readKey)
+            assertEquals(400, status, "$query: $raw")
+            assertEquals("field_invalid", errorOf(raw), query)
+            assertEquals(field, obj(raw)["details"]!!.jsonObject.str("field"), query)
+        }
+    }
+
+    // ── Raw step bodies ──
+
+    @Test
+    fun `a raw body is the stored bytes, as an attachment, up to the store's own cap`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val bytes = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff.toByte(), 0x00)
+        val png = objectStep(fx, "${fx.owner.orgId}/${UUID.randomUUID()}.png", bytes, "image/png")
+        fun request(step: UUID, method: String = "GET") = Request.Builder()
+            .url("http://localhost:$serverPort${bodyPath(fx, step)}/raw")
+            .method(method, null)
+            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.readKey}")
+            .build()
+
+        client.newCall(request(png)).execute().use {
+            assertEquals(200, it.code)
+            assertEquals("image/png", it.header("Content-Type"))
+            assertEquals(bytes.size.toString(), it.header("Content-Length"))
+            assertTrue(it.header("Content-Disposition")!!.startsWith("attachment"), it.header("Content-Disposition"))
+            assertEquals("nosniff", it.header("X-Content-Type-Options"))
+            assertTrue(bytes.contentEquals(it.body.bytes()))
+        }
+        // HEAD: the headers, without the bytes.
+        client.newCall(request(png, "HEAD")).execute().use {
+            assertEquals(200, it.code)
+            assertEquals(bytes.size.toString(), it.header("Content-Length"))
+            assertEquals(0, it.body.bytes().size)
+        }
+        // A type the gateway does not repeat is not repeated.
+        val odd = objectStep(fx, "${fx.owner.orgId}/${UUID.randomUUID()}.bin", "<b>hi</b>".toByteArray(), "application/x-made-up")
+        client.newCall(request(odd)).execute().use {
+            assertEquals(200, it.code)
+            assertEquals("application/octet-stream", it.header("Content-Type"))
+        }
+
+        // Past the inline cap and under the store's: served.
+        val dir = Files.createDirectories(storageRoot.resolve(fx.owner.orgId.toString()))
+        val five = dir.resolve("five-${UUID.randomUUID()}.bin")
+        java.io.RandomAccessFile(five.toFile(), "rw").use { it.setLength(ProbeResultController.PUBLIC_BODY_INLINE_MAX + 1) }
+        client.newCall(request(stepAt(fx, "file://$five"))).execute().use {
+            assertEquals(200, it.code)
+            assertEquals((ProbeResultController.PUBLIC_BODY_INLINE_MAX + 1).toString(), it.header("Content-Length"))
+        }
+        // Past the store's: 413, with the limit.
+        val huge = dir.resolve("huge-${UUID.randomUUID()}.bin")
+        java.io.RandomAccessFile(huge.toFile(), "rw").use { it.setLength(BodyStoreRegistry.MAX_BODY_BYTES + 1) }
+        val (hugeStatus, hugeRaw) = send(address, "GET", "${bodyPath(fx, stepAt(fx, "file://$huge"))}/raw", fx.readKey)
+        assertEquals(413, hugeStatus, hugeRaw)
+        assertEquals("body_too_large", errorOf(hugeRaw))
+        assertEquals(BodyStoreRegistry.MAX_BODY_BYTES.toString(), obj(hugeRaw)["details"]!!.jsonObject.str("maxBytes"))
+
+        // None stored: 204. Recorded and gone: 410.
+        assertEquals(204, send(address, "GET", "${bodyPath(fx, stepAt(fx, null))}/raw", fx.readKey).first)
+        val gone = "file://${storageRoot.resolve("${fx.owner.orgId}/never-written.json")}"
+        val (goneStatus, goneRaw) = send(address, "GET", "${bodyPath(fx, stepAt(fx, gone))}/raw", fx.readKey)
+        assertEquals(410, goneStatus, goneRaw)
+        assertEquals("body_gone", errorOf(goneRaw))
+
+        // A user who may not see the service learns nothing, as with the inline read.
+        val (memberStatus, _) = send(address, "GET", "${bodyPath(fx, png)}/raw", fx.memberKey)
+        assertEquals(send(address, "GET", bodyPath(fx, png), fx.memberKey).first, memberStatus)
+        assertEquals(404, memberStatus)
+        // Every read left the gate (the last one leaves it just after its answer is out).
+        val deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos()
+        while (ProbeResultController.gateState(fx.owner.orgId) != ProbeResultController.idleGate && System.nanoTime() < deadline) Thread.sleep(20)
+        assertEquals(ProbeResultController.idleGate, ProbeResultController.gateState(fx.owner.orgId))
+    }
+
+    // ── Script validation ──
+
+    @Test
+    fun `validation answers as a save would, without saving, and never shows a decrypted value`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        val path = "${PublicApi.V1}/scripts/validate"
+
+        // A script the Lace validator refuses: named, and nothing written.
+        val (badStatus, badRaw) = send(address, "POST", path, fx.readKey, validateBody("get(", fx.service))
+        assertEquals(200, badStatus, badRaw)
+        assertEquals("false", obj(badRaw).str("valid"))
+        assertTrue(obj(badRaw)["errors"]!!.jsonArray.isNotEmpty(), badRaw)
+        assertEquals(fx.serviceVersion, ServiceController.get(o.orgId, fx.service, o.userId).version)
+
+        // The address policy, judged with the service's own (secret) values.
+        ServiceController.createVariable(o.orgId, fx.service, CreateVariableRequest("HOST", "http://10.0.0.5", "secret"), o.userId)
+        val script = "get(\"\$s.HOST/health\").expect(status: 200)"
+        ServiceController.init(probeTargetPolicy = dev.tracedown.common.net.ProbeTargetPolicy.Mode.PUBLIC_ONLY)
+        try {
+            val (status, raw) = send(address, "POST", path, fx.readKey, validateBody(script, fx.service))
+            assertEquals(200, status, raw)
+            val answer = obj(raw)
+            assertEquals("false", answer.str("valid"))
+            val blocked = answer["targets"]!!.jsonObject["blocked"]!!.jsonArray.single().jsonObject
+            assertEquals("\$s.HOST/health", blocked.str("source"))
+            assertEquals("target_private_address", blocked.str("reason"))
+            val error = answer["errors"]!!.jsonArray.single().jsonObject
+            assertEquals("blocked_probe_target", error.str("code"))
+            assertEquals("0", error.str("callIndex"))
+            assertFalse("10.0.0.5" in raw, "A decrypted value reached the answer: $raw")
+
+            // The save refuses it the same way.
+            val (saveStatus, saveRaw) = send(
+                address, "PATCH", "${PublicApi.V1}/services/${fx.service}/script", fx.writeKey,
+                kotlinx.serialization.json.buildJsonObject {
+                    put("script", kotlinx.serialization.json.JsonPrimitive(script))
+                    put("version", kotlinx.serialization.json.JsonPrimitive(fx.serviceVersion))
+                }.toString(),
+            )
+            assertEquals(400, saveStatus, saveRaw)
+            assertEquals("blocked_probe_target", errorOf(saveRaw))
+
+            // Without a service there is no value: the host is unresolved, not judged.
+            val (bareStatus, bareRaw) = send(address, "POST", path, fx.readKey, validateBody(script))
+            assertEquals(200, bareStatus, bareRaw)
+            val bare = obj(bareRaw)
+            assertEquals("true", bare.str("valid"), bareRaw)
+            assertEquals(listOf("\$s.HOST/health"), bare["targets"]!!.jsonObject["unresolved"]!!.jsonArray.map { it.jsonPrimitive.content })
+            assertTrue(bare["targets"]!!.jsonObject["blocked"]!!.jsonArray.isEmpty(), bareRaw)
+        } finally {
+            ServiceController.init(probeTargetPolicy = dev.tracedown.common.net.ProbeTargetPolicy.Mode.ALLOW_PRIVATE)
+        }
+
+        // The unverified-domain limits, judged as a save judges them.
+        val four = (1..4).joinToString("\n") { "get(\"https://example.com/$it\").expect(status: 200)" }
+        ServiceController.init(trustedDomainMode = false)
+        try {
+            val answer = obj(send(address, "POST", path, fx.readKey, validateBody(four, fx.service)).second)
+            assertEquals("false", answer.str("valid"))
+            assertEquals(listOf("unverified_domain_call_limit"), answer["errors"]!!.jsonArray.map { it.jsonObject.str("code") })
+            assertEquals(listOf("example.com"), answer["targets"]!!.jsonObject["unverified"]!!.jsonArray.map { it.jsonPrimitive.content })
+            val limits = answer["limits"]!!.jsonObject
+            assertEquals("4", limits.str("callCount"))
+            assertEquals("3", limits.str("maxCalls"))
+            assertEquals("5", limits.str("minIntervalMinutes"))
+            val (saveStatus, saveRaw) = send(
+                address, "PATCH", "${PublicApi.V1}/services/${fx.service}/script", fx.writeKey,
+                kotlinx.serialization.json.buildJsonObject {
+                    put("script", kotlinx.serialization.json.JsonPrimitive(four))
+                    put("version", kotlinx.serialization.json.JsonPrimitive(fx.serviceVersion))
+                }.toString(),
+            )
+            assertEquals(400, saveStatus, saveRaw)
+            assertEquals("unverified_domain_call_limit", errorOf(saveRaw))
+            // One call is within the limits, which still apply.
+            val one = obj(send(address, "POST", path, fx.readKey, validateBody(SCRIPT, fx.service)).second)
+            assertEquals("true", one.str("valid"), one.toString())
+            assertEquals("3", one["limits"]!!.jsonObject.str("maxCalls"))
+        } finally {
+            ServiceController.init(trustedDomainMode = true)
+        }
+
+        // Read access to the service is what it takes: a member who cannot see
+        // it gets what the service read gives them.
+        val (memberStatus, memberRaw) = send(address, "POST", path, fx.memberKey, validateBody(SCRIPT, fx.service))
+        assertEquals(send(address, "GET", "${PublicApi.V1}/services/${fx.service}", fx.memberKey).first, memberStatus, memberRaw)
+        assertEquals(404, memberStatus)
+        // Without a service, membership is enough.
+        assertEquals(200, send(address, "POST", path, fx.memberKey, validateBody(SCRIPT)).first)
+        // A malformed service id is named.
+        val (idStatus, idRaw) = send(address, "POST", path, fx.readKey, """{"script":"x","serviceId":"nope"}""")
+        assertEquals(400, idStatus, idRaw)
+        assertEquals("serviceId", obj(idRaw)["details"]!!.jsonObject.str("field"))
+    }
+
+    // ── Idempotent requests ──
+
+    /** A POST with [idempotencyKey]: its status, body, and the replay header. */
+    private fun postIdempotent(address: String, path: String, token: String, body: String, idempotencyKey: String): Triple<Int, String, String?> {
+        val request = Request.Builder().url("http://localhost:$serverPort$path")
+            .post(body.toRequestBody(jsonType))
+            .header("X-Forwarded-For", address).header("Authorization", "Bearer $token")
+            .header("Idempotency-Key", idempotencyKey)
+            .build()
+        return client.newCall(request).execute().use { Triple(it.code, it.body.string(), it.header("Idempotent-Replayed")) }
+    }
+
+    // ── Agent health ──
+
+    // ── Runs on several agents, and undelivered runs ──
+
+    @Test
+    fun `a run on several agents is done once all of its results are in, and says the worst of them`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val runId = ServiceController.triggerRun(fx.owner.orgId, fx.service, fx.owner.userId).runId
+        transaction { RunRequests.update({ RunRequests.id eq runId }) { it[expectedResults] = 2 } }
+        val startedAt = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+        val path = "${PublicApi.V1}/services/${fx.service}/runs/$runId"
+
+        insertResult(fx, runId, "success", trigger = "manual", startedAt = startedAt, runId = runId)
+        val partial = obj(send(address, "GET", path, fx.readKey).second)
+        assertEquals("pending", partial.str("state"), "one of two results is not the run: $partial")
+        assertEquals(1, partial["results"]!!.jsonArray.size)
+
+        val sibling = insertResult(fx, UUID.randomUUID(), "failure", trigger = "manual", startedAt = startedAt, runId = runId)
+        val done = obj(send(address, "GET", path, fx.readKey).second)
+        assertEquals("done", done.str("state"), done.toString())
+        assertEquals("failure", done.str("status"), "the worst of success and failure")
+        assertEquals(setOf(runId.toString(), sibling.toString()), done["results"]!!.jsonArray.map { it.jsonObject.str("id") }.toSet())
+        assertEquals(runId.toString(), done["result"]!!.jsonObject.str("id"))
+    }
+
+    // ── The raw download and the read gate ──
+
+    @Test
+    fun `HEAD on a download answers from a size lookup, without reading the body`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val reads = AtomicInteger(0)
+        val stub = object : BodyStorageClient() {
+            override fun sizeOf(uri: String): Long? = 1234
+            override fun readBytes(uri: String, maxBytes: Long): BodyStorageClient.StoredBody {
+                reads.incrementAndGet()
+                return BodyStorageClient.StoredBody.Found(ByteArray(1234), null)
+            }
+        }
+        val step = stepAt(fx, "file://${storageRoot.resolve("${fx.owner.orgId}/stubbed.bin")}")
+        withGate {
+            ProbeResultController.init(stub)
+            val request = Request.Builder().url("http://localhost:$serverPort${bodyPath(fx, step)}/raw")
+                .head().header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.readKey}").build()
+            client.newCall(request).execute().use {
+                assertEquals(200, it.code)
+                assertEquals("1234", it.header("Content-Length"))
+                assertEquals("application/octet-stream", it.header("Content-Type"))
+                assertTrue(it.header("Content-Disposition")!!.startsWith("attachment"))
+            }
+            assertEquals(0, reads.get(), "HEAD must not download the body")
+        }
+    }
+
+    /** A 24 MiB body in the default store, as a step of [fx]'s result: more than any socket buffers. */
+    private fun bigStep(fx: Fx): String {
+        val dir = Files.createDirectories(storageRoot.resolve(fx.owner.orgId.toString()))
+        val big = dir.resolve("big-${UUID.randomUUID()}.bin")
+        java.io.RandomAccessFile(big.toFile(), "rw").use { it.setLength(BIG_BODY) }
+        return "${bodyPath(fx, stepAt(fx, "file://$big"))}/raw"
+    }
+
+    private val BIG_BODY = 24L * 1024 * 1024
+
+    /** Sends a GET for [path] on a socket of its own and reads nothing back. */
+    private fun silentGet(socket: java.net.Socket, address: String, path: String, key: String) {
+        socket.getOutputStream().write(
+            ("GET $path HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: $address\r\n" +
+                "Authorization: Bearer $key\r\n\r\n").toByteArray(),
+        )
+        socket.getOutputStream().flush()
+    }
+
+    /** Polls [condition] for up to [seconds]; true once it holds. */
+    private fun eventually(seconds: Long, condition: () -> Boolean): Boolean {
+        val deadline = System.nanoTime() + Duration.ofSeconds(seconds).toNanos()
+        while (System.nanoTime() < deadline) {
+            if (condition()) return true
+            Thread.sleep(20)
+        }
+        return condition()
+    }
+
+    @Test
+    fun `a download holds its bytes in the gate until its client has them, and a steady client gets them all`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val org = fx.owner.orgId
+        val path = bigStep(fx)
+        java.net.Socket("localhost", serverPort).use { socket ->
+            socket.soTimeout = 30_000
+            silentGet(socket, address, path, fx.readKey)
+            // Read, and handed back its places — but the client has taken
+            // nothing, so the bytes stay counted against the budget.
+            assertTrue(eventually(10) {
+                val state = ProbeResultController.gateState(org)
+                state.byteUnits < ProbeResultController.idleGate.byteUnits && state.orgReads == ProbeResultController.idleGate.orgReads
+            }, "the read never got to its write: ${ProbeResultController.gateState(org)}")
+            repeat(20) {
+                Thread.sleep(100)
+                val state = ProbeResultController.gateState(org)
+                assertTrue(state.byteUnits < ProbeResultController.idleGate.byteUnits, "the bytes left the gate before the client had them: $state")
+                assertEquals(ProbeResultController.idleGate.orgReads, state.orgReads, "a waiting write holds a place: $state")
+            }
+            // A client that reads steadily, if slowly, gets every byte.
+            val input = socket.getInputStream().buffered()
+            val head = StringBuilder()
+            while (!head.endsWith("\r\n\r\n")) head.append(input.read().toChar())
+            assertTrue(head.startsWith("HTTP/1.1 200"), head.toString())
+            val length = Regex("(?i)content-length: (\\d+)").find(head)!!.groupValues[1].toLong()
+            assertEquals(BIG_BODY, length)
+            var received = 0L
+            val buffer = ByteArray(256 * 1024)
+            while (received < length) {
+                val n = input.read(buffer)
+                if (n < 0) break
+                received += n
+                Thread.sleep(2)
+            }
+            assertEquals(length, received, "the body was cut short")
+        }
+        assertTrue(eventually(5) { ProbeResultController.gateState(org) == ProbeResultController.idleGate })
+    }
+
+    @Test
+    fun `a download its client stops taking is cut off after the stall bound, and its bytes come back`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val org = fx.owner.orgId
+        val path = bigStep(fx)
+        ProbeResultController.bodyWriteStall = 2.seconds
+        try {
+            java.net.Socket("localhost", serverPort).use { socket ->
+                silentGet(socket, address, path, fx.readKey)
+                assertTrue(eventually(10) { ProbeResultController.gateState(org).byteUnits < ProbeResultController.idleGate.byteUnits })
+                val held = System.nanoTime()
+                assertTrue(eventually(15) { ProbeResultController.gateState(org) == ProbeResultController.idleGate }, "the bytes never came back")
+                assertTrue(Duration.ofNanos(System.nanoTime() - held) >= Duration.ofMillis(1500), "released before the bound")
+                socket.soTimeout = 10_000
+                val got = runCatching { socket.getInputStream().readAllBytes().size.toLong() }.getOrDefault(0L)
+                assertTrue(got < BIG_BODY, "the whole body arrived after the bound: $got")
+            }
+        } finally {
+            ProbeResultController.bodyWriteStall = ProbeResultController.BODY_WRITE_STALL
+        }
+    }
+
+    @Test
+    fun `a download read steadily but too slowly is cut off at the overall cap`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val org = fx.owner.orgId
+        val path = bigStep(fx)
+        ProbeResultController.bodyWriteCap = 3.seconds
+        try {
+            java.net.Socket("localhost", serverPort).use { socket ->
+                socket.soTimeout = 10_000
+                silentGet(socket, address, path, fx.readKey)
+                val input = socket.getInputStream()
+                val buffer = ByteArray(16 * 1024)
+                var received = 0L
+                val started = System.nanoTime()
+                // About 1 MiB a second: steady progress, far too slow for 24 MiB in 3 s.
+                while (System.nanoTime() - started < Duration.ofSeconds(12).toNanos()) {
+                    val n = runCatching { input.read(buffer) }.getOrDefault(-1)
+                    if (n < 0) break
+                    received += n
+                    Thread.sleep(15)
+                }
+                assertTrue(received < BIG_BODY, "the whole body arrived past the cap: $received")
+            }
+            assertTrue(eventually(10) { ProbeResultController.gateState(org) == ProbeResultController.idleGate })
+        } finally {
+            ProbeResultController.bodyWriteCap = ProbeResultController.BODY_WRITE_CAP
+        }
+        // The bounds themselves, without a socket.
+        ProbeResultController.bodyWriteStall = 200.milliseconds
+        try {
+            val e = assertThrows<kotlinx.coroutines.CancellationException> {
+                runBlocking {
+                    kotlinx.coroutines.withTimeout(10_000) {
+                        ProbeResultController.writeBounded { CompletableDeferred<Unit>().await() }
+                    }
+                }
+            }
+            assertTrue(dev.tracedown.gateway.util.isClientDisconnect(e), "a stalled write reads as a client gone: $e")
+            // A write that keeps making progress is not a stall.
+            runBlocking {
+                kotlinx.coroutines.withTimeout(10_000) {
+                    val progress = java.util.concurrent.atomic.AtomicLong(System.nanoTime())
+                    ProbeResultController.writeBounded(progress) {
+                        repeat(10) { kotlinx.coroutines.delay(100); progress.set(System.nanoTime()) }
+                    }
+                }
+            }
+        } finally {
+            ProbeResultController.bodyWriteStall = ProbeResultController.BODY_WRITE_STALL
+        }
+    }
+
+    @Test
+    fun `one organization's silent downloads take its share of the budget, never another's read`() {
+        val address = nextAddress()
+        val a = fixtures(address)
+        val b = fixtures(nextAddress())
+        val paths = (1..3).map { bigStep(a) }
+        val sockets = paths.map { java.net.Socket("localhost", serverPort).also { s -> silentGet(s, address, it, a.readKey) } }
+        try {
+            // Two 24 MiB downloads fill most of the organization's share; the
+            // third waits on it — and on nothing of anyone else's.
+            assertTrue(eventually(10) {
+                ProbeResultController.gateState(a.owner.orgId).orgByteUnits <= ProbeResultController.idleGate.orgByteUnits - 48
+            }, "${ProbeResultController.gateState(a.owner.orgId)}")
+            val started = System.nanoTime()
+            val (status, raw) = send(address, "GET", bodyPath(b, b.step), b.readKey)
+            assertEquals(200, status, raw)
+            assertTrue(Duration.ofNanos(System.nanoTime() - started) < Duration.ofSeconds(3), "another organization's small read was held up")
+            // The third of A's downloads is still waiting on A's share.
+            assertTrue(ProbeResultController.gateState(a.owner.orgId).orgByteUnits < 24, "${ProbeResultController.gateState(a.owner.orgId)}")
+        } finally {
+            sockets.forEach { it.close() }
+        }
+        assertTrue(eventually(30) { ProbeResultController.gateState(a.owner.orgId) == ProbeResultController.idleGate })
+    }
+    // ── Validation judges only what its caller may know ──
+
+    @Test
+    fun `validation judges with no value its caller could not read`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        // A member who may read the service, and not change it.
+        val reader = newMember(o.orgId)
+        ResourceAccessController.upsert(o.orgId, "service", fx.service, UpsertAccessRequest("user", reader.userId.toString(), 1), o.userId)
+        val readerKey = mintKey(login(reader, address), "write", address)
+        ServiceController.createVariable(o.orgId, fx.service, CreateVariableRequest("HOST", "http://10.0.0.5", "secret"), o.userId)
+        val script = "get(\"\$s.HOST/health\").expect(status: 200)"
+        val path = "${PublicApi.V1}/scripts/validate"
+        ServiceController.init(probeTargetPolicy = dev.tracedown.common.net.ProbeTargetPolicy.Mode.PUBLIC_ONLY)
+        try {
+            // The owner may save it: judged with the secret, and refused.
+            val owner = obj(send(address, "POST", path, fx.writeKey, validateBody(script, fx.service)).second)
+            assertEquals("false", owner.str("valid"))
+            assertEquals(1, owner["targets"]!!.jsonObject["blocked"]!!.jsonArray.size)
+
+            // The reader may not: the secret's host is unresolved, judged by nothing.
+            val (status, raw) = send(address, "POST", path, readerKey, validateBody(script, fx.service))
+            assertEquals(200, status, raw)
+            val answer = obj(raw)
+            assertTrue(answer["targets"]!!.jsonObject["blocked"]!!.jsonArray.isEmpty(), raw)
+            assertEquals(listOf("\$s.HOST/health"), answer["targets"]!!.jsonObject["unresolved"]!!.jsonArray.map { it.jsonPrimitive.content })
+            assertFalse("target_private_address" in raw || "10.0.0.5" in raw, raw)
+        } finally {
+            ServiceController.init(probeTargetPolicy = dev.tracedown.common.net.ProbeTargetPolicy.Mode.ALLOW_PRIVATE)
+        }
+
+        // Without a service, the organization's verified domains are judged
+        // only for a caller who may read them.
+        ServiceController.init(trustedDomainMode = false)
+        try {
+            val owner = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT)).second)
+            assertEquals("true", owner.str("domainsChecked"), owner.toString())
+            assertEquals(listOf("example.com"), owner["targets"]!!.jsonObject["unverified"]!!.jsonArray.map { it.jsonPrimitive.content })
+            val member = obj(send(address, "POST", path, fx.memberKey, validateBody(SCRIPT)).second)
+            assertEquals("false", member.str("domainsChecked"), member.toString())
+            assertTrue(member["targets"]!!.jsonObject["unverified"]!!.jsonArray.isEmpty(), member.toString())
+            assertTrue(member["limits"]!!.jsonObject["maxCalls"] is JsonNull, member.toString())
+        } finally {
+            ServiceController.init(trustedDomainMode = true)
+        }
+    }
+
+    // ── Idempotency when a call does not end cleanly ──
+
+    @Test
+    fun `an answer the engine fails to write is still the answer to a retry`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        brokenWriteCalls.set(0)
+        val path = "${PublicApi.V1}/test/broken-write"
+        runCatching { postIdempotent(address, path, fx.writeKey, "{}", "broken-1") }
+        assertEquals(1, brokenWriteCalls.get())
+        val retry = postIdempotent(address, path, fx.writeKey, "{}", "broken-1")
+        assertEquals(200, retry.first, retry.second)
+        assertEquals("true", retry.third)
+        assertEquals("""{"n":1}""", retry.second)
+        assertEquals(1, brokenWriteCalls.get(), "the work was not done twice")
+    }
+
+    // ── What an idempotent request remembers ──
+
+    /** The Redis key an `Idempotency-Key` is held under for [apiKey]. */
+    private fun idempotencyStoreKey(address: String, apiKey: String, idempotencyKey: String): String {
+        val keyId = obj(send(address, "GET", "${PublicApi.V1}/key", apiKey).second).str("id")
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(idempotencyKey.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return "idempotency:$keyId:$digest"
+    }
+
+    private val redisCommands by lazy { dev.tracedown.common.redis.RedisFactory.createConnection(TestRedis.url).sync() }
+
+    @Test
+    fun `a success is replayed, a refusal is not remembered, and the key cannot name another request`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val name = "Idempotent ${UUID.randomUUID().toString().take(6)}"
+        val path = "${PublicApi.V1}/workspaces"
+
+        val first = postIdempotent(address, path, fx.writeKey, """{"name":"$name"}""", "ws-1")
+        assertEquals(200, first.first, first.second)
+        assertNull(first.third)
+        // The body reached the handler after it was read for the fingerprint.
+        assertEquals(name, obj(first.second).str("name"))
+        val again = postIdempotent(address, path, fx.writeKey, """{"name":"$name"}""", "ws-1")
+        assertEquals(200, again.first, again.second)
+        assertEquals("true", again.third)
+        assertEquals(first.second, again.second)
+        assertEquals(1L, transaction {
+            dev.tracedown.common.models.Workspaces.selectAll().where { dev.tracedown.common.models.Workspaces.name eq name }.count()
+        })
+        // Kept a day.
+        val ttl = redisCommands.ttl(idempotencyStoreKey(address, fx.writeKey, "ws-1"))
+        assertTrue(ttl in (Idempotency.TTL_SECONDS - 60)..Idempotency.TTL_SECONDS, "ttl $ttl")
+
+        // The same key with a different request — body, or path.
+        val other = postIdempotent(address, path, fx.writeKey, """{"name":"$name 2"}""", "ws-1")
+        assertEquals(422, other.first, other.second)
+        assertEquals("idempotency_key_reused", errorOf(other.second))
+        assertEquals(422, postIdempotent(address, "${PublicApi.V1}/silences", fx.writeKey, """{"name":"$name"}""", "ws-1").first)
+
+        // Keys are the API key's own: another key may use the same one.
+        val secondKey = mintKey(fx.ownerSession, "write", address)
+        val elsewhere = postIdempotent(address, path, secondKey, """{"name":"$name b"}""", "ws-1")
+        assertEquals(200, elsewhere.first, elsewhere.second)
+        assertNull(elsewhere.third)
+
+        // A run asked for twice under one key is one run, with one handle.
+        val runPath = "${PublicApi.V1}/services/${fx.service}/run"
+        val runs = transaction { RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.count() }
+        val run1 = postIdempotent(address, runPath, fx.writeKey, "{}", "run-1")
+        val run2 = postIdempotent(address, runPath, fx.writeKey, "{}", "run-1")
+        assertEquals(202, run1.first, run1.second)
+        assertEquals("true", run2.third)
+        assertEquals(obj(run1.second).str("runId"), obj(run2.second).str("runId"))
+        assertEquals(runs + 1, transaction { RunRequests.selectAll().where { RunRequests.serviceId eq fx.service }.count() })
+
+        // A refusal did nothing: it is not remembered, and a repeat runs again.
+        val refused = postIdempotent(address, path, fx.writeKey, """{"name":""}""", "empty-name")
+        assertEquals(400, refused.first, refused.second)
+        val refusedAgain = postIdempotent(address, path, fx.writeKey, """{"name":""}""", "empty-name")
+        assertEquals(400, refusedAgain.first)
+        assertNull(refusedAgain.third)
+        assertNull(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "empty-name")))
+        // Neither is a method a path does not take.
+        val (wrongMethod, wrongRaw, _) = postIdempotent(address, "${PublicApi.V1}/services/${fx.service}/agents", fx.writeKey, "{}", "wrong-1")
+        assertEquals(405, wrongMethod, wrongRaw)
+        assertNull(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "wrong-1")))
+        // Nor a path no route takes.
+        assertEquals(404, postIdempotent(address, "${PublicApi.V1}/no-such-thing", fx.writeKey, "{}", "missing-1").first)
+        assertNull(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "missing-1")))
+
+        // Validation changes nothing and takes no key: never replayed.
+        repeat(2) {
+            val answer = postIdempotent(address, "${PublicApi.V1}/scripts/validate", fx.readKey, validateBody(SCRIPT), "v-1")
+            assertEquals(200, answer.first, answer.second)
+            assertNull(answer.third)
+        }
+
+        // A malformed key is refused, naming the header.
+        for (bad in listOf("", "x".repeat(129), "tab\there")) {
+            val (status, raw, _) = postIdempotent(address, path, fx.writeKey, """{"name":"$name bad"}""", bad)
+            assertEquals(400, status, "'$bad': $raw")
+            assertEquals("Idempotency-Key", obj(raw)["details"]!!.jsonObject.str("field"))
+        }
+        assertEquals(200, postIdempotent(address, path, fx.writeKey, """{"name":"$name max"}""", "k".repeat(128)).first)
+
+        // Query order does not matter; the content type does.
+        val bindings = "${PublicApi.V1}/webhooks/bindings"
+        val body = """{"webhookId":"${fx.spareWebhook}"}"""
+        val bound = postIdempotent(address, "$bindings?resourceType=service&resourceId=${fx.service}", fx.writeKey, body, "order-1")
+        val reordered = postIdempotent(address, "$bindings?resourceId=${fx.service}&resourceType=service", fx.writeKey, body, "order-1")
+        assertEquals(bound.first, reordered.first, reordered.second)
+        assertEquals("true", reordered.third)
+        val asText = Request.Builder().url("http://localhost:$serverPort$bindings?resourceType=service&resourceId=${fx.service}")
+            .post(body.toRequestBody("text/plain".toMediaType()))
+            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+            .header("Idempotency-Key", "order-1").build()
+        client.newCall(asText).execute().use { assertEquals(422, it.code) }
+    }
+
+    @Test
+    fun `a server error is not remembered, and one in flight holds its key`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        flakyCalls.set(0)
+        val flaky = "${PublicApi.V1}/test/flaky"
+        assertEquals(500, postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1").first)
+        val second = postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1")
+        assertEquals(200, second.first, second.second)
+        assertNull(second.third, "a 5xx is not an answer to replay: the request runs again")
+        val third = postIdempotent(address, flaky, fx.writeKey, "{}", "flaky-1")
+        assertEquals("true", third.third)
+        assertEquals(second.second, third.second)
+        assertEquals(2, flakyCalls.get())
+
+        slowEntered = CompletableDeferred()
+        slowRelease = CompletableDeferred()
+        val slow = "${PublicApi.V1}/test/slow"
+        val inFlight = java.util.concurrent.CompletableFuture.supplyAsync { postIdempotent(address, slow, fx.writeKey, "{}", "slow-1") }
+        try {
+            runBlocking { kotlinx.coroutines.withTimeout(10_000) { slowEntered.await() } }
+            // The marker stands a day, so a request that never comes back is never run again.
+            val ttl = redisCommands.ttl(idempotencyStoreKey(address, fx.writeKey, "slow-1"))
+            assertTrue(ttl in (Idempotency.TTL_SECONDS - 60)..Idempotency.TTL_SECONDS, "marker ttl $ttl")
+            val request = Request.Builder().url("http://localhost:$serverPort$slow").post("{}".toRequestBody(jsonType))
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+                .header("Idempotency-Key", "slow-1").build()
+            client.newCall(request).execute().use {
+                assertEquals(409, it.code)
+                assertEquals("idempotency_in_progress", errorOf(it.body.string()))
+                assertEquals("1", it.header("Retry-After"))
+            }
+        } finally {
+            slowRelease.complete(Unit)
+        }
+        assertEquals(200, inFlight.get(10, java.util.concurrent.TimeUnit.SECONDS).first)
+        assertEquals("true", postIdempotent(address, slow, fx.writeKey, "{}", "slow-1").third)
+    }
+
+    @Test
+    fun `a client that hangs up after the work leaves an unknown outcome, never a second run`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        hangupCalls.set(0)
+        hangupRelease = CompletableDeferred()
+        val impatient = client.newBuilder().callTimeout(Duration.ofMillis(800)).build()
+        val request = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/test/hangup")
+            .post("{}".toRequestBody(jsonType))
+            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+            .header("Idempotency-Key", "hangup-1").build()
+        assertTrue(runCatching { impatient.newCall(request).execute().close() }.isFailure, "the client was meant to give up")
+        assertTrue(eventually(5) { hangupCalls.get() == 1 })
+        val storeKey = idempotencyStoreKey(address, fx.writeKey, "hangup-1")
+        // Decided once the call is cut off: an unknown outcome, kept a day.
+        assertTrue(eventually(10) { redisCommands.get(storeKey)?.contains("\"unknown\"") == true }, "${redisCommands.get(storeKey)}")
+        assertTrue(redisCommands.ttl(storeKey) > Idempotency.IN_FLIGHT_TTL_SECONDS, "held past the in-flight bound")
+        val (status, raw, _) = postIdempotent(address, "${PublicApi.V1}/test/hangup", fx.writeKey, "{}", "hangup-1")
+        assertEquals(409, status, raw)
+        assertEquals("idempotency_outcome_unknown", errorOf(raw))
+        assertEquals(1, hangupCalls.get())
+        hangupRelease.complete(Unit)
+    }
+
+    @Test
+    fun `an answer too large to keep says so, and a repeat is not made`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        bigCalls.set(0)
+        val path = "${PublicApi.V1}/test/big"
+        val request = Request.Builder().url("http://localhost:$serverPort$path").post("{}".toRequestBody(jsonType))
+            .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+            .header("Idempotency-Key", "big-1").build()
+        client.newCall(request).execute().use {
+            assertEquals(200, it.code)
+            assertEquals("not-kept", it.header("Idempotency-Status"))
+        }
+        val (status, raw, _) = postIdempotent(address, path, fx.writeKey, "{}", "big-1")
+        assertEquals(409, status, raw)
+        assertEquals("idempotency_outcome_unknown", errorOf(raw))
+        assertEquals(1, bigCalls.get())
+    }
+
+    @Test
+    fun `a request still marked as running past the in-flight bound is never run again`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        flakyCalls.set(0)
+        val path = "${PublicApi.V1}/test/flaky"
+        // The marker a request left that never came back, from before the bound.
+        val first = postIdempotent(address, path, fx.writeKey, "{}", "old-1")
+        assertEquals(500, first.first)
+        val storeKey = idempotencyStoreKey(address, fx.writeKey, "old-1")
+        val fingerprintOf = postIdempotent(address, path, fx.writeKey, "{}", "probe-fp")
+        val fp = Json.parseToJsonElement(redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "probe-fp"))!!).jsonObject.str("fp")
+        assertEquals(200, fingerprintOf.first)
+        val calls = flakyCalls.get()
+        redisCommands.set(
+            storeKey,
+            """{"state":"pending","fp":"$fp","token":"gone","startedAt":${System.currentTimeMillis() / 1000 - Idempotency.IN_FLIGHT_TTL_SECONDS - 60}}""",
+        )
+        val (status, raw, _) = postIdempotent(address, path, fx.writeKey, "{}", "old-1")
+        assertEquals(409, status, raw)
+        assertEquals("idempotency_outcome_unknown", errorOf(raw))
+        assertEquals(calls, flakyCalls.get(), "the handler ran again")
+    }
+
+    @Test
+    fun `an unknown outcome is charged to the budget, at the size kept`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val budgetKey = "idempotency_bytes:${fx.owner.orgId}"
+        redisCommands.del(budgetKey)
+        postIdempotent(address, "${PublicApi.V1}/test/big", fx.writeKey, "{}", "charge-1")
+        val charged = redisCommands.get(budgetKey)?.toLong() ?: 0L
+        val kept = redisCommands.get(idempotencyStoreKey(address, fx.writeKey, "charge-1"))!!
+        assertEquals(kept.length.toLong(), charged, "charged at the stored record's size")
+        val window = redisCommands.ttl(budgetKey)
+        assertTrue(window in 1..Idempotency.TTL_SECONDS, "a window of a day from the first charge: $window")
+    }
+
+    @Test
+    fun `past the organization's budget a new key is refused before anything runs`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val path = "${PublicApi.V1}/workspaces"
+        Idempotency.orgBudgetBytes = 1
+        try {
+            val first = postIdempotent(address, path, fx.writeKey, """{"name":"Budget 1"}""", "b-1")
+            assertEquals(200, first.first, first.second)
+            val request = Request.Builder().url("http://localhost:$serverPort$path").post("""{"name":"Budget 2"}""".toRequestBody(jsonType))
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+                .header("Idempotency-Key", "b-2").build()
+            client.newCall(request).execute().use {
+                assertEquals(429, it.code)
+                assertEquals("idempotency_limit_reached", errorOf(it.body.string()))
+                assertTrue((it.header("Retry-After")?.toLong() ?: 0) > 0)
+            }
+            assertEquals(0L, transaction {
+                dev.tracedown.common.models.Workspaces.selectAll().where { dev.tracedown.common.models.Workspaces.name eq "Budget 2" }.count()
+            }, "refused before it ran")
+            // What was kept is still answered; a request with no key is not affected.
+            assertEquals("true", postIdempotent(address, path, fx.writeKey, """{"name":"Budget 1"}""", "b-1").third)
+            assertEquals(200, send(address, "POST", path, fx.writeKey, """{"name":"Budget 3"}""").first)
+        } finally {
+            Idempotency.orgBudgetBytes = Idempotency.DEFAULT_ORG_BUDGET_BYTES
+        }
+    }
+
+    @Test
+    fun `when the store does not answer, a request with a key is refused and does not run`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val name = "Unavailable ${UUID.randomUUID().toString().take(6)}"
+        Idempotency.init({ throw io.lettuce.core.RedisConnectionException("down") }, 1024 * 1024)
+        try {
+            val request = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/workspaces")
+                .post("""{"name":"$name"}""".toRequestBody(jsonType))
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.writeKey}")
+                .header("Idempotency-Key", "down-1").build()
+            client.newCall(request).execute().use {
+                assertEquals(503, it.code)
+                assertEquals("idempotency_unavailable", errorOf(it.body.string()))
+                assertEquals("5", it.header("Retry-After"))
+            }
+            assertEquals(0L, transaction {
+                dev.tracedown.common.models.Workspaces.selectAll().where { dev.tracedown.common.models.Workspaces.name eq name }.count()
+            })
+        } finally {
+            Idempotency.init({ redisCommands }, 1024 * 1024)
+        }
+    }
+
+    @Test
+    fun `a body cache predicate a host registers makes another body readable twice`() = io.ktor.server.testing.testApplication {
+        dev.tracedown.gateway.util.RequestBodyCache.cacheAlso { it.request.local.uri == "/host/twice" }
+        try {
+            application {
+                dev.tracedown.gateway.util.RequestBodyCache.install(this, 1024)
+                routing {
+                    post("/host/twice") {
+                        val a = call.receiveText()
+                        val b = call.receiveText()
+                        call.respondText("$a|$b")
+                    }
+                    post("/host/once") {
+                        val a = call.receiveText()
+                        val b = runCatching { call.receiveText() }.getOrElse { "refused" }
+                        call.respondText("$a|$b")
+                    }
+                }
+            }
+            assertEquals("x|x", client.post("/host/twice") { setBody("x") }.bodyAsText())
+            assertEquals("x|refused", client.post("/host/once") { setBody("x") }.bodyAsText())
+        } finally {
+            dev.tracedown.gateway.util.RequestBodyCache.clearAll()
+        }
+    }
+
+    // ── Agent health ──
+
+    @Test
+    fun `agents say how they are doing, as the dashboard's roster does, and an unchecked one says unknown`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val tag = UUID.randomUUID().toString().take(6)
+        val checkedAt = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+        val agents = mapOf("ok-$tag" to "success", "down-$tag" to "failure", "late-$tag" to "timeout", "new-$tag" to "success")
+        transaction {
+            for ((slug, status) in agents) {
+                val id = ProbeAgents.insert {
+                    it[ProbeAgents.slug] = slug
+                    it[label] = slug
+                    it[agentUri] = "https://$slug.example.com:8443"
+                    it[publicKey] = "unused"
+                    it[isActive] = true
+                    it[lastPing] = checkedAt
+                    it[lastStatus] = status
+                    it[lastPingDelayMs] = 0
+                    it[lastPongDeltaMs] = 0
+                    it[createdAt] = Instant.now()
+                }[ProbeAgents.id]
+                // Every one but the new one has had a health round.
+                if (!slug.startsWith("new-")) {
+                    dev.tracedown.common.models.AgentHealthChecks.insert {
+                        it[dev.tracedown.common.models.AgentHealthChecks.id] = UUID.randomUUID()
+                        it[probeAgentId] = id
+                        it[challengeId] = UUID.randomUUID().toString()
+                        it[challengedAt] = checkedAt
+                        it[result] = if (status == "success") "pass" else "fail"
+                        it[dev.tracedown.common.models.AgentHealthChecks.createdAt] = checkedAt
+                    }
+                }
+            }
+        }
+        try {
+            val listed = Json.parseToJsonElement(send(address, "GET", "${PublicApi.V1}/agents", fx.readKey).second).jsonArray
+                .map { it.jsonObject }.associateBy { it.str("slug") }
+            assertEquals("healthy", listed.getValue("ok-$tag").str("status"))
+            assertEquals("down", listed.getValue("down-$tag").str("status"))
+            assertEquals("down", listed.getValue("late-$tag").str("status"))
+            assertEquals(checkedAt, Instant.parse(listed.getValue("ok-$tag").str("lastCheckAt")))
+            // Registered, never checked: its last ping is its registration.
+            assertEquals("unknown", listed.getValue("new-$tag").str("status"))
+            assertTrue(listed.getValue("new-$tag")["lastCheckAt"] is JsonNull)
+            // The dashboard's roster, for the checked agents: the same verdicts.
+            val roster = obj(send(address, "GET", "/api/v1/agents/health", fx.ownerSession).second)["statuses"]!!.jsonArray
+                .map { it.jsonObject }.filter { it.str("agentSlug").endsWith(tag) && !it.str("agentSlug").startsWith("new-") }
+            assertEquals(3, roster.size)
+            for (entry in roster) {
+                assertEquals(
+                    dev.tracedown.gateway.controllers.agents.AgentDirectory.health(entry.str("status"), entry.str("degraded").toBoolean()),
+                    listed.getValue(entry.str("agentSlug")).str("status"),
+                )
+            }
+        } finally {
+            transaction {
+                val ids = ProbeAgents.select(ProbeAgents.id).where { ProbeAgents.slug inList agents.keys }.map { it[ProbeAgents.id] }
+                dev.tracedown.common.models.AgentHealthChecks.deleteWhere { probeAgentId inList ids }
+                ProbeAgents.deleteWhere { ProbeAgents.slug inList agents.keys }
+            }
+        }
+        assertEquals("degraded", dev.tracedown.gateway.controllers.agents.AgentDirectory.health("success", true))
+        assertEquals("unknown", dev.tracedown.gateway.controllers.agents.AgentDirectory.health(null, false))
+    }
+
+    // ── Run handles: delivery, bounds, retention, siblings ──
+
+    @Test
+    fun `a run no scheduler heard is settled at once, and one whose publish failed is not`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        stopListeningForRuns()
+        try {
+            // Redis must have seen the subscriber go before it can say nobody listens.
+            assertTrue(eventually(5) {
+                redisCommands.pubsubNumsub(dev.tracedown.common.runs.RunTrigger.RUN_CHANNEL).values.sum() == 0L
+            })
+            val (status, raw) = send(address, "POST", "${PublicApi.V1}/services/${fx.service}/run", fx.writeKey)
+            assertEquals(202, status, raw)
+            val run = obj(send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/${obj(raw).str("runId")}", fx.readKey).second)
+            assertEquals("skipped", run.str("state"), run.toString())
+            assertEquals("run_not_delivered", run.str("reason"))
+            assertTrue(run["result"] is JsonNull, run.toString())
+        } finally {
+            listenForRuns()
+        }
+        // Redis did not answer: whether anyone heard is not known, and the handle waits.
+        dev.tracedown.gateway.util.ScheduleNudge.init { throw io.lettuce.core.RedisConnectionException("down") }
+        try {
+            val runId = ServiceController.triggerRun(fx.owner.orgId, fx.service, fx.owner.userId).runId
+            assertEquals("pending", RunRequestController.status(fx.owner.orgId, fx.service, runId, fx.owner.userId).state)
+        } finally {
+            dev.tracedown.gateway.util.ScheduleNudge.init { redisCommands }
+        }
+    }
+
+    @Test
+    fun `a run is pending up to its bound and expired past it, and is kept as long as the result window`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        val runId = ServiceController.triggerRun(o.orgId, fx.service, o.userId).runId
+        val requestedAt = transaction { RunRequests.selectAll().where { RunRequests.id eq runId }.single()[RunRequests.requestedAt] }
+        val bound = Duration.ofSeconds(dev.tracedown.common.runs.RunBounds.runExpirySeconds(30_000))
+        assertEquals("pending", RunRequestController.status(o.orgId, fx.service, runId, o.userId, requestedAt.plus(bound)).state)
+        assertEquals("expired", RunRequestController.status(o.orgId, fx.service, runId, o.userId, requestedAt.plus(bound).plusSeconds(1)).state)
+
+        // Kept as long as the organization's result window — the global one here.
+        transaction {
+            assertEquals(
+                requestedAt.plus(90, java.time.temporal.ChronoUnit.DAYS),
+                RunRequests.selectAll().where { RunRequests.id eq runId }.single()[RunRequests.purgeAfter],
+            )
+        }
+        // An organization whose results are kept for ever keeps its handles for ever.
+        val previous = dev.tracedown.common.config.PlatformDefaults.retentionConfig
+        dev.tracedown.common.config.PlatformDefaults.retentionConfig = object : dev.tracedown.common.config.RetentionConfig by previous {
+            override fun resultRetentionDays(orgId: UUID): Int? = if (orgId == o.orgId) -1 else previous.resultRetentionDays(orgId)
+        }
+        try {
+            val forever = ServiceController.triggerRun(o.orgId, fx.service, o.userId).runId
+            transaction { assertNull(RunRequests.selectAll().where { RunRequests.id eq forever }.single()[RunRequests.purgeAfter]) }
+        } finally {
+            dev.tracedown.common.config.PlatformDefaults.retentionConfig = previous
+        }
+
+        // The worst result is the run's, over the whole order.
+        val order = listOf("failure", "timeout", "error", "skipped", "success")
+        for (i in order.indices) {
+            assertEquals(order[i], RunRequestController.worstOf(order.drop(i).shuffled()), "worst of ${order.drop(i)}")
+        }
+        assertEquals("brand-new", RunRequestController.worstOf(listOf("failure", "brand-new")), "an unknown status counts as the worst")
+        assertNull(RunRequestController.worstOf(emptyList()))
+    }
+
+    @Test
+    fun `a run whose own row is missing is told by its siblings`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val runId = ServiceController.triggerRun(fx.owner.orgId, fx.service, fx.owner.userId).runId
+        transaction { RunRequests.update({ RunRequests.id eq runId }) { it[expectedResults] = 2 } }
+        val sibling = insertResult(fx, UUID.randomUUID(), "success", trigger = "manual", runId = runId)
+        val run = obj(send(address, "GET", "${PublicApi.V1}/services/${fx.service}/runs/$runId", fx.readKey).second)
+        assertEquals(listOf(sibling.toString()), run["results"]!!.jsonArray.map { it.jsonObject.str("id") })
+        assertEquals(sibling.toString(), run["result"]!!.jsonObject.str("id"))
+    }
+
+    @Test
+    fun `a download is never kept on the way`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        for (method in listOf("GET", "HEAD")) {
+            val request = Request.Builder().url("http://localhost:$serverPort${bodyPath(fx, fx.step)}/raw")
+                .method(method, null).header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.readKey}").build()
+            client.newCall(request).execute().use {
+                assertEquals(200, it.code, method)
+                assertEquals("private, no-store", it.header("Cache-Control"), method)
+            }
+        }
+    }
+
+    // ── Validation and verified domains ──
+
+    @Test
+    fun `verified-domain coverage is judged only for those who may read the domains, and only over hosts known`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner
+        val reader = newMember(o.orgId)
+        ResourceAccessController.upsert(o.orgId, "service", fx.service, UpsertAccessRequest("user", reader.userId.toString(), 1), o.userId)
+        val readerKey = mintKey(login(reader, address), "write", address)
+        ServiceController.createVariable(o.orgId, fx.service, CreateVariableRequest("BASE", "https://example.org", "secret"), o.userId)
+        val path = "${PublicApi.V1}/scripts/validate"
+        val concealed = (1..4).joinToString("\n") { "get(\"\$s.BASE/$it\").expect(status: 200)" }
+        ServiceController.init(trustedDomainMode = false)
+        try {
+            // A reader of the service, with no domains read: coverage not judged, so not complete.
+            val asReader = obj(send(address, "POST", path, readerKey, validateBody(SCRIPT, fx.service)).second)
+            assertEquals("false", asReader.str("domainsChecked"), asReader.toString())
+            assertEquals("false", asReader.str("complete"), asReader.toString())
+            // Hosts it cannot see are not held against the script: nothing made up.
+            val hidden = obj(send(address, "POST", path, readerKey, validateBody(concealed, fx.service)).second)
+            assertEquals("true", hidden.str("valid"), hidden.toString())
+            assertEquals("false", hidden.str("complete"))
+            assertFalse(hidden["errors"]!!.jsonArray.any { it.jsonObject.str("code").startsWith("unverified_domain") }, hidden.toString())
+            // The owner sees it all: judged, and complete.
+            val asOwner = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT, fx.service)).second)
+            assertEquals("true", asOwner.str("domainsChecked"))
+            assertEquals("true", asOwner.str("complete"))
+            // Without a service there is no schedule: the interval rule is not judged.
+            val noService = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT)).second)
+            assertEquals("true", noService.str("domainsChecked"))
+            assertEquals("false", noService.str("complete"), noService.toString())
+        } finally {
+            ServiceController.init(trustedDomainMode = true)
+        }
+        // With verified domains not asked for, there is nothing more to judge.
+        val trusted = obj(send(address, "POST", path, fx.writeKey, validateBody(SCRIPT, fx.service)).second)
+        assertEquals("true", trusted.str("complete"))
+    }
+
     // ── The description ──
 
     @Test
@@ -2186,6 +4562,22 @@ class ApiKeyResourcesTest {
             assertFalse(url.contains("://"), "Absolute server URL in the description: $url")
         }
         assertTrue(doc["tags"]!!.jsonArray.isNotEmpty())
+        // The download answers bytes, as an attachment.
+        val raw200 = paths["${PublicApi.V1}/services/{id}/results/{resultId}/steps/{stepId}/body/raw"]!!.jsonObject["get"]!!
+            .jsonObject["responses"]!!.jsonObject["200"]!!.jsonObject
+        assertEquals(setOf("application/octet-stream"), raw200["content"]!!.jsonObject.keys)
+        val binary = raw200["content"]!!.jsonObject["application/octet-stream"]!!.jsonObject["schema"]!!.jsonObject
+        assertEquals("string", binary.str("type"))
+        assertEquals("binary", binary.str("format"))
+        assertTrue("Content-Disposition" in raw200["headers"]!!.jsonObject, raw200.toString())
+        // An idempotent operation says how a replay is marked; `status` is a list of its values.
+        val create = paths["${PublicApi.V1}/workspaces"]!!.jsonObject["post"]!!.jsonObject
+        assertTrue("Idempotent-Replayed" in create["responses"]!!.jsonObject["200"]!!.jsonObject["headers"]!!.jsonObject)
+        assertTrue(create["parameters"]!!.jsonArray.any { it.jsonObject.str("name") == "Idempotency-Key" && it.jsonObject.str("in") == "header" })
+        val statusParam = paths["${PublicApi.V1}/services/{id}/results"]!!.jsonObject["get"]!!.jsonObject["parameters"]!!.jsonArray
+            .map { it.jsonObject }.single { it.str("name") == "status" }
+        assertEquals("array", statusParam["schema"]!!.jsonObject.str("type"))
+        assertEquals(5, statusParam["schema"]!!.jsonObject["items"]!!.jsonObject["enum"]!!.jsonArray.size)
         assertEquals("https://tracedown.dev/guide/api/", doc["externalDocs"]!!.jsonObject.str("url"))
         // Timestamps the API keeps numeric say what they are.
         assertTrue("epoch seconds" in raw && "int64" in raw, "The epoch-second fields are not documented")
@@ -2195,7 +4587,7 @@ class ApiKeyResourcesTest {
     }
 
     /** The writes that take no body: a run is asked for, not described. */
-    private val BODILESS_WRITES = setOf("runService")
+    private val BODILESS_WRITES = setOf("runService", "dismissAlert", "bindProjectNotificationTemplate")
 
     private val HTTP_METHODS = setOf("get", "put", "post", "delete", "patch", "head", "options")
 }

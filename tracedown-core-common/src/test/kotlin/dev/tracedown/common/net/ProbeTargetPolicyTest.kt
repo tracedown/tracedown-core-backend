@@ -246,6 +246,22 @@ class ProbeTargetPolicyTest {
     }
 
     @Test
+    fun `every refusal is reported with its call, and the first is the one a save makes`() {
+        val script = "get(\"https://example.com/\")\n" +
+            "get(\"http://10.0.0.1/a\")\n" +
+            "get(\"ftp://example.com/b\")"
+        val all = ProbeTargetPolicy.refusalsBySyntax(script, emptyMap(), publicOnly)
+        assertEquals(listOf(1, 2), all.map { it.callIndex })
+        assertEquals(
+            listOf(ProbeTargetPolicy.REASON_PRIVATE_ADDRESS, ProbeTargetPolicy.REASON_SCHEME),
+            all.map { it.reason },
+        )
+        assertEquals(listOf("http://10.0.0.1/a", "ftp://example.com/b"), all.map { it.source })
+        assertEquals(all.first(), ProbeTargetPolicy.evaluateSyntax(script, emptyMap(), publicOnly))
+        assertTrue(ProbeTargetPolicy.refusalsBySyntax("get(\"https://example.com/\")", emptyMap(), publicOnly).isEmpty())
+    }
+
+    @Test
     fun `a refusal names the target as written, never as substituted`() {
         // The substituted URL may carry a decrypted value; only `source`, the
         // call as written, is kept to be logged.

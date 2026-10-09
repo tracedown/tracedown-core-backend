@@ -29,9 +29,14 @@ import dev.tracedown.gateway.util.GoneException
 import dev.tracedown.gateway.util.NotFoundException
 import dev.tracedown.gateway.util.ResourceResolver
 import dev.tracedown.gateway.util.requireCachedPermissions
+import io.ktor.http.ContentDisposition
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondBytes
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.time.Instant
@@ -42,8 +47,16 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.async
+import io.ktor.http.content.OutgoingContent
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
@@ -59,6 +72,8 @@ import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.greater
 import org.jetbrains.exposed.v1.core.greaterEq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.lessEq
 import org.jetbrains.exposed.v1.jdbc.andWhere
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -84,19 +99,47 @@ object ProbeResultController {
     }
 
     /**
-     * Lists probe results for a service, ordered by most recent first (ties by
-     * id). [since], when given, keeps only results started at or after it,
-     * floored to the second the start times are kept to.
+     * Which of a service's results a list keeps, and in which order. Every
+     * bound is optional. [since] and [until] are compared to the second the
+     * start times are kept to (both inclusive); [statuses] and [trigger] keep
+     * the results with one of those values. [ascending] lists oldest first;
+     * either way ties go by id in the same direction.
+     *
+     * Every shape is served by `idx_probe_results_service (service_id,
+     * started_at DESC)`: the time bounds are a range on it, `ascending` reads
+     * it backwards, and status and trigger are filters on the rows that range
+     * yields. No index of their own — `probe_results` is big, and a filter on
+     * a handful of values inside one service's range does not need one.
      */
-    fun list(orgId: UUID, serviceId: UUID, userId: UUID, pfs: PfsParams, since: Instant? = null): Page<ProbeResultSummary> {
-        return transaction {
-            val ctx = ResourceResolver.resolveService(serviceId, orgId)
-            val cached = requireCachedPermissions(orgId, userId)
-            val parentChain = listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
-            if (!canAccessResource(cached, "service", ctx.serviceId, parentChain)) {
-                throw NotFoundException()
-            }
+    /** The values `probe_results.status` takes: what the results list's `status` filter accepts. */
+    val STATUSES = listOf("success", "failure", "timeout", "error", "skipped")
 
+    /** What the results list's `order` accepts; the first is the default. */
+    val ORDERS = listOf("desc", "asc")
+
+    data class ResultFilter(
+        val since: Instant? = null,
+        val until: Instant? = null,
+        val statuses: Set<String> = emptySet(),
+        val trigger: String? = null,
+        val ascending: Boolean = false,
+    )
+
+    /**
+     * Lists probe results for a service, ordered by most recent first (ties by
+     * id) unless [filter] asks for oldest first, and narrowed by it.
+     */
+    fun list(
+        orgId: UUID,
+        serviceId: UUID,
+        userId: UUID,
+        pfs: PfsParams,
+        filter: ResultFilter = ResultFilter(),
+    ): Page<ProbeResultSummary> {
+        return transaction {
+            requireResultsRead(orgId, serviceId, userId)
+
+            val order = if (filter.ascending) SortOrder.ASC else SortOrder.DESC
             val query = ProbeResults
                 .join(ProbeAgents, JoinType.LEFT, ProbeResults.probeAgentId, ProbeAgents.id)
                 .select(ProbeResults.columns + ProbeAgents.slug)
@@ -104,23 +147,41 @@ object ProbeResultController {
                     (ProbeResults.serviceId eq serviceId) and
                         (ProbeResults.organizationId eq orgId)
                 }
-                .orderBy(ProbeResults.startedAt to SortOrder.DESC, ProbeResults.id to SortOrder.DESC)
-            // Run times are stored to the second; a `since` with a fraction would
-            // miss a run started in its own second.
-            if (since != null) query.andWhere { ProbeResults.startedAt greaterEq since.truncatedTo(ChronoUnit.SECONDS) }
+                .orderBy(ProbeResults.startedAt to order, ProbeResults.id to order)
+            // Run times are stored to the second; a bound with a fraction would
+            // miss (or, for `until`, cut short) a run started in its own second.
+            filter.since?.let { since -> query.andWhere { ProbeResults.startedAt greaterEq since.truncatedTo(ChronoUnit.SECONDS) } }
+            filter.until?.let { until -> query.andWhere { ProbeResults.startedAt lessEq until.truncatedTo(ChronoUnit.SECONDS) } }
+            if (filter.statuses.isNotEmpty()) query.andWhere { ProbeResults.status inList filter.statuses }
+            filter.trigger?.let { trigger -> query.andWhere { ProbeResults.trigger eq trigger } }
 
             val (pagedQuery, total) = query.applyPfs(pfs)
-            val items = pagedQuery.map { row ->
-                ProbeResultSummary(
-                    id = row[ProbeResults.id].toString(),
-                    status = row[ProbeResults.status],
-                    runDurationMs = row[ProbeResults.runDurationMs],
-                    totalResponseMs = row[ProbeResults.totalResponseMs],
-                    startedAt = row[ProbeResults.startedAt].toString(),
-                    agentSlug = row[ProbeAgents.slug],
-                )
-            }
+            val items = pagedQuery.map(::summaryOf)
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /** A result row (joined with its agent's slug) as the list shows it. */
+    internal fun summaryOf(row: org.jetbrains.exposed.v1.core.ResultRow) = ProbeResultSummary(
+        id = row[ProbeResults.id].toString(),
+        status = row[ProbeResults.status],
+        runDurationMs = row[ProbeResults.runDurationMs],
+        totalResponseMs = row[ProbeResults.totalResponseMs],
+        startedAt = row[ProbeResults.startedAt].toString(),
+        agentSlug = row[ProbeAgents.slug],
+        trigger = row[ProbeResults.trigger],
+    )
+
+    /**
+     * Read access to a service's results for [userId] — 404 when the service
+     * is not theirs to see, as for the service itself. Inside a transaction.
+     */
+    internal fun requireResultsRead(orgId: UUID, serviceId: UUID, userId: UUID) {
+        val ctx = ResourceResolver.resolveService(serviceId, orgId)
+        val cached = requireCachedPermissions(orgId, userId)
+        val parentChain = listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}")
+        if (!canAccessResource(cached, "service", ctx.serviceId, parentChain)) {
+            throw NotFoundException()
         }
     }
 
@@ -203,6 +264,7 @@ object ProbeResultController {
                 agentSlug = row[ProbeAgents.slug],
                 rawResult = row[ProbeResults.rawResult],
                 steps = steps,
+                trigger = row[ProbeResults.trigger],
             )
         }
     }
@@ -324,7 +386,12 @@ object ProbeResultController {
             }
             bodyStoreId?.let(BodyStoreService::clearFailure)
             when (read) {
-                is BodyStorageClient.StoredBody.Found -> use(publicContent(read.bytes, read.contentType))
+                is BodyStorageClient.StoredBody.Found -> {
+                    // Read: the places go back, the bytes stay reserved until
+                    // the answer is written.
+                    hold.releasePlaces()
+                    use(publicContent(read.bytes, read.contentType))
+                }
                 BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
                 is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(
                     HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
@@ -340,11 +407,260 @@ object ProbeResultController {
      * read gate ([readStepBody]). Taking the call is the point: the answer
      * cannot be sent from anywhere but inside the gate.
      */
-    suspend fun respondStepBody(call: ApplicationCall, orgId: UUID, serviceId: UUID, resultId: UUID, stepId: UUID, userId: UUID) {
+    suspend fun respondStepBody(
+        call: ApplicationCall,
+        orgId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+        stepId: UUID,
+        userId: UUID,
+        headOnly: Boolean = false,
+    ) {
+        // HEAD: from a stat, as for the download — the answer's size is not
+        // known without encoding the body, so none is given.
+        if (headOnly) {
+            respondHead(call, orgId, serviceId, resultId, stepId, userId, PUBLIC_BODY_INLINE_MAX) { _, _ ->
+                SizedHead(null, ContentType.Application.Json)
+            }
+            return
+        }
         readStepBody(orgId, serviceId, resultId, stepId, userId) { body ->
             insideGateProbe?.invoke()
-            if (body == null) call.respond(HttpStatusCode.NoContent, "") else call.respond(body)
+            if (body == null) {
+                call.respond(HttpStatusCode.NoContent, "")
+            } else {
+                // Encoded here and streamed, so the answer is written under
+                // the gate's bytes rather than handed whole to the engine.
+                val encoded = publicJson.encodeToString(StepBodyContent.serializer(), body).toByteArray()
+                respondStreamed(call, encoded, ContentType.Application.Json)
+            }
         }
+    }
+
+    /**
+     * Answers a HEAD on a step's body from a size (and type) lookup — nothing
+     * is downloaded — with the same 204, 410, 413 and 503 the read gives.
+     * [answer] builds the headers from the size and the stored type.
+     */
+    private suspend fun respondHead(
+        call: ApplicationCall,
+        orgId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+        stepId: UUID,
+        userId: UUID,
+        cap: Long,
+        answer: (Long, String?) -> OutgoingContent,
+    ) {
+        val (storageUrl, bodyStoreId) = locateStepBody(orgId, serviceId, resultId, stepId, userId)
+        if (storageUrl == null) {
+            call.respond(HttpStatusCode.NoContent, "")
+            return
+        }
+        val store = bodyStoreId?.let { BodyStoreRegistry.load(it) ?: throw GoneException(ErrorCodes.BODY_GONE) }
+        if (store == null && storageClient == null) throw GoneException(ErrorCodes.BODY_GONE)
+        val stat = gated(store?.organizationId ?: orgId, bodyStoreId) { hold ->
+            val client = if (store != null) storeClient(store) else storageClient!!
+            readingFrom(bodyStoreId, storageUrl) { hold.onIo { client.statOf(storageUrl) } }
+        } ?: throw GoneException(ErrorCodes.BODY_GONE)
+        bodyStoreId?.let(BodyStoreService::clearFailure)
+        if (stat.size > cap) throw ApiException(
+            HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
+            details = buildJsonObject { put("maxBytes", cap) },
+        )
+        call.respond(answer(stat.size, stat.contentType))
+    }
+
+    /**
+     * Answers [call] with [bytes] streamed to the client, for a body read that
+     * still holds its byte units in the gate (the caller's [GateHold]) — and
+     * keeps holding them until the engine has handed the last byte to the
+     * connection, not merely until the answer is queued.
+     *
+     * What bounds memory is that wait, not the chunking: Ktor's response
+     * channel takes about a megabyte before a flush suspends and its reader
+     * another, so a small body is "written" at once whatever the client does.
+     * Only the engine's own write job ([engineWriteJob]) finishing says the
+     * bytes have left the process (into the kernel's send buffer, which is the
+     * connection's, not the heap's). Until then they count against the gate:
+     * [CONCURRENT_BODY_BYTES] in all, [CONCURRENT_BODY_BYTES_PER_ORG] for any
+     * one organization.
+     *
+     * Bounded by [writeBounded]: [bodyWriteStall] without a chunk taken, or
+     * [bodyWriteCap] in all.
+     */
+    private suspend fun respondStreamed(call: ApplicationCall, bytes: ByteArray, type: ContentType) {
+        val progress = AtomicLong(System.nanoTime())
+        writeBounded(progress) {
+            call.respond(StreamedBody(bytes, type, progress))
+            engineWriteJob(call)?.join()
+        }
+    }
+
+    /**
+     * The engine's job that writes [call]'s answer to the connection, when
+     * the engine has one (Netty); null otherwise, and then the wait ends when
+     * the answer is queued.
+     */
+    private fun engineWriteJob(call: ApplicationCall): kotlinx.coroutines.Job? {
+        var engineCall: Any = call
+        if (engineCall is io.ktor.server.routing.RoutingCall) engineCall = engineCall.pipelineCall
+        if (engineCall is io.ktor.server.routing.RoutingPipelineCall) engineCall = engineCall.engineCall
+        return runCatching { (engineCall as? io.ktor.server.netty.NettyApplicationCall)?.responseWriteJob }.getOrNull()
+    }
+
+    /** [bytes] as an answer written in chunks, each one marking [progress]. */
+    private class StreamedBody(
+        private val bytes: ByteArray,
+        override val contentType: ContentType,
+        private val progress: AtomicLong,
+    ) : OutgoingContent.WriteChannelContent() {
+        override val contentLength: Long get() = bytes.size.toLong()
+        override val status: HttpStatusCode get() = HttpStatusCode.OK
+
+        override suspend fun writeTo(channel: ByteWriteChannel) {
+            var offset = 0
+            while (offset < bytes.size) {
+                val end = minOf(offset + STREAM_CHUNK_BYTES, bytes.size)
+                channel.writeFully(bytes, offset, end)
+                channel.flush()
+                progress.set(System.nanoTime())
+                offset = end
+            }
+        }
+    }
+
+    /** How much of a body is handed to the engine at a time. */
+    private const val STREAM_CHUNK_BYTES = 64 * 1024
+
+    /** The API's own encoding of a body answer, as content negotiation would write it. */
+    private val publicJson = kotlinx.serialization.json.Json { encodeDefaults = true }
+
+    /**
+     * Runs [write] — the answer of a body read, holding its bytes in the gate
+     * — until it is done, or until it stalls: [bodyWriteStall] since
+     * [progress] last moved, or [bodyWriteCap] in all. A client that stops
+     * taking the body is cut off as one that went away: the call is cancelled
+     * and the bytes go back to the gate. A client that keeps reading, however
+     * slowly, keeps its answer until the cap.
+     */
+    internal suspend fun writeBounded(progress: AtomicLong = AtomicLong(System.nanoTime()), write: suspend () -> Unit) {
+        val started = System.nanoTime()
+        kotlinx.coroutines.coroutineScope {
+            val writer = async { write() }
+            while (true) {
+                if (withTimeoutOrNull(WRITE_POLL) { writer.await(); true } == true) return@coroutineScope
+                val now = System.nanoTime()
+                if (now - progress.get() > bodyWriteStall.inWholeNanoseconds || now - started > bodyWriteCap.inWholeNanoseconds) {
+                    writer.cancel()
+                    throw CancellationException("the client did not read the body")
+                        .apply { initCause(io.ktor.utils.io.ConnectionClosedException("body write stalled")) }
+                }
+            }
+        }
+    }
+
+    /** How often a bounded write looks at its progress. */
+    private val WRITE_POLL = 100.milliseconds
+
+    /** How long the answer of a body read may go without its client taking a chunk. */
+    val BODY_WRITE_STALL = 20.seconds
+
+    /** How long the answer of a body read may take in all, however steadily it is read. */
+    val BODY_WRITE_CAP = 10.minutes
+
+    /**
+     * The engine's per-write timeout the gateway runs with (`system.conf`
+     * `ktor.deployment.responseWriteTimeoutSeconds`): above
+     * [BODY_WRITE_STALL], so the gateway's bound, not the engine's, is the
+     * one a stalled client meets.
+     */
+    const val ENGINE_WRITE_TIMEOUT_SECONDS = 75
+
+    /** [BODY_WRITE_STALL] and [BODY_WRITE_CAP], settable so tests need not wait the real times. */
+    internal var bodyWriteStall = BODY_WRITE_STALL
+    internal var bodyWriteCap = BODY_WRITE_CAP
+
+    /**
+     * Answers [call] with a step's body as it was stored: the bytes, under the
+     * stored content type when it is one the gateway repeats
+     * (`application/octet-stream` otherwise), as an attachment, never sniffed
+     * — or 204 when none was stored. The key-authenticated API's download, for
+     * what [respondStepBody] will not inline.
+     *
+     * Same access check, confinement, gate and errors as the other reads;
+     * capped by the store's own limit ([BodyStoreRegistry.MAX_BODY_BYTES],
+     * 413 `body_too_large` with `details.maxBytes` past it), not by the inline
+     * cap. Never a link to where it is kept. The read reserves what the store
+     * reports (up to the cap) and answers from inside the gate, so the bytes
+     * held at once stay within the gate's budget: one copy of the body, not
+     * the six an inline answer needs.
+     */
+    suspend fun respondStepBodyRaw(
+        call: ApplicationCall,
+        orgId: UUID,
+        serviceId: UUID,
+        resultId: UUID,
+        stepId: UUID,
+        userId: UUID,
+        headOnly: Boolean = false,
+    ) {
+        // HEAD: the headers of the download, from a size (and type) lookup.
+        if (headOnly) {
+            respondHead(call, orgId, serviceId, resultId, stepId, userId, BodyStoreRegistry.MAX_BODY_BYTES) { size, stored ->
+                attachmentHeaders(call, stepId)
+                SizedHead(size, safeContentType(stored)?.let(ContentType::parse) ?: ContentType.Application.OctetStream)
+            }
+            return
+        }
+        val (storageUrl, bodyStoreId) = locateStepBody(orgId, serviceId, resultId, stepId, userId)
+        if (storageUrl == null) {
+            call.respond(HttpStatusCode.NoContent, "")
+            return
+        }
+        val store = bodyStoreId?.let { BodyStoreRegistry.load(it) ?: throw GoneException(ErrorCodes.BODY_GONE) }
+        if (store == null && storageClient == null) throw GoneException(ErrorCodes.BODY_GONE)
+
+        gated(store?.organizationId ?: orgId, bodyStoreId) { hold ->
+            val client = if (store != null) storeClient(store) else storageClient!!
+            val read = readingFrom(bodyStoreId, storageUrl) {
+                readSized(client, storageUrl, BodyStoreRegistry.MAX_BODY_BYTES, hold)
+            }
+            bodyStoreId?.let(BodyStoreService::clearFailure)
+            when (read) {
+                is BodyStorageClient.StoredBody.Found -> {
+                    hold.releasePlaces()
+                    insideGateProbe?.invoke()
+                    attachmentHeaders(call, stepId)
+                    val type = safeContentType(read.contentType)?.let(ContentType::parse) ?: ContentType.Application.OctetStream
+                    respondStreamed(call, read.bytes, type)
+                }
+                BodyStorageClient.StoredBody.Missing -> throw GoneException(ErrorCodes.BODY_GONE)
+                is BodyStorageClient.StoredBody.TooLarge -> throw ApiException(
+                    HttpStatusCode.PayloadTooLarge, ErrorCodes.BODY_TOO_LARGE,
+                    details = buildJsonObject { put("maxBytes", BodyStoreRegistry.MAX_BODY_BYTES) },
+                )
+            }
+        }
+    }
+
+    /** The download's own headers: an attachment, never sniffed, never kept on the way. */
+    private fun attachmentHeaders(call: ApplicationCall, stepId: UUID) {
+        call.response.header(
+            HttpHeaders.ContentDisposition,
+            ContentDisposition.Attachment.withParameter(ContentDisposition.Parameters.FileName, "body-$stepId").toString(),
+        )
+        call.response.header("X-Content-Type-Options", "nosniff")
+        // Bodies carry whatever the probed endpoint answered — tokens,
+        // personal data. Nothing on the way keeps a copy.
+        call.response.header(HttpHeaders.CacheControl, "private, no-store")
+    }
+
+    /** A HEAD answer: the download's length and type, and no body. */
+    private class SizedHead(private val size: Long?, private val type: ContentType) : io.ktor.http.content.OutgoingContent.NoContent() {
+        override val contentLength: Long? get() = size
+        override val contentType: ContentType get() = type
+        override val status: HttpStatusCode get() = HttpStatusCode.OK
     }
 
     /** Called inside the gate just before a key-authenticated body is answered. For tests. */
@@ -600,24 +916,76 @@ object ProbeResultController {
     /** The confined client for a body store. A seam for tests that need a store to misbehave. */
     internal var storeClient: (BodyStore) -> BodyStorageClient = { BodyStoreRegistry.clientFor(it) }
 
-    /** What the gate has free, for tests: global places, body-store places, byte units, and [orgId]'s places. */
-    internal data class GateState(val reads: Int, val storeReads: Int, val byteUnits: Int, val orgReads: Int)
+    /**
+     * What the gate has free, for tests: global places, body-store places,
+     * byte units, [orgId]'s places, and [orgId]'s byte units.
+     */
+    internal data class GateState(val reads: Int, val storeReads: Int, val byteUnits: Int, val orgReads: Int, val orgByteUnits: Int)
 
     internal fun gateState(orgId: UUID): GateState = GateState(
         reads = bodyReads.availablePermits,
         storeReads = storeReadsTotal.availablePermits,
-        byteUnits = bodyBytes.availablePermits,
+        byteUnits = bodyBytes.available,
         orgReads = orgReads[orgId]?.availablePermits ?: CONCURRENT_READS_PER_ORG,
+        orgByteUnits = orgBytes[orgId]?.available ?: ORG_BYTE_UNITS,
     )
 
     /** The gate when nothing holds it, for tests. */
     internal val idleGate = GateState(
         CONCURRENT_BODY_READS, CONCURRENT_STORE_READS, (CONCURRENT_BODY_BYTES / BODY_BYTE_UNIT).toInt(), CONCURRENT_READS_PER_ORG,
+        ORG_BYTE_UNITS,
     )
+
+    /**
+     * Of [CONCURRENT_BODY_BYTES], the most one organization may hold at once:
+     * half — room for its two places at the largest reservation (a 32 MiB
+     * download each) — so its downloads, however slowly their clients read,
+     * always leave the other half to everyone else.
+     */
+    internal const val CONCURRENT_BODY_BYTES_PER_ORG: Long = CONCURRENT_BODY_BYTES / 2
+
+    private const val ORG_BYTE_UNITS = (CONCURRENT_BODY_BYTES_PER_ORG / BODY_BYTE_UNIT).toInt()
 
     private val bodyReads = Semaphore(CONCURRENT_BODY_READS)
     private val storeReadsTotal = Semaphore(CONCURRENT_STORE_READS)
-    private val bodyBytes = Semaphore((CONCURRENT_BODY_BYTES / BODY_BYTE_UNIT).toInt())
+    private val bodyBytes = UnitBudget((CONCURRENT_BODY_BYTES / BODY_BYTE_UNIT).toInt())
+    private val orgBytes = ConcurrentHashMap<UUID, UnitBudget>()
+
+    /**
+     * A count of byte units taken all at once or not at all: a reservation
+     * waits until the whole of it is free, holding nothing while it waits —
+     * so a large one never sits on part of the budget ahead of smaller ones
+     * that would fit. Waiters are woken on every release and try again.
+     */
+    private class UnitBudget(private val total: Int) {
+        private var free = total
+        private val waiters = mutableListOf<CompletableDeferred<Unit>>()
+
+        val available: Int get() = synchronized(this) { free }
+
+        suspend fun acquire(n: Int) {
+            require(n in 0..total) { "$n units of $total" }
+            while (true) {
+                val wake = synchronized(this) {
+                    if (free >= n) {
+                        free -= n
+                        return
+                    }
+                    CompletableDeferred<Unit>().also { waiters += it }
+                }
+                wake.await()
+            }
+        }
+
+        fun release(n: Int) {
+            if (n == 0) return
+            val woken = synchronized(this) {
+                free += n
+                waiters.toList().also { waiters.clear() }
+            }
+            woken.forEach { it.complete(Unit) }
+        }
+    }
     private val storeReads = ConcurrentHashMap<UUID, Semaphore>()
     private val orgReads = ConcurrentHashMap<UUID, Semaphore>()
 
@@ -632,27 +1000,33 @@ object ProbeResultController {
      * A read's place in the gate: the permits it took, the bytes it has
      * reserved, and when it must be done by.
      */
-    private class GateHold(private val held: List<Semaphore>, private val deadlineNanos: Long) {
+    private class GateHold(
+        private val held: List<Semaphore>,
+        private val orgBudget: UnitBudget,
+        private val deadlineNanos: Long,
+    ) {
         private var units = 0
 
         /**
          * Reserves [bytes] of the byte budget for this read, waiting at most
-         * [BODY_READ_WAIT]. Reserving again only adds what is missing. Each
-         * unit is taken on its own, without a lock, so a large reservation
-         * waiting for units does not hold up smaller ones behind it. Two
-         * reservations that each hold part of what they need can wait on each
-         * other only until the deadline: the one that times out answers 503
-         * and gives everything back as it leaves the gate.
+         * [BODY_READ_WAIT]: first from its organization's share, then from the
+         * global budget, each all at once (in that order everywhere, so no two
+         * reads hold what the other waits for). Reserving again only adds what
+         * is missing. A reservation that does not fit within the wait answers
+         * 503 and gives back what it took.
          */
         suspend fun reserve(bytes: Long) {
             val wanted = ((bytes + BODY_BYTE_UNIT - 1) / BODY_BYTE_UNIT).toInt().coerceAtLeast(1)
             if (wanted <= units) return
-            withTimeoutOrNull(readWait) {
-                while (units < wanted) {
-                    bodyBytes.acquire()
-                    units++
-                }
-            } ?: throw ApiException(HttpStatusCode.ServiceUnavailable, ErrorCodes.BODY_STORE_UNAVAILABLE)
+            val more = wanted - units
+            val org = withTimeoutOrNull(readWait) { orgBudget.acquire(more) }
+                ?: throw ApiException(HttpStatusCode.ServiceUnavailable, ErrorCodes.BODY_STORE_UNAVAILABLE)
+            val global = withTimeoutOrNull(readWait) { bodyBytes.acquire(more) }
+            if (global == null) {
+                orgBudget.release(more)
+                throw ApiException(HttpStatusCode.ServiceUnavailable, ErrorCodes.BODY_STORE_UNAVAILABLE)
+            }
+            units = wanted
         }
 
         /**
@@ -679,10 +1053,26 @@ object ProbeResultController {
             }
         }
 
-        fun release() {
-            repeat(units) { bodyBytes.release() }
-            units = 0
+        private var placesHeld = true
+
+        /**
+         * Gives back the places (organization, store, global) once the body
+         * has been read, keeping the byte units: what is still held is the
+         * body in memory, while it is encoded and written to a client that
+         * may read slowly — and a slow reader must not keep a place another
+         * read could use. Idempotent.
+         */
+        fun releasePlaces() {
+            if (!placesHeld) return
+            placesHeld = false
             held.asReversed().forEach { it.release() }
+        }
+
+        fun release() {
+            bodyBytes.release(units)
+            orgBudget.release(units)
+            units = 0
+            releasePlaces()
         }
     }
 
@@ -726,7 +1116,11 @@ object ProbeResultController {
             held.asReversed().forEach { it.release() }
             throw ApiException(HttpStatusCode.ServiceUnavailable, ErrorCodes.BODY_STORE_UNAVAILABLE)
         }
-        val hold = GateHold(held, System.nanoTime() + readDeadline.inWholeNanoseconds)
+        val hold = GateHold(
+            held,
+            orgBytes.computeIfAbsent(orgId) { UnitBudget(ORG_BYTE_UNITS) },
+            System.nanoTime() + readDeadline.inWholeNanoseconds,
+        )
         try {
             return block(hold)
         } finally {

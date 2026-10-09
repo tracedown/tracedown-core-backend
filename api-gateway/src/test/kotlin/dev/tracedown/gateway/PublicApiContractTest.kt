@@ -32,10 +32,12 @@ import kotlin.reflect.KType
  * are a **baseline** — what v1 promised when it was published — and the API
  * may grow from it but not move away from it.
  *
- * Passes: a new route; a new type; a new field in a response; a new optional
- * field in a request; a required request field becoming optional.
+ * Passes: a new route; a new optional query parameter on a route; a new type;
+ * a new field in a response; a new optional field in a request; a required
+ * request field becoming optional.
  * Fails: a baseline route that is no longer mounted, or whose operation id,
- * success status, query parameters, request type or response type changed; a
+ * success status, request type or response type changed, or that lost or
+ * newly requires a query parameter; a
  * baseline field removed, renamed, retyped or made nullable; a class whose
  * serial name changed (it is what its schema is called); a request field that
  * became required, or a new required one — a client written against the
@@ -47,13 +49,17 @@ import kotlin.reflect.KType
  * class of the public API's own that keeps the old shape.
  *
  * The current routes and shapes are written under `build/public-api-contract/`
- * on every run, for review; the baseline files are only ever replaced by hand.
+ * on every run, for review; the baseline files are only ever appended to, by
+ * hand. A route that gains a parameter gets a second line beside its first,
+ * and a type that gains a field a second block after its first: each line and
+ * block is what v1 promised when it was written, and all of them hold.
  */
 class PublicApiContractTest {
 
     companion object {
         const val ROUTES_FILE = "public-api-v1.routes.txt"
         const val TYPES_FILE = "public-api-v1.types.txt"
+        const val EVENTS_FILE = "public-api-v1.events.txt"
 
         private const val DELIBERATE =
             "The key-authenticated API is a published contract: within v1 a change must be deliberate and " +
@@ -94,7 +100,11 @@ class PublicApiContractTest {
          * it may be left out (`optional`).
          */
         data class Shape(val key: String, val fields: Map<String, Field>) {
-            data class Field(val type: String, val optional: Boolean)
+            /**
+             * One field: its type, whether it may be left out, and — for a
+             * string held to a set of values (`@JsonSchema.Enum`) — the values.
+             */
+            data class Field(val type: String, val optional: Boolean, val values: List<String>? = null)
 
             /** The class's serial name. A change of it is a break: it is what a schema is called. */
             val name: String get() = key.substringBefore('<')
@@ -104,6 +114,7 @@ class PublicApiContractTest {
                 fields.forEach { (field, f) ->
                     append("  ").append(field).append(": ").append(f.type)
                     if (f.optional) append(" optional")
+                    f.values?.let { append(" enum ").append(it.joinToString(", ", "[", "]")) }
                     append('\n')
                 }
             }
@@ -127,8 +138,10 @@ class PublicApiContractTest {
                     if (descriptor.elementsCount == 0 && kind == StructureKind.CLASS) unreadable += name
                     val fields = linkedMapOf<String, Shape.Field>()
                     for (i in 0 until descriptor.elementsCount) {
+                        val values = descriptor.getElementAnnotations(i)
+                            .filterIsInstance<io.ktor.openapi.JsonSchema.Enum>().firstOrNull()?.value?.toList()
                         fields[descriptor.getElementName(i)] =
-                            Shape.Field(typeName(descriptor.getElementDescriptor(i)), descriptor.isElementOptional(i))
+                            Shape.Field(typeName(descriptor.getElementDescriptor(i)), descriptor.isElementOptional(i), values)
                     }
                     Shape(key ?: name, fields).let { shapes[it.key] = it }
                 } else if (kind != StructureKind.LIST && kind != StructureKind.MAP) {
@@ -161,20 +174,44 @@ class PublicApiContractTest {
             return out.toString()
         }
 
-        /** Reads the class shapes back out of a types file (any line endings). */
+        /**
+         * Reads the class shapes back out of a types file (any line endings).
+         * A class with more than one block — it gained fields after it was
+         * first pinned — is every field of all of them, the earliest block's
+         * word standing for a field two of them name.
+         */
         fun parseShapes(text: String): Map<String, Shape> {
             val normalized = text.replace("\r\n", "\n")
             val blocks = normalized.substringAfter("\n\n", "").split("\n\n").filter { it.isNotBlank() }
-            return blocks.associate { block ->
+            val shapes = linkedMapOf<String, Shape>()
+            for (block in blocks) {
                 val lines = block.trim('\n').lines()
                 val fields = linkedMapOf<String, Shape.Field>()
                 for (line in lines.drop(1)) {
-                    val (field, rest) = line.trim().split(": ", limit = 2)
+                    val (field, described) = line.trim().split(": ", limit = 2)
+                    val values = described.substringAfter(" enum [", "").takeIf { it.isNotEmpty() }
+                        ?.removeSuffix("]")?.split(", ")
+                    val rest = described.substringBefore(" enum [")
                     val optional = rest.endsWith(" optional")
-                    fields[field] = Shape.Field(rest.removeSuffix(" optional"), optional)
+                    fields[field] = Shape.Field(rest.removeSuffix(" optional"), optional, values)
                 }
-                Shape(lines.first(), fields).let { it.key to it }
+                val key = lines.first()
+                // The earliest block's word stands for a field two of them
+                // name; a later block can add the field's values to it.
+                val earlier = shapes[key]?.fields ?: emptyMap()
+                // Values accumulate: a later block may pin a set the earlier did
+                // not, or widen one (append-only, as everything here).
+                val merged = fields + earlier.mapValues { (name, f) ->
+                    val later = fields[name]?.values
+                    when {
+                        later == null -> f
+                        f.values == null -> f.copy(values = later)
+                        else -> f.copy(values = (f.values + later).distinct())
+                    }
+                }
+                shapes[key] = Shape(key, merged)
             }
+            return shapes
         }
 
         /**
@@ -187,7 +224,10 @@ class PublicApiContractTest {
             val (method, path) = route.split(' ', limit = 2)
             val operation = PublicApiOperations.find(HttpMethod.parse(method), path.removePrefix(PublicApi.V1))
                 ?: return@map route
-            val query = operation.query.joinToString(" ", "[", "]") { if (it.required) "${it.name}!" else it.name }
+            // `name!` when required, `name(a|b)` when held to a set of values.
+            val query = operation.query.joinToString(" ", "[", "]") { q ->
+                (if (q.required) "${q.name}!" else q.name) + (q.values?.joinToString("|", "(", ")") ?: "")
+            }
             fun typeOf(type: KType?) = type?.toString()?.replace("dev.tracedown.", "") ?: "-"
             "$route ${operation.operationId} ${operation.status.value} $query -> ${typeOf(operation.request)} / ${typeOf(operation.response)}"
         }
@@ -222,11 +262,51 @@ class PublicApiContractTest {
         }
 
         /**
-         * The baseline route lines [current] no longer has exactly: a route
-         * that went, or one whose operation id, status, query parameters or
-         * types changed. A route [current] adds is no change.
+         * The baseline route lines [current] no longer keeps: a route that
+         * went, or one whose operation id, status or types changed, or that
+         * lost a query parameter, or requires one it did not. A route
+         * [current] adds is no change, and neither is an optional query
+         * parameter it adds to one.
          */
-        fun routeChanges(baseline: List<String>, current: List<String>): List<String> = baseline - current.toSet()
+        fun routeChanges(baseline: List<String>, current: List<String>): List<String> {
+            val now = current.map(::parseRouteLine)
+            return baseline.filterNot { line ->
+                val was = parseRouteLine(line)
+                now.any { it.keeps(was) }
+            }
+        }
+
+        /** A route line taken apart: everything but the query parameters, and the parameters by name. */
+        /** One query parameter of a route line: whether it is required, and the values it takes when pinned. */
+        private data class Param(val required: Boolean, val values: Set<String>?)
+
+        private data class RouteLine(val head: String, val tail: String, val parameters: Map<String, Param>) {
+            /**
+             * Whether this line keeps every promise of [was]: the same
+             * parameters, none newly required, and every value [was] pinned
+             * still taken (a parameter may take more).
+             */
+            fun keeps(was: RouteLine): Boolean =
+                head == was.head && tail == was.tail &&
+                    was.parameters.all { (name, p) ->
+                        val now = parameters[name]
+                        now != null && now.required == p.required &&
+                            (p.values == null || (now.values != null && now.values.containsAll(p.values)))
+                    } &&
+                    parameters.filterKeys { it !in was.parameters }.values.none { it.required }
+        }
+
+        private fun parseRouteLine(line: String): RouteLine {
+            val open = line.indexOf(" [")
+            val close = line.indexOf("] ", open)
+            if (open < 0 || close < 0) return RouteLine(line, "", emptyMap())
+            val parameters = line.substring(open + 2, close).split(' ').filter { it.isNotBlank() }.associate { token ->
+                val values = token.substringAfter('(', "").takeIf { it.isNotEmpty() }?.removeSuffix(")")?.split('|')?.toSet()
+                val name = token.substringBefore('(')
+                name.removeSuffix("!") to Param(name.endsWith("!"), values)
+            }
+            return RouteLine(line.substring(0, open), line.substring(close + 1), parameters)
+        }
 
         /** Every way [current] moves away from [baseline] (see the class KDoc), as readable lines. */
         fun breaks(baseline: Map<String, Shape>, current: Map<String, Shape>, requestClasses: Set<String>): List<String> {
@@ -242,6 +322,8 @@ class PublicApiContractTest {
                     when {
                         g == null -> out += "${was.name}.$field was removed"
                         g.type != f.type -> out += "${was.name}.$field changed type: ${f.type} -> ${g.type}"
+                        f.values != null && !(g.values ?: emptyList()).containsAll(f.values) ->
+                            out += "${was.name}.$field lost values: ${f.values - (g.values ?: emptyList()).toSet()}"
                         f.optional && !g.optional && was.name in requestClasses ->
                             out += "${was.name}.$field became required in a request"
                     }
@@ -302,6 +384,39 @@ class PublicApiContractTest {
         }
     }
 
+    /**
+     * The event feed's contract: each type, what its `resource` is, and the
+     * fields its `data` carries. Append only, as the other baselines: a type
+     * stays, keeps its resource and keeps every field; new types and new
+     * fields pass.
+     */
+    @Test
+    fun `every baseline event type keeps its resource and its data`() {
+        val current = dev.tracedown.gateway.controllers.events.EventTypes.ALL.map { type ->
+            "$type ${dev.tracedown.gateway.controllers.events.EventTypes.RESOURCE.getValue(type)} " +
+                dev.tracedown.gateway.controllers.events.EventTypes.DATA.getValue(type).joinToString(",")
+        }
+        val written = writeCurrent(EVENTS_FILE, current.joinToString("\n", postfix = "\n"))
+        val pinned = baseline(EVENTS_FILE).replace("\r\n", "\n").lines().filter { it.isNotBlank() }
+        assertTrue(pinned.isNotEmpty(), "The events baseline is empty")
+        val now = current.associate { line -> line.split(' ', limit = 3).let { it[0] to (it[1] to it.getOrElse(2) { "" }) } }
+        val problems = pinned.mapNotNull { line ->
+            val parts = line.split(' ', limit = 3)
+            val type = parts[0]
+            val resource = parts[1]
+            val fields = parts.getOrElse(2) { "" }.split(',').filter { it.isNotEmpty() }
+            val (nowResource, nowFields) = now[type] ?: return@mapNotNull "$type is gone"
+            when {
+                nowResource != resource -> "$type is now about $nowResource, not $resource"
+                !nowFields.split(',').containsAll(fields) -> "$type lost data fields: ${fields - nowFields.split(',').toSet()}"
+                else -> null
+            }
+        }
+        assertTrue(problems.isEmpty(), problems.joinToString("\n", postfix = "\n") + "$DELIBERATE (Current events: $written)")
+        val unpinned = now.keys - pinned.map { it.substringBefore(' ') }.toSet()
+        assertTrue(unpinned.isEmpty(), "Event types not in the baseline: $unpinned — append them to $EVENTS_FILE")
+    }
+
     @Test
     fun `the route check refuses a removed or changed route and passes an added one`() {
         val line = "GET /api/public/v1/things listThings 200 [page pageSize] -> - / Page<Thing>"
@@ -312,11 +427,18 @@ class PublicApiContractTest {
             line.replace("listThings", "getThings"),
             line.replace(" 200 ", " 202 "),
             line.replace("[page pageSize]", "[page pageSize kind!]"),
+            line.replace("[page pageSize]", "[page! pageSize]"),
+            line.replace("[page pageSize]", "[pageSize]"),
             line.replace("Page<Thing>", "List<Thing>"),
             line.replace("-> -", "-> Filter"),
         )) {
             assertEquals(baseline, routeChanges(baseline, listOf(changed)), "changed: $changed")
         }
+        // An optional parameter added is kept; so is the line that pinned it,
+        // beside the one before it.
+        val grown = line.replace("[page pageSize]", "[since page pageSize]")
+        assertEquals(emptyList<String>(), routeChanges(baseline + grown, listOf(grown)))
+        assertEquals(listOf(grown), routeChanges(baseline + grown, listOf(line)), "the parameter went again")
     }
 
     @Test
@@ -338,5 +460,54 @@ class PublicApiContractTest {
         assertTrue(breaks(baseline, current(keep + ("a" to Shape.Field("kotlin.String?", false)), baseline.getValue("Q").fields), req).single().contains("type"))
         assertTrue(breaks(baseline, current(keep + ("b" to Shape.Field("kotlin.Int", false)), baseline.getValue("Q").fields), req).single().contains("required"))
         assertTrue(breaks(baseline, current(keep + ("n" to Shape.Field("kotlin.Int", false)), baseline.getValue("Q").fields), req).single().contains("new required"))
+    }
+
+    @Test
+    fun `a type pinned in two blocks is held to both`() {
+        val text = "# Entry points\nA = A\n\nA\n  a: kotlin.String\n\nA\n  a: kotlin.String\n  b: kotlin.Int\n"
+        val pinned = parseShapes(text)
+        assertEquals(listOf("a", "b"), pinned.getValue("A").fields.keys.sorted())
+        val lost = breaks(pinned, mapOf("A" to Shape("A", mapOf("a" to Shape.Field("kotlin.String", false)))), emptySet())
+        assertTrue(lost.single().contains("A.b was removed"), lost.toString())
+    }
+
+    @Test
+    fun `everything the API answers today is pinned in the baseline`() = testApplication {
+        // The baseline is only of use if it is kept up with: a route, a field
+        // or a set of values the API has and the baseline does not is a
+        // promise nobody holds it to. Append it (see PublicApiOperations).
+        lateinit var root: Route
+        application {
+            routing {
+                root = this
+                publicApiRoutes()
+            }
+        }
+        startApplication()
+        val pinnedRoutes = baseline(ROUTES_FILE).replace("\r\n", "\n").lines().filter { it.isNotBlank() }.toSet()
+        val unpinnedRoutes = operationLines(root as RoutingNode).filter { it !in pinnedRoutes }
+        assertTrue(unpinnedRoutes.isEmpty(), "Routes not in the baseline:\n${unpinnedRoutes.joinToString("\n")}")
+
+        val pinned = parseShapes(baseline(TYPES_FILE))
+        val unpinned = shapes(PUBLIC_TYPES).first.values.flatMap { shape ->
+            val was = pinned[shape.key] ?: return@flatMap listOf("${shape.key} is not pinned")
+            shape.fields.mapNotNull { (name, f) ->
+                if (was.fields[name] == f) null else "${shape.key}.$name is pinned as ${was.fields[name]}, is $f"
+            }
+        }
+        assertTrue(unpinned.isEmpty(), "Not in the baseline:\n${unpinned.joinToString("\n")}")
+    }
+
+    @Test
+    fun `a value taken out of a pinned set is a break`() {
+        val baseline = mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a", "b")))))
+        assertEquals(emptyList<String>(), breaks(baseline, mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a", "b", "c"))))), emptySet()))
+        assertTrue(breaks(baseline, mapOf("A" to Shape("A", mapOf("s" to Shape.Field("kotlin.String", false, listOf("a"))))), emptySet()).single().contains("lost values"))
+        val text = "# Entry points\nA = A\n\nA\n  s: kotlin.String\n\nA\n  s: kotlin.String enum [a, b]\n\nA\n  s: kotlin.String enum [a, b, c]\n"
+        assertEquals(listOf("a", "b", "c"), parseShapes(text).getValue("A").fields.getValue("s").values, "a widened set is pinned whole")
+        // A query parameter's values: more is fine, fewer is a break.
+        val line = "GET /api/public/v1/things listThings 200 [kind(a|b) page] -> - / Page<Thing>"
+        assertEquals(emptyList<String>(), routeChanges(listOf(line), listOf(line.replace("kind(a|b)", "kind(a|b|c)"))))
+        assertEquals(listOf(line), routeChanges(listOf(line), listOf(line.replace("kind(a|b)", "kind(a)"))))
     }
 }

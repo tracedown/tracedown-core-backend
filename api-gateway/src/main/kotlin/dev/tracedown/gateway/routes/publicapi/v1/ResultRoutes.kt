@@ -1,26 +1,44 @@
 package dev.tracedown.gateway.routes.publicapi.v1
 
+import dev.tracedown.common.runs.RunTrigger
 import dev.tracedown.gateway.controllers.results.ProbeResultController
+import dev.tracedown.gateway.routes.publicapi.PublicApi
 import dev.tracedown.gateway.routes.publicapi.apiCaller
+import dev.tracedown.gateway.util.fieldError
 import dev.tracedown.gateway.util.publicPaging
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
+import java.time.temporal.ChronoUnit
 
 /**
  * A service's runs: what each request returned and how each assertion went.
  */
 fun Route.resultRoutes() {
     /**
-     * Lists a service's runs, most recent first. `since` (an ISO-8601 instant)
-     * keeps only runs started at or after it — the way to wait for the run a
-     * `POST …/run` asked for. Paged with `page` and `pageSize`.
+     * Lists a service's runs, most recent first (`order=asc` for oldest
+     * first; ties by id either way). `since` and `until` (ISO-8601 instants,
+     * both inclusive, to the second) bound when they started; `status` (one or
+     * more, repeated or comma-separated) and `trigger` (`schedule` or
+     * `manual`) keep the runs with those values. Paged with `page` and
+     * `pageSize`. Every refused parameter is named.
      */
     get("/services/{id}/results") {
         val caller = call.apiCaller
         val serviceId = call.pathUuid("id")
         val since = call.instantQuery("since")
-        call.respond(ProbeResultController.list(caller.orgId, serviceId, caller.userId, publicPaging(call), since))
+        val until = call.instantQuery("until")
+        if (since != null && until != null && until.truncatedTo(ChronoUnit.SECONDS) < since.truncatedTo(ChronoUnit.SECONDS)) {
+            throw fieldError("until")
+        }
+        val filter = ProbeResultController.ResultFilter(
+            since = since,
+            until = until,
+            statuses = call.valuesQuery("status", ProbeResultController.STATUSES.toSet()),
+            trigger = call.choiceQuery("trigger", RunTrigger.TRIGGERS),
+            ascending = call.choiceQuery("order", ProbeResultController.ORDERS.toSet()) == "asc",
+        )
+        call.respond(ProbeResultController.list(caller.orgId, serviceId, caller.userId, publicPaging(call), filter))
     }
 
     /**
@@ -61,6 +79,26 @@ fun Route.resultRoutes() {
         val stepId = call.pathUuid("stepId")
         // Answered from inside the read: the body is held, encoded and sent
         // under the same bound on memory (see readStepBody).
-        ProbeResultController.respondStepBody(call, caller.orgId, serviceId, resultId, stepId, caller.userId)
+        ProbeResultController.respondStepBody(
+            call, caller.orgId, serviceId, resultId, stepId, caller.userId, headOnly = PublicApi.isHead(call),
+        )
+    }
+
+    /**
+     * The same body as it was stored — the bytes, not text in a response —
+     * for bodies of any size up to the store's own limit (32 MiB). The stored
+     * content type when the gateway repeats it (`application/octet-stream`
+     * otherwise), always as an attachment and never to be sniffed. Never a
+     * link to the storage it lives in. Same 204, 410, 413 and 503 as the read
+     * above; HEAD answers the headers alone.
+     */
+    get("/services/{id}/results/{resultId}/steps/{stepId}/body/raw") {
+        val caller = call.apiCaller
+        val serviceId = call.pathUuid("id")
+        val resultId = call.pathUuid("resultId")
+        val stepId = call.pathUuid("stepId")
+        ProbeResultController.respondStepBodyRaw(
+            call, caller.orgId, serviceId, resultId, stepId, caller.userId, headOnly = PublicApi.isHead(call),
+        )
     }
 }

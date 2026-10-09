@@ -6,11 +6,16 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.net.PathCanonicalizer
 import dev.tracedown.gateway.context.Credential
 import dev.tracedown.gateway.routes.publicapi.v1.accessRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.alertRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.eventRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.notificationTemplateRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.presetRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.directoryRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.keyRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.metricsRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.projectRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.resultRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.scriptRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.serviceRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.silenceRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.variableRoutes
@@ -20,6 +25,7 @@ import dev.tracedown.gateway.routes.v1.auth.requireAuth
 import dev.tracedown.gateway.util.ApiNamespace
 import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ForbiddenException
+import dev.tracedown.gateway.util.Idempotency
 import dev.tracedown.gateway.util.UnauthorizedException
 import io.ktor.http.HttpMethod
 import io.ktor.server.application.ApplicationCall
@@ -95,10 +101,13 @@ val ApplicationCall.apiCaller: ApiCaller
  *     Budget first: a call that is about to be refused, for any reason below,
  *     has still spent its budget;
  *  2. the key's own ceiling is applied: a read-only key is refused anything
- *     but a read;
+ *     but a read (and the few POSTs that change nothing, [READ_ONLY_POSTS]);
  *  3. every registered [guard] has let the call through;
  *  4. the key is named as the credential behind whatever the handler goes on
- *     to audit.
+ *     to audit;
+ *  5. a POST carrying an `Idempotency-Key` it was already answered for is
+ *     answered from the record instead of reaching its handler, and one it
+ *     was not is remembered once answered ([Idempotency]).
  *
  * So there is no handler that can forget one of them, and no way to mount a
  * route that is in the namespace but outside them: the steps are keyed on the
@@ -202,6 +211,11 @@ object PublicApi {
         v1.accessRoutes()
         v1.directoryRoutes()
         v1.webhookRoutes()
+        v1.scriptRoutes()
+        v1.presetRoutes()
+        v1.notificationTemplateRoutes()
+        v1.alertRoutes()
+        v1.eventRoutes()
         for (route in v1.endpoints()) {
             val (method, path) = route
             val operation = PublicApiOperations.find(method, path)
@@ -275,7 +289,29 @@ object PublicApi {
             // suspension and never reaches another. It covers the handler and
             // whatever it runs in its own coroutine or a `withContext` of it —
             // not a coroutine launched from the call, which starts outside.
-            withContext(AuditActor.asContextElement(caller.keyId)) { proceed() }
+            withContext(AuditActor.asContextElement(caller.keyId)) {
+                // Step 5: a POST carrying an Idempotency-Key that was already
+                // answered is answered again from the record, and its handler
+                // does not run.
+                // Only a POST a route takes: a path nothing answers has
+                // nothing to remember. Its key is decided as its answer goes
+                // out (Responses, below), or as it is cut off with none.
+                val path = PathCanonicalizer.canonicalize(uri)
+                if (call.request.local.method == HttpMethod.Post && path != null && path !in READ_ONLY_POSTS &&
+                    isMountedPath(uri, HttpMethod.Post)
+                ) {
+                    Idempotency.begin(call, caller.keyId, caller.orgId, caller.userId, path)
+                    if (call.response.isCommitted) return@withContext
+                }
+                try {
+                    proceed()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // Cut off under its handler with no answer: decided as an
+                    // unknown outcome (a no-op for a call without a key).
+                    Idempotency.cancelled(call)
+                    throw e
+                }
+            }
         }
     }
 
@@ -309,6 +345,9 @@ object PublicApi {
     /** Marks a HEAD request being answered as its GET. */
     private val headRequest = AttributeKey<Unit>("PublicApiHead")
 
+    /** Whether [call] is a HEAD being answered by its GET's route — which may then skip the body it would send. */
+    fun isHead(call: ApplicationCall): Boolean = call.attributes.contains(headRequest)
+
     /**
      * The namespace's answers on their way out. The router's own refusals — a
      * bare 404 for a path no route matches, a bare 405 for a method a route
@@ -325,6 +364,7 @@ object PublicApi {
                     answer = TextContent("""{"error":"$code"}""", ContentType.Application.Json, status)
                 }
             }
+            Idempotency.capture(call, answer)
             if (call.attributes.contains(headRequest)) answer = HeadOnly(answer)
             if (answer !== content) transformBodyTo(answer)
         }
@@ -360,7 +400,7 @@ object PublicApi {
             ?: throw BadRequestException(ErrorCodes.NO_ORG_SELECTED)
         val caller = ApiCaller(principal.userId, orgId, principal.email, key.keyId, key.access)
 
-        if (!key.access.canWrite() && call.request.httpMethod !in READ_METHODS) {
+        if (!key.access.canWrite() && call.request.httpMethod !in READ_METHODS && !isReadOnlyPost(call)) {
             throw ForbiddenException(ErrorCodes.API_KEY_READ_ONLY)
         }
 
@@ -372,6 +412,35 @@ object PublicApi {
     }
 
     private val READ_METHODS = setOf(HttpMethod.Get, HttpMethod.Head)
+
+    /**
+     * Runs every registered [guard] again for a call already admitted — for a
+     * handler whose call outlasts its admission (a long-poll), so a host's
+     * refusal made meanwhile applies from its next step. Throws what a guard
+     * throws, and [AnsweredByGuard] when one answered the call itself.
+     */
+    internal suspend fun recheckGuards(caller: ApiCaller, call: ApplicationCall) {
+        for (guard in guards) {
+            guard(caller, call)
+            if (call.response.isCommitted) throw AnsweredByGuard()
+        }
+    }
+
+    /** A guard answered the call while its handler was still working: nothing more is to be sent. */
+    internal class AnsweredByGuard : RuntimeException(null, null, false, false)
+
+    /**
+     * POSTs that change nothing — a POST only because what they are given
+     * does not fit in a query. A read-only key may make them (they are the one
+     * exception to step 2), and they take no `Idempotency-Key`: there is
+     * nothing for a repeat to do twice. Canonical paths, Core's own only: a
+     * host's route is never added here.
+     */
+    private val READ_ONLY_POSTS = setOf("$V1/scripts/validate")
+
+    private fun isReadOnlyPost(call: ApplicationCall): Boolean =
+        call.request.httpMethod == HttpMethod.Post &&
+            PathCanonicalizer.canonicalize(call.request.local.uri) in READ_ONLY_POSTS
 }
 
 /**

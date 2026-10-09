@@ -2,11 +2,14 @@ package dev.tracedown.gateway.data.notifications
 
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
+import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 
 @Serializable
 data class CreateNotificationTemplateRequest(
+    @JsonSchema.MaxLength(64)
     val name: String,
+    @JsonSchema.MaxLength(10000)
     val text: String,
     val projectIds: List<String>? = null,
 ) : Validatable {
@@ -21,7 +24,9 @@ data class CreateNotificationTemplateRequest(
 
 @Serializable
 data class UpdateNotificationTemplateRequest(
+    @JsonSchema.MaxLength(64)
     val name: String? = null,
+    @JsonSchema.MaxLength(10000)
     val text: String? = null,
 ) : Validatable {
     override fun validate() = buildList {

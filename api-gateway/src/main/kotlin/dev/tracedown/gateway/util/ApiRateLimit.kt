@@ -40,6 +40,10 @@ object ApiRateLimit {
     fun spend(digest: String): RateLimiter.RateLimitResult? =
         limiter?.check(digest, RateLimiter.Tier.API)
 
+    /** Where the key with this [digest] stands on its budget, without spending any. Null when rate limiting is off. */
+    fun peek(digest: String): RateLimiter.RateLimitResult? =
+        limiter?.peek(digest, RateLimiter.Tier.API)
+
     /** Where [ip] stands on its limit on unknown tokens. Null when rate limiting is off. */
     fun unknownTokens(ip: String): RateLimiter.RateLimitResult? =
         limiter?.peek(ip, RateLimiter.Tier.API_FAILURE)

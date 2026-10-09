@@ -3,6 +3,7 @@ package dev.tracedown.common.auth
 import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.Users
 import org.jetbrains.exposed.v1.core.JoinType
+import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -19,6 +20,8 @@ data class ApiKeyContext(
     val totpEnabled: Boolean,
     /** The key's own ceiling — an [AccessLevel]: read or write. */
     val access: Short,
+    /** The user's permissions in [organizationId], as they were resolved to let the key in. */
+    val permissions: CachedPermissions? = null,
 )
 
 /** Outcome of validating a presented API key, with the reason when it is refused. */
@@ -64,11 +67,20 @@ object ApiKeyFormat {
 object ApiKeyAuthenticator {
 
     /** Only the digest is stored at rest: the caller hashes the presented key (`TokenHasher`) and this matches. */
-    fun authenticateDigest(keyHash: String): ApiKeyResult = transaction {
+    fun authenticateDigest(keyHash: String): ApiKeyResult = authenticate { ApiKeys.keyHash eq keyHash }
+
+    /**
+     * The same verdict, again, for a key already authenticated — by its id.
+     * For a call that outlasts the moment it was let in: whatever happened to
+     * the key or its user since applies from the next ask.
+     */
+    fun recheck(keyId: UUID): ApiKeyResult = authenticate { ApiKeys.id eq keyId }
+
+    private fun authenticate(match: () -> Op<Boolean>): ApiKeyResult = transaction {
         val row = ApiKeys
             .join(Users, JoinType.LEFT, ApiKeys.createdBy, Users.id)
             .selectAll()
-            .where { (ApiKeys.keyHash eq keyHash) and (ApiKeys.deleted eq false) }
+            .where { match() and (ApiKeys.deleted eq false) }
             .firstOrNull()
             ?: return@transaction ApiKeyResult.Invalid(ApiKeyResult.Reason.NOT_FOUND)
 
@@ -84,18 +96,21 @@ object ApiKeyAuthenticator {
                 ApiKeyResult.Invalid(ApiKeyResult.Reason.OWNER_GONE)
             !row[Users.isActive] ->
                 ApiKeyResult.Invalid(ApiKeyResult.Reason.OWNER_INACTIVE)
-            resolveCachedPermissions(row[ApiKeys.organizationId], userId) == null ->
-                ApiKeyResult.Invalid(ApiKeyResult.Reason.NOT_MEMBER)
-            else -> ApiKeyResult.Valid(
-                ApiKeyContext(
-                    keyId = row[ApiKeys.id],
-                    userId = userId,
-                    organizationId = row[ApiKeys.organizationId],
-                    email = row[Users.email],
-                    totpEnabled = row[Users.totpEnabled],
-                    access = row[ApiKeys.access],
-                ),
-            )
+            else -> {
+                val permissions = resolveCachedPermissions(row[ApiKeys.organizationId], userId)
+                    ?: return@transaction ApiKeyResult.Invalid(ApiKeyResult.Reason.NOT_MEMBER)
+                ApiKeyResult.Valid(
+                    ApiKeyContext(
+                        keyId = row[ApiKeys.id],
+                        userId = userId,
+                        organizationId = row[ApiKeys.organizationId],
+                        email = row[Users.email],
+                        totpEnabled = row[Users.totpEnabled],
+                        access = row[ApiKeys.access],
+                        permissions = permissions,
+                    ),
+                )
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 package dev.tracedown.ingestor.services
 
 import dev.tracedown.common.alerts.SystemAlertService
+import dev.tracedown.common.runs.RunTrigger
 
 /**
  * Which system alert, if any, a `skipped` tick's reason deserves.
@@ -33,6 +34,10 @@ object SkippedProbeAlert {
     fun alertType(reason: String): String? = when {
         // A tick the unverified-domain policy withheld (§18.4).
         reason.startsWith(UNVERIFIED_PREFIX) -> null
+        // The answer to a run somebody asked for and the scheduler did not
+        // make — the service was off, held, in its window, already running.
+        // The person who asked reads it on the run; nothing is broken.
+        reason.startsWith(RunTrigger.SKIP_PREFIX) -> null
         // A decision about the script's target: the address is one this
         // install does not probe, or the target's own operator declined.
         // Nothing is broken and nobody needs paging — the skipped row names
