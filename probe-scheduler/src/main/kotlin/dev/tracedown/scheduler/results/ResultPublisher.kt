@@ -1,5 +1,6 @@
 package dev.tracedown.scheduler.results
 
+import dev.tracedown.common.runs.RunTrigger
 import io.lettuce.core.api.sync.RedisCommands
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
@@ -13,7 +14,8 @@ import java.util.UUID
 /**
  * Publishes probe results to the Redis queue for the result-ingestor.
  *
- * Each envelope carries a `resultId` minted here, once, before it is queued.
+ * Each envelope carries a `resultId` fixed once, before it is queued — minted
+ * here, or the id a run was asked for under (see `RunTrigger`).
  * That id becomes the `probe_results` primary key, which is what makes the
  * ingestor's at-least-once delivery safe: a redelivered envelope carries the
  * same id and the second insert is refused by the key rather than duplicating
@@ -82,12 +84,28 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
          * are keyed from their resolved URLs at aggregation time instead.
          */
         endpointKeys: List<String>? = null,
+        /**
+         * The row this envelope becomes. Minted here by default; a run
+         * somebody asked for under an id passes that id, so the result is
+         * filed where its handle looks for it. Either way it is fixed before
+         * the push, not after the pop: the id has to be a property of the
+         * message so that every delivery of it — including one the ingestor is
+         * handed a second time after a crash — resolves to the same row.
+         */
+        resultId: UUID = UUID.randomUUID(),
+        /**
+         * What started the run: [RunTrigger.SCHEDULE] or [RunTrigger.MANUAL].
+         * An ingestor that predates the field files every run as scheduled.
+         */
+        trigger: String = RunTrigger.SCHEDULE,
+        /**
+         * The run somebody asked for that this result belongs to, and how
+         * many results that run publishes in all ([RunTrigger.ENVELOPE_RUN_ID],
+         * [RunTrigger.ENVELOPE_RUN_SIZE]); null for any other run.
+         */
+        runId: UUID? = null,
+        runSize: Int? = null,
     ): UUID {
-        // Minted before the push, not after the pop: the id has to be a property
-        // of the message so that every delivery of it — including one the
-        // ingestor is handed a second time after a crash — resolves to the same
-        // row.
-        val resultId = UUID.randomUUID()
         val envelope = buildJsonObject {
             put("resultId", resultId.toString())
             put("jobId", jobId.toString())
@@ -99,6 +117,11 @@ class ResultPublisher(private val redis: RedisCommands<String, String>) {
             put("rawResult", rawResult)
             put("startedAt", startedAt.toString())
             put("agentEgressBytes", agentEgressBytes)
+            put("trigger", trigger)
+            if (runId != null) {
+                put(RunTrigger.ENVELOPE_RUN_ID, runId.toString())
+                put(RunTrigger.ENVELOPE_RUN_SIZE, runSize ?: 1)
+            }
             if (bodiesWithheld != null) put("bodiesWithheld", bodiesWithheld)
             if (endpointKeys != null) {
                 put("endpointKeys", buildJsonArray { for (key in endpointKeys) add(key) })

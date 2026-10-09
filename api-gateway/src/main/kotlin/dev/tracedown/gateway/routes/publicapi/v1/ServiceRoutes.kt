@@ -1,5 +1,6 @@
 package dev.tracedown.gateway.routes.publicapi.v1
 
+import dev.tracedown.gateway.controllers.runs.RunRequestController
 import dev.tracedown.gateway.controllers.services.ServiceController
 import dev.tracedown.gateway.data.services.CreateServiceRequest
 import dev.tracedown.gateway.data.services.RunRequested
@@ -96,17 +97,33 @@ fun Route.serviceRoutes() {
 
     /**
      * Asks for one run of the service now, outside its schedule. Answers 202
-     * with `requestedAt` once the request is queued; the run's result appears
-     * under `/services/{id}/results` (`since=requestedAt`) when it has been
-     * made. A service that would not run is refused instead of queued for
+     * with `requestedAt` and `runId` once the request is recorded; the run is
+     * followed at `/services/{id}/runs/{runId}`, and its result is filed under
+     * that id. A service that would not run is refused instead of queued for
      * nothing: 409 `script_missing`, or 409 `service_inactive` when it is
      * switched off.
      */
     post("/services/{id}/run") {
         val caller = call.apiCaller
         val serviceId = call.pathUuid("id")
-        val requestedAt = ServiceController.triggerRun(caller.orgId, serviceId, caller.userId, refuseUnrunnable = true)
-        call.respond(HttpStatusCode.Accepted, RunRequested(requestedAt = requestedAt.toString()))
+        val ticket = ServiceController.triggerRun(caller.orgId, serviceId, caller.userId, refuseUnrunnable = true)
+        call.respond(
+            HttpStatusCode.Accepted,
+            RunRequested(requestedAt = ticket.requestedAt.toString(), runId = ticket.runId.toString()),
+        )
+    }
+
+    /**
+     * Where a run asked for with `POST …/run` stands: `pending`, then `done`
+     * or `skipped` (with the result, and for a skip its reason), or `expired`
+     * when nothing was recorded within the gateway's bound. 404 for an id that
+     * is not a run of this service.
+     */
+    get("/services/{id}/runs/{runId}") {
+        val caller = call.apiCaller
+        val serviceId = call.pathUuid("id")
+        val runId = call.pathUuid("runId")
+        call.respond(RunRequestController.status(caller.orgId, serviceId, runId, caller.userId))
     }
 
     /** The agents the service may run on, by slug. An empty list means any agent. */

@@ -3,6 +3,10 @@ package dev.tracedown.scheduler.scheduling
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Workspaces
+import dev.tracedown.common.runs.RunTrigger
+import dev.tracedown.scheduler.dispatch.DispatchItem
+import io.lettuce.core.SetArgs
+import io.lettuce.core.api.sync.RedisCommands
 import io.lettuce.core.pubsub.RedisPubSubAdapter
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection
 import kotlinx.coroutines.*
@@ -28,6 +32,14 @@ class ScheduleSyncService(
     private val quartzManager: QuartzManager,
     private val sweepIntervalSeconds: Long,
     private val pubSubConnection: StatefulRedisPubSubConnection<String, String>,
+    /**
+     * Where a run that names an id is claimed (see [RunTrigger.claimKey]), so
+     * that of the replicas that all hear it exactly one runs it. Null claims
+     * every run: right for a single scheduler, and for tests.
+     */
+    private val claims: RedisCommands<String, String>? = null,
+    /** Where a run asked for is handed. The dispatch queue; a seam for tests. */
+    private val enqueueRun: (DispatchItem) -> Boolean = { ProbeJobContext.dispatchQueue.enqueue(it) },
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -81,38 +93,80 @@ class ScheduleSyncService(
     /**
      * Subscribes to Redis pub/sub for low-latency coordination:
      * - `schedule:nudge` — re-syncs a service's Quartz job on config change.
-     * - `probe:trigger` — enqueues one immediate dispatch for a service.
+     * - [RunTrigger.TRIGGER_CHANNEL] — one immediate dispatch for a service,
+     *   named by its bare id (what a gateway from before run handles sends,
+     *   and what any gateway sends when no scheduler heard the run channel).
+     * - [RunTrigger.RUN_CHANNEL] — one immediate dispatch filed under the run
+     *   id the gateway handed out for it.
      */
     fun startPubSub() {
-        pubSubConnection.addListener(object : RedisPubSubAdapter<String, String>() {
+        val connection = pubSubConnection
+        connection.addListener(object : RedisPubSubAdapter<String, String>() {
             override fun message(channel: String, message: String) {
-                try {
-                    val serviceId = UUID.fromString(message)
-                    when (channel) {
-                        "schedule:nudge" -> handleNudge(serviceId)
-                        "probe:trigger" -> handleTrigger(serviceId)
-                    }
-                } catch (e: Exception) {
-                    log.warn("invalid pub/sub message '{}' on {}: {}", message, channel, e.message)
-                }
+                onMessage(channel, message)
             }
         })
-        pubSubConnection.sync().subscribe("schedule:nudge", "probe:trigger")
-        log.info("subscribed to schedule:nudge and probe:trigger")
+        connection.sync().subscribe(NUDGE_CHANNEL, RunTrigger.TRIGGER_CHANNEL, RunTrigger.RUN_CHANNEL)
+        log.info("subscribed to {}, {} and {}", NUDGE_CHANNEL, RunTrigger.TRIGGER_CHANNEL, RunTrigger.RUN_CHANNEL)
+    }
+
+    /** Handles one pub/sub message. Never throws: a bad message is logged and dropped. */
+    fun onMessage(channel: String, message: String) {
+        try {
+            if (channel == NUDGE_CHANNEL) {
+                handleNudge(UUID.fromString(message))
+                return
+            }
+            val request = RunTrigger.decode(channel, message)
+            if (request == null) {
+                log.warn("invalid pub/sub message '{}' on {}", message, channel)
+                return
+            }
+            val runId = request.runId
+            if (runId == null) handleTrigger(request.serviceId) else handleRun(request.serviceId, runId)
+        } catch (e: Exception) {
+            log.warn("invalid pub/sub message '{}' on {}: {}", message, channel, e.message)
+        }
     }
 
     /**
-     * Handles a run-now trigger for a single service by enqueueing one immediate
-     * dispatch. The dispatch path applies the same guards as scheduled runs —
-     * active/script checks, service window, distributed lock, and queue policy —
-     * so inactive or already-running services are ignored, never double-run.
+     * Handles a run-now trigger that names no run id by enqueueing one
+     * immediate dispatch. The dispatch path applies the same guards as
+     * scheduled runs — active/script checks, service window, distributed lock,
+     * and queue policy — so inactive or already-running services are ignored,
+     * never double-run.
      */
     fun handleTrigger(serviceId: UUID) {
-        val enqueued = ProbeJobContext.dispatchQueue.enqueue(serviceId)
-        if (!enqueued) {
-            log.debug("trigger: dispatch shed for service {}", serviceId)
+        enqueue(DispatchItem(serviceId, manual = true))
+    }
+
+    /**
+     * Handles a run asked for under [runId]: claimed first, because every
+     * replica hears it and only one may file a result under the id, then
+     * enqueued like any trigger. A claim that cannot be made — Redis did not
+     * answer — is not made at all: another replica may have claimed it, and
+     * two results under one id would leave one of them lost. The run is not
+     * dispatched, and its handle expires.
+     */
+    fun handleRun(serviceId: UUID, runId: UUID) {
+        val claimed = claims == null || try {
+            claims.set(RunTrigger.claimKey(runId), "1", SetArgs().nx().ex(RunTrigger.CLAIM_TTL_SECONDS)) != null
+        } catch (e: Exception) {
+            log.warn("could not claim run {} of service {} — not running it: {}", runId, serviceId, e.message)
+            false
+        }
+        if (!claimed) {
+            log.debug("run {} of service {} was claimed by another replica", runId, serviceId)
+            return
+        }
+        enqueue(DispatchItem(serviceId, manual = true, runId = runId))
+    }
+
+    private fun enqueue(item: DispatchItem) {
+        if (!enqueueRun(item)) {
+            log.debug("trigger: dispatch shed for service {} (run {})", item.serviceId, item.runId)
         } else {
-            log.debug("trigger: enqueued immediate dispatch for service {}", serviceId)
+            log.debug("trigger: enqueued immediate dispatch for service {} (run {})", item.serviceId, item.runId)
         }
     }
 
@@ -134,6 +188,10 @@ class ScheduleSyncService(
     fun stop() {
         sweepJob?.cancel()
         try { pubSubConnection.close() } catch (_: Exception) {}
+    }
+
+    private companion object {
+        const val NUDGE_CHANNEL = "schedule:nudge"
     }
 
     /**

@@ -82,6 +82,8 @@ object ProbeTargetPolicy {
          * carry the plaintext of an encrypted variable.
          */
         val source: String? = null,
+        /** Which call of the script, from 0, when the verdict was made per call ([refusalsBySyntax]). */
+        val callIndex: Int? = null,
     ) {
         companion object {
             val ALLOWED = Decision(allowed = true)
@@ -259,14 +261,18 @@ object ProbeTargetPolicy {
      * Syntactic twin of [evaluate] for save-time validation: no DNS, and hosts
      * that are still templated are left for dispatch to judge.
      */
-    fun evaluateSyntax(script: String, vars: Map<String, String>, mode: Mode): Decision {
-        for (raw in targetUrls(script)) {
-            val url = substituteVars(raw, vars)
-            val reason = checkSyntax(url, mode)
-            if (reason != null) return Decision(allowed = false, reason = reason, source = raw)
+    fun evaluateSyntax(script: String, vars: Map<String, String>, mode: Mode): Decision =
+        refusalsBySyntax(script, vars, mode).firstOrNull() ?: Decision.ALLOWED
+
+    /**
+     * Every refusal [evaluateSyntax] would make, in script order, one per call
+     * — the same judgement, for a caller that reports them all instead of
+     * stopping at the first. Empty when every call is acceptable.
+     */
+    fun refusalsBySyntax(script: String, vars: Map<String, String>, mode: Mode): List<Decision> =
+        targetUrls(script).withIndex().mapNotNull { (index, raw) ->
+            checkSyntax(substituteVars(raw, vars), mode)?.let { Decision(allowed = false, reason = it, source = raw, callIndex = index) }
         }
-        return Decision.ALLOWED
-    }
 
     private fun systemResolve(host: String): List<InetAddress> =
         InetAddress.getAllByName(host).toList()

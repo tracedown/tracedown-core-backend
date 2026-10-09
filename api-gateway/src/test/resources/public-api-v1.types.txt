@@ -524,3 +524,169 @@ dev.tracedown.gateway.data.workspaces.WorkspaceSummary
   id: kotlin.String
   name: kotlin.String
   createdAt: kotlin.String
+
+dev.tracedown.gateway.data.CreateVariableRequest
+  key: kotlin.String
+  value: kotlin.String
+  type: kotlin.String optional enum [variable, secret, metric]
+
+dev.tracedown.gateway.data.VariableSummary
+  id: kotlin.String
+  key: kotlin.String
+  value: kotlin.String
+  type: kotlin.String enum [variable, secret, metric]
+  systemType: kotlin.String? optional
+  createdAt: kotlin.String
+  updatedAt: kotlin.String
+  masked: kotlin.Boolean optional
+
+dev.tracedown.gateway.data.agents.PublicAgentSummary
+  slug: kotlin.String
+  label: kotlin.String
+  status: kotlin.String optional enum [healthy, degraded, down, unknown]
+  lastCheckAt: kotlin.String? optional
+
+dev.tracedown.gateway.data.apikeys.ApiKeyInfo
+  id: kotlin.String
+  name: kotlin.String
+  prefix: kotlin.String?
+  access: kotlin.String enum [read, write]
+  expiresAt: kotlin.String?
+  organization: dev.tracedown.gateway.data.apikeys.ApiKeyInfo.Organization
+  user: dev.tracedown.gateway.data.apikeys.ApiKeyInfo.User
+
+dev.tracedown.gateway.data.orgs.ResourceAccessEntry
+  principalType: kotlin.String enum [user, group]
+  principalId: kotlin.String
+  name: kotlin.String
+  email: kotlin.String? optional
+  permissions: kotlin.Short
+
+dev.tracedown.gateway.data.orgs.UpsertAccessRequest
+  principalType: kotlin.String enum [user, group]
+  principalId: kotlin.String
+  permissions: kotlin.Short
+
+dev.tracedown.gateway.data.results.ProbeResultDetail
+  id: kotlin.String
+  serviceId: kotlin.String
+  status: kotlin.String enum [success, failure, timeout, skipped, error]
+  runDurationMs: kotlin.Int
+  startedAt: kotlin.String
+  probeAgentId: kotlin.Long? optional
+  rawResult: JsonElement
+  steps: List<dev.tracedown.gateway.data.results.ProbeStepSummary>
+  agentSlug: kotlin.String? optional
+  trigger: kotlin.String optional enum [schedule, manual]
+
+dev.tracedown.gateway.data.results.ProbeResultSummary
+  id: kotlin.String
+  status: kotlin.String enum [success, failure, timeout, skipped, error]
+  runDurationMs: kotlin.Int
+  totalResponseMs: kotlin.Int
+  startedAt: kotlin.String
+  agentSlug: kotlin.String? optional
+  trigger: kotlin.String optional enum [schedule, manual]
+
+dev.tracedown.gateway.data.results.RunStatus
+  runId: kotlin.String
+  state: kotlin.String enum [pending, done, skipped, expired]
+  requestedAt: kotlin.String
+  result: dev.tracedown.gateway.data.results.ProbeResultSummary? optional
+  reason: kotlin.String? optional
+  status: kotlin.String? optional enum [success, failure, timeout, skipped, error]
+  results: List<dev.tracedown.gateway.data.results.ProbeResultSummary> optional
+
+dev.tracedown.gateway.data.services.BlockedTarget
+  source: kotlin.String
+  reason: kotlin.String
+
+dev.tracedown.gateway.data.services.FailedAssertion
+  scope: kotlin.String
+  expected: kotlin.String?
+  actual: kotlin.String?
+  expression: kotlin.String? optional
+
+dev.tracedown.gateway.data.services.ProbePoint
+  status: kotlin.String enum [success, failure, timeout, skipped, error]
+  avgResponseMs: kotlin.Int
+  callCount: kotlin.Int
+  failedCalls: kotlin.Int
+  timestamp: kotlin.Long
+
+dev.tracedown.gateway.data.services.RunRequested
+  ok: kotlin.Boolean optional
+  requestedAt: kotlin.String
+  runId: kotlin.String
+
+dev.tracedown.gateway.data.services.ScriptLimits
+  callCount: kotlin.Int
+  maxCalls: kotlin.Int? optional
+  minIntervalMinutes: kotlin.Int? optional
+
+dev.tracedown.gateway.data.services.ScriptTargets
+  blocked: List<dev.tracedown.gateway.data.services.BlockedTarget>
+  unverified: List<kotlin.String>
+  unresolved: List<kotlin.String>
+
+dev.tracedown.gateway.data.services.ScriptValidation
+  valid: kotlin.Boolean
+  errors: List<dev.tracedown.gateway.data.services.ScriptValidationError>
+  targets: dev.tracedown.gateway.data.services.ScriptTargets
+  limits: dev.tracedown.gateway.data.services.ScriptLimits
+  domainsChecked: kotlin.Boolean optional
+  complete: kotlin.Boolean optional
+
+dev.tracedown.gateway.data.services.ScriptValidationError
+  code: kotlin.String
+  callIndex: kotlin.Int? optional
+  field: kotlin.String? optional
+  detail: kotlin.String? optional
+
+dev.tracedown.gateway.data.services.ServiceSummary
+  id: kotlin.String
+  projectId: kotlin.String
+  name: kotlin.String
+  label: kotlin.String?
+  script: kotlin.String
+  schedule: kotlin.String
+  probeMode: kotlin.String enum [consecutive, simultaneous, random]
+  queuePolicy: kotlin.String enum [skip, enqueue_once]
+  serviceWindow: kotlin.String?
+  saveResponseBodies: kotlin.Boolean
+  unverifiedTargets: List<kotlin.String> optional
+  isActive: kotlin.Boolean
+  lastStatus: kotlin.String?
+  lastStatusSince: kotlin.String?
+  version: kotlin.Int
+  createdAt: kotlin.String
+  metrics: dev.tracedown.gateway.data.metrics.ServiceMetricsDto? optional
+  lastFailure: dev.tracedown.gateway.data.services.LastFailureInfo? optional
+
+dev.tracedown.gateway.data.services.SkippedService
+  serviceId: kotlin.String
+  name: kotlin.String
+  reason: kotlin.String enum [forbidden, script_missing, script_invalid]
+
+dev.tracedown.gateway.data.services.ValidateScriptRequest
+  script: kotlin.String
+  serviceId: kotlin.String? optional
+
+dev.tracedown.gateway.data.silences.CreateSilenceRequest
+  channel: kotlin.String enum [email, all, quiet-hours]
+  workspaceId: kotlin.String? optional
+  projectId: kotlin.String? optional
+  serviceId: kotlin.String? optional
+  config: kotlin.String? optional
+  quietHours: kotlin.String? optional
+
+dev.tracedown.gateway.data.silences.SilenceSummary
+  id: kotlin.String
+  orgUserId: kotlin.String
+  workspaceId: kotlin.String?
+  projectId: kotlin.String?
+  serviceId: kotlin.String?
+  channel: kotlin.String enum [email, webhook, all, quiet-hours]
+  config: kotlin.String?
+  quietHours: kotlin.String?
+  resourceName: kotlin.String? optional

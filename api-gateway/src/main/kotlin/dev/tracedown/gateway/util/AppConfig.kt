@@ -99,9 +99,25 @@ data class SystemLimitsConfig(
     val maxVarsPerResource: Int,
     /** Most API keys one user may hold, across every organization they belong to. */
     val maxApiKeysPerUser: Int,
+    /**
+     * How long a run somebody asked for may go without a result before its
+     * handle reads `expired`. Null derives it from the probe timeout
+     * ([dev.tracedown.common.runs.RunBounds.runExpirySeconds]).
+     */
+    val runRequestExpirySeconds: Long? = null,
+    /** The scheduler's per-request probe timeout, which the run expiry is derived from. */
+    val probeDefaultTimeoutMs: Int = DEFAULT_PROBE_TIMEOUT_MS,
 ) {
+    /** The run expiry in force: the configured one, or the one derived from the probe timeout. */
+    val effectiveRunExpirySeconds: Long
+        get() = runRequestExpirySeconds ?: dev.tracedown.common.runs.RunBounds.runExpirySeconds(probeDefaultTimeoutMs)
+
     companion object {
         const val DEFAULT_MAX_API_KEYS_PER_USER = 20
+        const val DEFAULT_PROBE_TIMEOUT_MS = 30_000
+
+        /** A configured number that counts only when above 0: unset, empty, 0 and negatives all read as unset. */
+        fun positive(raw: String?): Long? = raw?.trim()?.toLongOrNull()?.takeIf { it > 0 }
     }
 }
 
@@ -201,6 +217,12 @@ data class AppConfig(
                         ?: VariableLimits.DEFAULT_MAX_PER_RESOURCE,
                     maxApiKeysPerUser = config.propertyOrNull("systemLimits.maxApiKeysPerUser")?.getString()?.toInt()
                         ?: SystemLimitsConfig.DEFAULT_MAX_API_KEYS_PER_USER,
+                    runRequestExpirySeconds = SystemLimitsConfig.positive(
+                        config.propertyOrNull("systemLimits.runRequestExpirySeconds")?.getString(),
+                    ),
+                    probeDefaultTimeoutMs = SystemLimitsConfig.positive(config.propertyOrNull("probe.defaultTimeoutMs")?.getString())
+                        ?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt()
+                        ?: SystemLimitsConfig.DEFAULT_PROBE_TIMEOUT_MS,
                 ),
                 maxRequestBodyBytes = config.propertyOrNull("requestBody.maxBytes")
                     ?.getString()?.toLongOrNull()?.takeIf { it > 0 } ?: DEFAULT_MAX_REQUEST_BODY_BYTES,
