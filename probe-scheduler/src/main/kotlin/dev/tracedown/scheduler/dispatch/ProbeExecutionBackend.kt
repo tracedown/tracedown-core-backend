@@ -153,9 +153,16 @@ class AgentExecutionBackend(
 
             val failure = dispatched.failure
             if (dispatched.result != null || failure == null) {
+                // Only the agent's own timeout carries its reading of the
+                // connection; a synthetic result is settled already.
+                val result = if (dispatched.fromAgent && dispatched.result != null) {
+                    settle(request, agent, dispatched.result, eligible)
+                } else {
+                    dispatched.result
+                }
                 return ProbeExecutionBackend.Execution(
                     agentId = agent.id,
-                    result = dispatched.result,
+                    result = result,
                     egressBytes = egressBytes,
                     failureReason = if (dispatched.result == null) failure?.reason else null,
                 )
@@ -187,6 +194,33 @@ class AgentExecutionBackend(
             )
             agent = next
         }
+    }
+
+    /**
+     * Whose a timed-out run is ([TimeoutSettlement]), asking another eligible
+     * agent to reach the endpoint when the first one's reading puts the stall
+     * on the path. The second agent is any eligible one — the question is not
+     * a re-run, so agents the run already used are fine — but never the one
+     * that timed out.
+     */
+    private suspend fun settle(
+        request: ProbeExecutionBackend.Request,
+        agent: AgentSelector.Agent,
+        result: JsonObject,
+        eligible: Lazy<List<AgentSelector.Agent>>,
+    ): JsonObject {
+        val settled = TimeoutSettlement.settle(result, agent.slug) { target ->
+            TimeoutSettlement.pickWitness(eligible.value, agent)?.let { witness ->
+                TimeoutSettlement.Witness(witness.slug, dispatch.reach(witness.uri, witness.slug, target))
+            }
+        }
+        if (settled !== result && settled["outcome"] != result["outcome"]) {
+            log.info(
+                "service {}: timeout on agent {} settled as the agent's, not the endpoint's — recorded as an error",
+                request.serviceId, agent.slug,
+            )
+        }
+        return settled
     }
 
     /**

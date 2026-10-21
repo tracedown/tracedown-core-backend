@@ -233,6 +233,44 @@ class AgentDispatchService(
     }
 
     /**
+     * Asks an agent whether it reaches [target] over a clean path — the second
+     * opinion [TimeoutSettlement] takes when another agent's run timed out on
+     * a path that lost packets or never answered. The agent opens connections
+     * and TLS handshakes only, never an HTTP request.
+     *
+     * Null when there is no answer to use: unreachable, an error status (an
+     * agent older than the endpoint answers 404), or a body that is not one.
+     * A missing answer settles nothing, and the run keeps its timeout.
+     */
+    suspend fun reach(agentUri: String, expectedSlug: String, target: TimeoutSettlement.Target): JsonObject? {
+        val body = buildJsonObject {
+            put("host", target.host)
+            put("port", target.port)
+            put("tls", target.tls)
+        }
+        return try {
+            val response = clientFactory.client(expectedSlug).post("$agentUri/reach") {
+                contentType(ContentType.Application.Json)
+                setBody(body)
+                timeout {
+                    requestTimeoutMillis = REACH_TIMEOUT_MS
+                    socketTimeoutMillis = REACH_TIMEOUT_MS
+                }
+            }
+            if (response.status.value !in 200..299) {
+                log.warn("agent {} could not be asked to reach {}:{}: HTTP {}", expectedSlug, target.host, target.port, response.status.value)
+                return null
+            }
+            Json.decodeFromString<JsonObject>(response.bodyAsText())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.warn("agent {} could not be asked to reach {}:{}: {}", expectedSlug, target.host, target.port, e.message)
+            null
+        }
+    }
+
+    /**
      * The agent took the job and returned nothing within [clientTimeoutMs] —
      * the budget it was dispatched plus the grace for processing and network.
      * The check did not evaluate, so this is an `error`, never a `timeout`.
@@ -251,6 +289,13 @@ class AgentDispatchService(
     companion object {
         /** Enough to identify the fault, short enough to keep out of the result payload's way. */
         private const val ERROR_DETAIL_MAX_CHARS = 300
+
+        /**
+         * How long a second agent has to report on a path: three connections
+         * and handshakes on its side, each bounded at a few seconds. Inside
+         * the execution lock's retry window, which this wait shares.
+         */
+        const val REACH_TIMEOUT_MS = 15_000L
 
         /** Grace past the run budget for the agent to answer: its processing plus the network. */
         const val DEFAULT_CLIENT_GRACE_MS = 15_000L
