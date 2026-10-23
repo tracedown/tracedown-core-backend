@@ -550,7 +550,7 @@ dev.tracedown.gateway.data.apikeys.ApiKeyInfo
   id: kotlin.String
   name: kotlin.String
   prefix: kotlin.String?
-  access: kotlin.String enum [read, write]
+  access: kotlin.String enum [read, write, admin]
   expiresAt: kotlin.String?
   organization: dev.tracedown.gateway.data.apikeys.ApiKeyInfo.Organization
   user: dev.tracedown.gateway.data.apikeys.ApiKeyInfo.User

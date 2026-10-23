@@ -4,7 +4,6 @@ import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.email.EmailPublisher
 import dev.tracedown.common.errors.ErrorCodes
-import dev.tracedown.common.auth.canWrite
 import dev.tracedown.gateway.data.apikeys.ApiKeyAccess
 import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.models.EmailChangeRequests
@@ -516,7 +515,7 @@ object UserDataController {
                     organizationId = row[ApiKeys.organizationId].toString(),
                     name = row[ApiKeys.name],
                     prefix = row[ApiKeys.keyPrefix],
-                    access = if (row[ApiKeys.access].canWrite()) ApiKeyAccess.WRITE else ApiKeyAccess.READ,
+                    access = ApiKeyAccess.name(row[ApiKeys.access]),
                     lastUsedAt = row[ApiKeys.lastUsedAt]?.toString(),
                     expiresAt = row[ApiKeys.expiresAt]?.toString(),
                     revoked = row[ApiKeys.revoked],

@@ -66,7 +66,7 @@ data class ApiCaller(
     val orgId: UUID,
     val email: String,
     val keyId: UUID,
-    /** The key's own ceiling — an `AccessLevel`: read or write. */
+    /** The key's own ceiling — an `AccessLevel` (read or write), or `ApiKeys.ADMIN_ACCESS`. */
     val access: Short,
 ) {
     internal companion object {

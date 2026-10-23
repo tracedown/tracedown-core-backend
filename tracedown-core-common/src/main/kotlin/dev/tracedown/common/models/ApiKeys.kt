@@ -20,8 +20,17 @@ object ApiKeys : Table("api_keys") {
     val keyHash = varchar("key_hash", 255)
     /** Leading characters of the key, for telling keys apart. Null on rows that predate key authentication. */
     val keyPrefix = varchar("key_prefix", 16).nullable()
-    /** Ceiling on what the key may do, on top of its user's permissions — an `AccessLevel`: read or write. */
+    /**
+     * Ceiling on what the key may do, on top of its user's permissions — an
+     * `AccessLevel` (read or write), or [ADMIN_ACCESS].
+     */
     val access = short("access").default(AccessLevel.READ)
+
+    /**
+     * The key-only level above write, for organization administration through
+     * keys. It passes every write check; nothing asks for more yet.
+     */
+    const val ADMIN_ACCESS: Short = 3
     val lastUsedAt = timestamp("last_used_at").nullable()
     val expiresAt = timestamp("expires_at").nullable()
     val revoked = bool("revoked").default(false)

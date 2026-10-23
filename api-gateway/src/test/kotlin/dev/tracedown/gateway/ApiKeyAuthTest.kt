@@ -493,7 +493,7 @@ class ApiKeyAuthTest {
         assertRefused(400, "invalid_request_body", post("/api/v1/me/api-keys", """{"name":"k"}""", session))
         assertRefused(
             400, "invalid_request_body",
-            post("/api/v1/me/api-keys", """{"name":"k","access":"admin","password":"$PASSWORD"}""", session),
+            post("/api/v1/me/api-keys", """{"name":"k","access":"owner","password":"$PASSWORD"}""", session),
         )
         assertRefused(400, "incorrect_password", post("/api/v1/me/api-keys", """{"name":"k","password":"nope"}""", session))
 
@@ -730,6 +730,21 @@ class ApiKeyAuthTest {
             assertEquals(200, send(method, "/api/public/v1/test/act", writeKey).first, method)
         }
         assertEquals(4, auditRows(owner.orgId, "test.act").size)
+    }
+
+    @Test
+    fun `an administration key is stored above write and does everything a write key does`() {
+        val owner = newOwner()
+        val session = login(owner)
+        val created = createKey(session, access = "admin")
+        assertEquals("admin", created.str("access"))
+        assertEquals(ApiKeys.ADMIN_ACCESS, keyRow(created.str("id"))[ApiKeys.access])
+
+        val key = created.str("key")
+        assertEquals("admin", json(get("/api/public/v1/key", key).second).str("access"))
+        for (method in listOf("POST", "PUT", "PATCH", "DELETE")) {
+            assertEquals(200, send(method, "/api/public/v1/test/act", key).first, method)
+        }
     }
 
     @Test

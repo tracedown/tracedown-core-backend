@@ -17,7 +17,7 @@ data class ApiKeyContext(
     val organizationId: UUID,
     val email: String,
     val totpEnabled: Boolean,
-    /** The key's own ceiling — an [AccessLevel]: read or write. */
+    /** The key's own ceiling — an [AccessLevel] (read or write), or `ApiKeys.ADMIN_ACCESS`. */
     val access: Short,
 )
 

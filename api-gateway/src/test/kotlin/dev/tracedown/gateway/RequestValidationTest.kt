@@ -82,10 +82,11 @@ class RequestValidationTest {
     }
 
     @Test
-    fun `CreateApiKeyRequest knows two access levels and asks for the password`() {
+    fun `CreateApiKeyRequest knows three access levels and asks for the password`() {
         assertTrue(CreateApiKeyRequest("k", access = "read", password = "pw").validate().isEmpty())
         assertTrue(CreateApiKeyRequest("k", access = "write", password = "pw").validate().isEmpty())
-        assertEquals(listOf("invalid_access"), CreateApiKeyRequest("k", access = "admin", password = "pw").validate())
+        assertTrue(CreateApiKeyRequest("k", access = "admin", password = "pw").validate().isEmpty())
+        assertEquals(listOf("invalid_access"), CreateApiKeyRequest("k", access = "owner", password = "pw").validate())
         // Minting a credential re-proves identity: a request without a password is not one.
         assertEquals(listOf("password_required"), CreateApiKeyRequest("k", password = "").validate())
     }

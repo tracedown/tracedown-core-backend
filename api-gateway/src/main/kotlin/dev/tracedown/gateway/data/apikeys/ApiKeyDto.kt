@@ -1,22 +1,47 @@
 package dev.tracedown.gateway.data.apikeys
 
+import dev.tracedown.common.auth.AccessLevel
+import dev.tracedown.common.auth.canWrite
+import dev.tracedown.common.errors.ErrorCodes
+import dev.tracedown.common.models.ApiKeys
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
+import dev.tracedown.gateway.util.BadRequestException
 import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 
-/** The two levels a key can be issued at, as they appear on the wire. */
+/**
+ * The levels a key can be issued at, as they appear on the wire. `admin`
+ * carries everything `write` does and is reserved for organization
+ * administration through keys, which no endpoint serves yet.
+ */
 object ApiKeyAccess {
     const val READ = "read"
     const val WRITE = "write"
-    val ALL = setOf(READ, WRITE)
+    const val ADMIN = "admin"
+    val ALL = setOf(READ, WRITE, ADMIN)
+
+    /** The stored level for [name], one of [ALL]. */
+    fun level(name: String): Short = when (name) {
+        READ -> AccessLevel.READ
+        WRITE -> AccessLevel.WRITE
+        ADMIN -> ApiKeys.ADMIN_ACCESS
+        else -> throw BadRequestException(ErrorCodes.FIELD_INVALID)
+    }
+
+    /** The wire name of a stored [level]. */
+    fun name(level: Short): String = when {
+        level >= ApiKeys.ADMIN_ACCESS -> ADMIN
+        level.canWrite() -> WRITE
+        else -> READ
+    }
 }
 
 @Serializable
 data class CreateApiKeyRequest(
     val name: String,
     val expiresInDays: Int? = null,
-    /** `read` or `write`. A key is read-only unless it is asked to be more. */
+    /** `read`, `write` or `admin`. A key is read-only unless it is asked to be more. */
     val access: String = ApiKeyAccess.READ,
     /** The caller's password: minting a credential asks for it again. */
     val password: String,
@@ -43,7 +68,7 @@ data class ApiKeySummary(
     val key: String? = null,
     /** Leading characters of the key, for telling keys apart. */
     val prefix: String?,
-    /** `read` or `write`. */
+    /** `read`, `write` or `admin`. */
     val access: String,
     /** `active`, `revoked`, `expired`, or `inactive` — the user it acts as cannot currently act in the organization. */
     val state: String,
@@ -65,7 +90,7 @@ data class ApiKeyInfo(
     val id: String,
     val name: String,
     val prefix: String?,
-    @JsonSchema.Enum("read", "write")
+    @JsonSchema.Enum("read", "write", "admin")
     val access: String,
     val expiresAt: String?,
     val organization: Organization,
