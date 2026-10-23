@@ -67,6 +67,7 @@ object Tables {
         Projects,
         ResourcePermissions,
         ResourceWebhookAccess,
+        RunRequests,
         ServiceAllowedAgents,
         ServiceVariables,
         Services,

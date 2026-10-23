@@ -67,9 +67,23 @@ object DomainPolicy {
         vars: Map<String, String>,
         orgId: UUID,
         concealed: Set<String> = emptySet(),
+    ): Evaluation = evaluateCalls(ProbeTargetPolicy.targetUrls(script), usesIncludes(script), vars, orgId, concealed)
+
+    /** Whether [script] uses `includes(...)` — read as [evaluate] reads it. */
+    fun usesIncludes(script: String): Boolean = INCLUDES_RE.containsMatchIn(script)
+
+    /**
+     * [evaluate] over a given list of call URLs as the script writes them —
+     * for a caller that judges only some of a script's calls (the ones whose
+     * hosts it can see). Must be called within a transaction.
+     */
+    fun evaluateCalls(
+        urls: List<String>,
+        usesIncludes: Boolean,
+        vars: Map<String, String>,
+        orgId: UUID,
+        concealed: Set<String> = emptySet(),
     ): Evaluation {
-        val usesIncludes = INCLUDES_RE.containsMatchIn(script)
-        val urls = ProbeTargetPolicy.targetUrls(script)
         if (urls.isEmpty()) return Evaluation(covered = true, callCount = 0, usesIncludes = usesIncludes)
 
         val hosts = urls.map { hostOf(it, vars) }

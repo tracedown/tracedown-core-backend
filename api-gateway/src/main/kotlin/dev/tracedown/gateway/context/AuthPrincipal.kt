@@ -11,7 +11,8 @@ sealed interface Credential {
 
     /**
      * An API key. [access] is the key's own ceiling (an `AccessLevel`: read or
-     * write), applied on top of the permissions of the user the key acts as.
+     * write, or `ApiKeys.ADMIN_ACCESS`), applied on top of the permissions of
+     * the user the key acts as.
      */
     data class ApiKey(val keyId: UUID, val access: Short) : Credential
 }

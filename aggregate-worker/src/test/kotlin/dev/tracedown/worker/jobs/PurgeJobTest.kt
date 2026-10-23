@@ -19,6 +19,7 @@ import dev.tracedown.common.models.EmailChangeRequests
 import dev.tracedown.common.models.PasswordResetTokens
 import dev.tracedown.common.models.PendingBodyDeletions
 import dev.tracedown.common.models.ProbeResults
+import dev.tracedown.common.models.RunRequests
 import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.models.ProjectNotificationTemplates
 import dev.tracedown.common.models.Projects
@@ -1464,6 +1465,46 @@ class PurgeJobTest {
             assertEquals(0, count(OrgAuditLog, OrgAuditLog.id eq oldId))
             assertEquals(1, count(OrgAuditLog, OrgAuditLog.id eq freshId))
         }
+    }
+
+    @Test
+    fun `run requests go on their purge date, and with their service`() {
+        lateinit var past: UUID
+        lateinit var future: UUID
+        lateinit var forever: UUID
+        lateinit var purged: UUID
+        transaction {
+            val owner = insertUser()
+            val org = insertOrg(owner)
+            val ws = insertWorkspace(org)
+            val kept = insertService(insertProject(ws))
+            fun request(service: UUID, purgeAfter: Instant?): UUID {
+                val id = UUID.randomUUID()
+                RunRequests.insert {
+                    it[RunRequests.id] = id
+                    it[serviceId] = service
+                    it[organizationId] = org
+                    it[requestedBy] = owner
+                    it[requestedAt] = NOW.minus(40, ChronoUnit.DAYS)
+                    it[RunRequests.purgeAfter] = purgeAfter
+                }
+                return id
+            }
+            past = request(kept, NOW.minus(10, ChronoUnit.DAYS))
+            future = request(kept, NOW.plus(10, ChronoUnit.DAYS))
+            forever = request(kept, null)
+            purged = request(insertService(insertProject(ws, purge = true)), null)
+        }
+
+        runBlocking { RetentionJob(defaultRetentionDays = 30, storageClient = FakeStorage()).execute() }
+        transaction {
+            assertEquals(0, count(RunRequests, RunRequests.id eq past))
+            assertEquals(1, count(RunRequests, RunRequests.id eq future))
+            assertEquals(1, count(RunRequests, RunRequests.id eq forever), "kept for good while results are")
+        }
+
+        runPurge()
+        transaction { assertEquals(0, count(RunRequests, RunRequests.id eq purged), "a purged service takes its run requests") }
     }
 
     @Test

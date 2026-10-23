@@ -1,6 +1,7 @@
 package dev.tracedown.gateway.routes.publicapi
 
 import dev.tracedown.gateway.data.publicapi.PublicApiError
+import dev.tracedown.gateway.util.Idempotency
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.openapi.ExternalDocs
@@ -26,6 +27,8 @@ import kotlinx.serialization.descriptors.elementDescriptors
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -52,7 +55,29 @@ private val descriptionJson = Json { explicitNulls = false; encodeDefaults = tru
 private val API_SUMMARY = """
     The key-authenticated API. Every operation needs an API key, sent as `Authorization: Bearer td_…`. A key acts
     as the user who created it, in one organization, and may never do more than that user may; a read-only key is
-    refused anything but GET and HEAD (403 `api_key_read_only`). HEAD is answered on every GET path.
+    refused anything but GET and HEAD (403 `api_key_read_only`) — and `POST /scripts/validate`, which changes
+    nothing. HEAD is answered on every GET path.
+
+    **Idempotent requests.** Every POST (but `/scripts/validate`) takes an `Idempotency-Key` header: 1–128
+    printable ASCII characters of the caller's choosing, unique per request. A repeat with the same key and the same
+    request (method, path, query parameters, content type and body) is never made a second time:
+    - after a success (2xx), it is answered with the first answer for 24 hours, marked `Idempotent-Replayed: true`
+      (status, type and body; headers the first answer carried are not kept);
+    - after a refusal or failure (4xx, 5xx), nothing was remembered — it runs again;
+    - while the first is still being answered, 409 `idempotency_in_progress` with `Retry-After`;
+    - when the first was cut off while it ran (its client went away), or succeeded with an answer over 256 KiB (that
+      answer carried `Idempotency-Status: not-kept`), 409 `idempotency_outcome_unknown` for 24 hours: it may have
+      taken effect, so it is not made again — check, then use a new key.
+    A request still marked as being answered after 5 minutes is answered 409 `idempotency_outcome_unknown` too. The
+    same key with a different request is 422 `idempotency_key_reused`. What is remembered — answers and unknown
+    outcomes, at their stored size — counts against a budget per organization (64 MiB unless the operator set
+    another), in a window fixed at 24 hours from its first use; once it is spent, a request with a new key is refused
+    before it runs, 429 `idempotency_limit_reached` with `Retry-After` (when the window ends). A replay checks the
+    caller is still a member of the organization, not the route's own permission again. When the store that remembers keys
+    does not answer, a request carrying one is refused, 503 `idempotency_unavailable` with `Retry-After`.
+
+    **Unknown values.** New values can appear in `state`, `status`, `trigger` and `reason` fields; treat one you do
+    not know as you would the nearest one you do, never as an error.
 
     **Base URL.** The server below is relative, so that a gateway published under a path prefix still gives the
     right addresses; code generators emit it literally — set your client's base URL to the gateway's origin (and
@@ -74,8 +99,8 @@ private val API_SUMMARY = """
     most 100); there is no filtering or sorting beyond the named query parameters an operation lists. `/agents`,
     `/services/{id}/agents`, `/access/…` and the metrics histories answer bare arrays. Every order is fixed:
     oldest first (by creation, then id) for workspaces, projects, services, variables, webhooks and bindings; by
-    name, then id, for members and groups; by id for silences; most recent first for results; by slug for agents;
-    groups then users, each by name then id, for access.
+    name, then id, for members and groups; by id for silences; most recent first for results (or oldest first, with
+    `order=asc`); by slug for agents; groups then users, each by name then id, for access.
 """.trimIndent()
 
 /** Each error status, with the codes it is answered with across the API. */
@@ -89,12 +114,23 @@ private val STATUS_CODES: Map<HttpStatusCode, String> = mapOf(
     HttpStatusCode.NotFound to "`not_found` — no such resource, or one the caller may not see.",
     HttpStatusCode.MethodNotAllowed to "`method_not_allowed`.",
     HttpStatusCode.Conflict to "`already_exists`, `version_conflict`, `binding_exists`, `script_missing`, `service_inactive`.",
+    HttpStatusCode.UnprocessableEntity to "`idempotency_key_reused` — the `Idempotency-Key` was used with a different request.",
     HttpStatusCode.Gone to "`body_gone` — the step recorded a body that is no longer there.",
     HttpStatusCode.PayloadTooLarge to "`request_body_too_large` (the request), or `body_too_large` (a stored body; " +
         "`details.maxBytes`).",
     HttpStatusCode.TooManyRequests to "`rate_limited` (the key's budget) or `too_many_unknown_keys` (the address). " +
         "`Retry-After` says when to come back.",
     HttpStatusCode.ServiceUnavailable to "`body_store_unavailable` — retry with backoff after `Retry-After`.",
+)
+
+/** What an operation taking an `Idempotency-Key` adds to the shared texts. */
+private val IDEMPOTENCY_CODES: Map<HttpStatusCode, String> = mapOf(
+    HttpStatusCode.BadRequest to " A malformed `Idempotency-Key` is `field_invalid` with `details.field` `Idempotency-Key`.",
+    HttpStatusCode.Conflict to " `idempotency_in_progress` (the request with this `Idempotency-Key` is still being answered; " +
+        "`Retry-After`), `idempotency_outcome_unknown` (it may have taken effect; use a new key).",
+    HttpStatusCode.TooManyRequests to " `idempotency_limit_reached` — the organization's budget for remembered answers is " +
+        "spent; `Retry-After` says when it comes back.",
+    HttpStatusCode.ServiceUnavailable to " `idempotency_unavailable` — retry after `Retry-After`.",
 )
 
 /**
@@ -127,13 +163,21 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
     summary = operation.summary
     operation.description?.let { description = it }
     tag(operation.tag)
-    if (operation.query.isNotEmpty()) {
+    if (operation.query.isNotEmpty() || operation.idempotent) {
         parameters {
             for (parameter in operation.query) {
                 query(parameter.name) {
                     description = parameter.description
                     required = parameter.required
                     schema = buildSchema(parameter.type)
+                }
+            }
+            if (operation.idempotent) {
+                header(Idempotency.HEADER) {
+                    description = "Makes the request safe to repeat: 1–128 printable ASCII characters, unique per " +
+                        "request. A repeat within 24 hours is answered as the first was, with `Idempotent-Replayed: true`."
+                    required = false
+                    schema = buildSchema(typeOf<String>())
                 }
             }
         }
@@ -154,7 +198,8 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
         }
         for (status in operation.errorStatuses) {
             status {
-                description = STATUS_CODES[status] ?: status.description
+                description = (STATUS_CODES[status] ?: status.description) +
+                    (if (operation.idempotent) IDEMPOTENCY_CODES[status].orEmpty() else "")
                 schema = buildSchema(typeOf<PublicApiError>())
             }
         }
@@ -170,7 +215,7 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
 
 /** Path and query parameters that hold an id. */
 private val ID_PARAMETERS = setOf(
-    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId",
+    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId", "runId",
 )
 
 /** Bounds and defaults of the integer query parameters: name to (minimum, maximum, default). */
@@ -180,6 +225,10 @@ private val INTEGER_PARAMETERS = mapOf(
     "hours" to Triple(1, 168, 24),
     "days" to Triple(1, 365, 90),
 )
+
+/** The query parameters held to a set of values, and the values: the operations' own. */
+private val PARAMETER_VALUES: Map<String, List<String>> = PublicApiOperations.all
+    .flatMap { it.query }.mapNotNull { q -> q.values?.let { q.name to it } }.toMap()
 
 /** String fields that hold an instant, beyond those named `…At`. */
 private val INSTANT_FIELDS = setOf("since", "until", "coveredFrom", "coveredTo", "lastStatusSince", "lastCheck")
@@ -210,10 +259,13 @@ private fun refine(doc: JsonObject): JsonObject {
  */
 private fun publicDescriptors(types: List<KType> = PublicApiOperations.types): Map<String, SerialDescriptor> {
     val out = mutableMapOf<String, SerialDescriptor>()
-    val seen = mutableSetOf<String>()
+    // By descriptor, not by name: every list is called the same, and keying
+    // on the name stopped the walk at the second list it met — a class
+    // reached only through that list was never refined.
+    val seen = mutableSetOf<SerialDescriptor>()
     fun collect(descriptor: SerialDescriptor) {
         val name = descriptor.serialName.removeSuffix("?")
-        if (!seen.add(name + descriptor.elementsCount)) return
+        if (!seen.add(descriptor)) return
         if (descriptor.kind == StructureKind.CLASS || descriptor.kind == StructureKind.OBJECT) {
             out.putIfAbsent(componentKey(name), descriptor)
         }
@@ -253,6 +305,10 @@ private fun refineProperty(name: String, property: JsonObject, element: SerialDe
                 add(buildJsonObject { put("type", "null") })
             })
         }
+    }
+    // A nullable property held to a set of values may also be null: the set says so.
+    if (element.isNullable && p["enum"] is JsonArray && JsonNull !in p["enum"]!!.jsonArray) {
+        p = JsonObject(p + ("enum" to JsonArray(p["enum"]!!.jsonArray + JsonNull)))
     }
     if ("format" !in p && "anyOf" !in p) {
         val kind = element.kind
@@ -302,12 +358,22 @@ private fun refinePathItem(item: JsonObject): JsonObject = JsonObject(item.mapVa
     if (key !in HTTP_METHODS || value !is JsonObject) value else refineOperation(value)
 })
 
+/** The operation ids that answer bytes rather than JSON. */
+private val BINARY_OPERATIONS = PublicApiOperations.all.filter { it.binary }.map { it.operationId }.toSet()
+
+/** Every operation that takes an `Idempotency-Key`, and so may answer with `Idempotent-Replayed`. */
+private val IDEMPOTENT_OPERATIONS = PublicApiOperations.all.filter { it.idempotent }.map { it.operationId }.toSet()
+
 private fun refineOperation(operation: JsonObject): JsonObject {
     var out = operation
+    val id = (operation["operationId"] as? JsonPrimitive)?.content
+    if (id in BINARY_OPERATIONS) out = binaryAnswer(out)
+    if (id in IDEMPOTENT_OPERATIONS) out = replayHeader(out)
+    out = retryAfter(out, setOf("503"))
     operation["parameters"]?.let { parameters ->
         out = JsonObject(out + ("parameters" to JsonArray((parameters as JsonArray).map { refineParameter(it.jsonObject) })))
     }
-    operation["responses"]?.jsonObject?.let { responses ->
+    out["responses"]?.jsonObject?.let { responses ->
         val withHeaders = responses.mapValues { (status, response) ->
             if (status != "429") response else JsonObject(response.jsonObject + ("headers" to rateLimitHeaders()))
         }
@@ -316,12 +382,87 @@ private fun refineOperation(operation: JsonObject): JsonObject {
     return out
 }
 
+/** A download: its success answer is the stored bytes, with the header that makes it one. */
+private fun binaryAnswer(operation: JsonObject): JsonObject {
+    val responses = operation["responses"]?.jsonObject ?: return operation
+    val ok = responses["200"]?.jsonObject ?: return operation
+    val refined = JsonObject(ok - "content" + mapOf(
+        "description" to JsonPrimitive(
+            "The stored bytes, under the type the store recorded when the gateway repeats it (an image, JSON, text…), " +
+                "`application/octet-stream` otherwise.",
+        ),
+        "content" to buildJsonObject {
+            put("application/octet-stream", buildJsonObject {
+                put("schema", buildJsonObject { put("type", "string"); put("format", "binary") })
+            })
+        },
+        "headers" to buildJsonObject {
+            put("Content-Disposition", buildJsonObject {
+                put("description", "`attachment`, with a file name.")
+                put("schema", buildJsonObject { put("type", "string") })
+            })
+            put("X-Content-Type-Options", buildJsonObject {
+                put("description", "`nosniff`.")
+                put("schema", buildJsonObject { put("type", "string") })
+            })
+            put("Content-Length", buildJsonObject {
+                put("description", "The body's size in bytes.")
+                put("schema", buildJsonObject { put("type", "integer"); put("format", "int64") })
+            })
+            put("Cache-Control", buildJsonObject {
+                put("description", "`private, no-store`: a body can carry whatever the probed endpoint answered.")
+                put("schema", buildJsonObject { put("type", "string") })
+            })
+        },
+    ))
+    return JsonObject(operation + ("responses" to JsonObject(responses + ("200" to refined))))
+}
+
+/** Declares `Idempotent-Replayed` on an idempotent operation's success answer. */
+private fun replayHeader(operation: JsonObject): JsonObject {
+    val responses = operation["responses"]?.jsonObject ?: return operation
+    val successes = responses.filterKeys { it.startsWith("2") }.mapValues { (_, response) ->
+        val r = response.jsonObject
+        val headers = r["headers"]?.jsonObject ?: JsonObject(emptyMap())
+        JsonObject(r + ("headers" to JsonObject(headers + ("Idempotent-Replayed" to buildJsonObject {
+            put("description", "`true` when this is the remembered answer of an earlier request with the same `Idempotency-Key`.")
+            put("schema", buildJsonObject { put("type", "string"); put("enum", buildJsonArray { add(JsonPrimitive("true")) }) })
+        }) + (Idempotency.STATUS_HEADER to buildJsonObject {
+            put("description", "`not-kept` when the answer was too large to remember: a repeat answers 409 `idempotency_outcome_unknown`.")
+            put("schema", buildJsonObject { put("type", "string"); put("enum", buildJsonArray { add(JsonPrimitive("not-kept")) }) })
+        }))))
+    }
+    return retryAfter(JsonObject(operation + ("responses" to JsonObject(responses + successes))), setOf("409"))
+}
+
+/** Declares `Retry-After` on the given error answers of an operation. */
+private fun retryAfter(operation: JsonObject, statuses: Set<String>): JsonObject {
+    val responses = operation["responses"]?.jsonObject ?: return operation
+    val retryable = responses.filterKeys { it in statuses }.mapValues { (_, response) ->
+        val r = response.jsonObject
+        val headers = r["headers"]?.jsonObject ?: JsonObject(emptyMap())
+        JsonObject(r + ("headers" to JsonObject(headers + ("Retry-After" to buildJsonObject {
+            put("description", "Seconds until the request is worth repeating, where the code says so.")
+            put("schema", buildJsonObject { put("type", "integer") })
+        }))))
+    }
+    return JsonObject(operation + ("responses" to JsonObject(responses + retryable)))
+}
+
 private fun refineParameter(parameter: JsonObject): JsonObject {
     val name = (parameter["name"] as? JsonPrimitive)?.content ?: return parameter
     val schema = parameter["schema"]?.jsonObject ?: return parameter
     val refined: JsonObject = when {
         name in ID_PARAMETERS -> JsonObject(schema + ("format" to JsonPrimitive("uuid")))
-        name == "since" -> JsonObject(schema + ("format" to JsonPrimitive("date-time")))
+        name == "since" || name == "until" -> JsonObject(schema + ("format" to JsonPrimitive("date-time")))
+        // Held to a set: the values the handler checks against.
+        name in PARAMETER_VALUES && schema["type"]?.let { (it as? JsonPrimitive)?.content } == "array" ->
+            JsonObject(schema + ("items" to buildJsonObject {
+                put("type", "string")
+                put("enum", JsonArray(PARAMETER_VALUES.getValue(name).map { JsonPrimitive(it) }))
+            }))
+        name in PARAMETER_VALUES -> JsonObject(schema + ("enum" to JsonArray(PARAMETER_VALUES.getValue(name).map { JsonPrimitive(it) })) +
+            (if (name == "order") mapOf("default" to JsonPrimitive("desc")) else emptyMap()))
         name == "window" -> JsonObject(schema + ("enum" to JsonArray(listOf("24h", "7d", "30d", "90d").map { JsonPrimitive(it) })) +
             ("default" to JsonPrimitive("24h")))
         name == "resourceType" -> JsonObject(schema + ("enum" to JsonArray(listOf("workspace", "project", "service").map { JsonPrimitive(it) })))
@@ -331,7 +472,10 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
         }
         else -> schema
     }
-    return JsonObject(parameter + ("schema" to refined))
+    // `status` is repeated or comma-separated: explode=true takes the first,
+    // and the comma form is described in the parameter's text.
+    val style = if (name == "status") mapOf("style" to JsonPrimitive("form"), "explode" to JsonPrimitive(true)) else emptyMap()
+    return JsonObject(parameter + ("schema" to refined) + style)
 }
 
 private fun rateLimitHeaders(): JsonElement = buildJsonObject {

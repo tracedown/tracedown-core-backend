@@ -32,6 +32,7 @@ import dev.tracedown.common.models.ProjectVariables
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.ResourcePermissions
 import dev.tracedown.common.models.ResourceWebhookAccess
+import dev.tracedown.common.models.RunRequests
 import dev.tracedown.common.models.ServiceAllowedAgents
 import dev.tracedown.common.models.ServiceVariables
 import dev.tracedown.common.models.Services
@@ -126,7 +127,7 @@ class PurgeFkCompletenessTest {
             "org_groups", "org_rule_presets", "org_user_groups", "org_users", "org_variables",
             "organizations", "password_reset_tokens", "probe_agents", "probe_aggregates",
             "probe_results", "probe_step_aggregates", "probe_steps", "project_notification_templates",
-            "project_variables", "projects", "resource_permissions", "resource_webhook_access",
+            "project_variables", "projects", "resource_permissions", "resource_webhook_access", "run_requests",
             "service_allowed_agents", "service_variables", "services", "sessions",
             "system_alert_dismissals", "system_alerts", "totp_recovery_codes", "users",
             "webhook_deliveries", "webhook_variables", "workspace_variables", "workspaces",
@@ -368,6 +369,14 @@ class PurgeFkCompletenessTest {
             it[id] = UUID.randomUUID()
             it[ServiceAllowedAgents.serviceId] = serviceId
             it[probeAgentId] = agentId
+        }
+        // A run asked for, still waiting on its result.
+        RunRequests.insert {
+            it[id] = UUID.randomUUID()
+            it[RunRequests.serviceId] = serviceId
+            it[organizationId] = orgId
+            it[requestedBy] = ownerId
+            it[requestedAt] = NOW
         }
 
         // Variables at every scope.

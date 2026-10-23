@@ -1,10 +1,8 @@
 package dev.tracedown.gateway.controllers.apikeys
 
 import dev.tracedown.common.audit.AuditService
-import dev.tracedown.common.auth.AccessLevel
 import dev.tracedown.common.auth.ApiKeyFormat
 import dev.tracedown.common.auth.TokenHasher
-import dev.tracedown.common.auth.canWrite
 import dev.tracedown.common.auth.actingPairs
 import dev.tracedown.common.auth.resolveCachedPermissions
 import dev.tracedown.common.config.DeletionRetention
@@ -96,7 +94,7 @@ object ApiKeyController {
      */
     @Injectable("api-key.create")
     fun create(orgId: UUID, request: CreateApiKeyRequest, userId: UUID): ApiKeySummary {
-        val access = accessLevel(request.access)
+        val access = ApiKeyAccess.level(request.access)
 
         // Everything this function would refuse for is checked before the
         // identity is: verifying consumes a TOTP step or a recovery code, and
@@ -287,7 +285,7 @@ object ApiKeyController {
             id = row[ApiKeys.id].toString(),
             name = row[ApiKeys.name],
             prefix = row[ApiKeys.keyPrefix],
-            access = accessName(row[ApiKeys.access]),
+            access = ApiKeyAccess.name(row[ApiKeys.access]),
             expiresAt = row[ApiKeys.expiresAt]?.toString(),
             organization = ApiKeyInfo.Organization(
                 id = row[ApiKeys.organizationId].toString(),
@@ -348,15 +346,6 @@ object ApiKeyController {
         return ApiKeyFormat.PREFIX + Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
     }
 
-    private fun accessLevel(name: String): Short = when (name) {
-        ApiKeyAccess.READ -> AccessLevel.READ
-        ApiKeyAccess.WRITE -> AccessLevel.WRITE
-        else -> throw BadRequestException(ErrorCodes.FIELD_INVALID)
-    }
-
-    private fun accessName(level: Short): String =
-        if (level.canWrite()) ApiKeyAccess.WRITE else ApiKeyAccess.READ
-
     /**
      * Describes [rows], including whether each key could act right now.
      *
@@ -387,7 +376,7 @@ object ApiKeyController {
                 id = row[ApiKeys.id].toString(),
                 name = row[ApiKeys.name],
                 prefix = row[ApiKeys.keyPrefix],
-                access = accessName(row[ApiKeys.access]),
+                access = ApiKeyAccess.name(row[ApiKeys.access]),
                 state = state,
                 organizationId = row[ApiKeys.organizationId].toString(),
                 organizationName = row[Organizations.name],

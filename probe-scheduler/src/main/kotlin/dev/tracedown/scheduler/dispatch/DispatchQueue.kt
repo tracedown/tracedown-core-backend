@@ -6,6 +6,7 @@ import dev.tracedown.common.models.Organizations
 import dev.tracedown.common.models.Projects
 import dev.tracedown.common.models.Services
 import dev.tracedown.common.models.Workspaces
+import dev.tracedown.common.runs.RunTrigger
 import dev.tracedown.common.variables.ScriptVariableResolver
 import dev.tracedown.scheduler.config.SchedulerConfig
 import dev.tracedown.scheduler.results.ResultPublisher
@@ -67,6 +68,24 @@ const val SKIP_VARIABLE_UNREADABLE = "variable_unreadable"
 const val BODIES_WITHHELD_UNVERIFIED = "unverifiedTarget"
 
 /**
+ * One dispatch to make: a scheduled tick, or — [manual] — a run somebody asked
+ * for, filed under [runId] when the request named one (see [RunTrigger]).
+ *
+ * A manual run with an id is owed an answer: wherever a scheduled tick would
+ * stop without a trace (switched off, held, in its window, already running),
+ * it is recorded as a skipped row under its id with a [RunTrigger.SKIP_PREFIX]
+ * reason, so the handle settles instead of waiting out its bound.
+ */
+data class DispatchItem(val serviceId: UUID, val manual: Boolean = false, val runId: UUID? = null) {
+    val trigger: String get() = if (manual) RunTrigger.MANUAL else RunTrigger.SCHEDULE
+
+    companion object {
+        /** A tick of the service's schedule. */
+        fun scheduled(serviceId: UUID) = DispatchItem(serviceId)
+    }
+}
+
+/**
  * Bounded dispatch queue that decouples Quartz trigger timing from agent HTTP dispatch.
  *
  * Quartz jobs enqueue service IDs instantly (non-blocking). A fixed pool of dispatcher
@@ -117,7 +136,7 @@ class DispatchQueue(
 ) {
 
     private val log = LoggerFactory.getLogger(javaClass)
-    private val channel = Channel<UUID>(capacity)
+    private val channel = Channel<DispatchItem>(capacity)
     private val droppedCount = AtomicLong(0)
     private val unrecordedSheds = AtomicLong(0)
 
@@ -128,7 +147,7 @@ class DispatchQueue(
      * written, so a shed recorded a second later is still filed at the minute it
      * belonged to.
      */
-    private data class ShedRecord(val serviceId: UUID, val reason: String, val at: Instant)
+    private data class ShedRecord(val item: DispatchItem, val reason: String, val at: Instant)
 
     /**
      * Sheds waiting to be recorded, drained off the Quartz threads.
@@ -172,15 +191,23 @@ class DispatchQueue(
      * next triggers misfired: dropped with no row and no log, which is the
      * opposite of visible.
      */
-    fun enqueue(serviceId: UUID): Boolean {
-        if (!queuedServices.add(serviceId)) {
-            shed(serviceId, "dispatch_backlog")
+    fun enqueue(serviceId: UUID): Boolean = enqueue(DispatchItem.scheduled(serviceId))
+
+    /**
+     * Enqueues [item]. As [enqueue] for a scheduled tick; a run somebody asked
+     * for that finds its service already waiting in the queue is not a sign of
+     * overload but of a dispatch about to happen anyway, so it is recorded as
+     * [RunTrigger.SKIP_ALREADY_QUEUED] rather than as backlog.
+     */
+    fun enqueue(item: DispatchItem): Boolean {
+        if (!queuedServices.add(item.serviceId)) {
+            shed(item, if (item.manual) RunTrigger.SKIP_ALREADY_QUEUED else "dispatch_backlog")
             return false
         }
-        val result = channel.trySend(serviceId)
+        val result = channel.trySend(item)
         if (result.isFailure) {
-            queuedServices.remove(serviceId)
-            shed(serviceId, "dispatch_queue_full")
+            queuedServices.remove(item.serviceId)
+            shed(item, "dispatch_queue_full")
             return false
         }
         return true
@@ -196,15 +223,15 @@ class DispatchQueue(
      * shed. Also called on a Quartz thread; also does no I/O.
      */
     fun recordMisfire(serviceId: UUID) {
-        shed(serviceId, "trigger_misfired")
+        shed(DispatchItem.scheduled(serviceId), "trigger_misfired")
     }
 
-    private fun shed(serviceId: UUID, reason: String) {
+    private fun shed(item: DispatchItem, reason: String) {
         val count = droppedCount.incrementAndGet()
         if (count % 100 == 1L) {
-            log.warn("Dispatch over capacity ({}), shed service {}. Total sheds: {}", reason, serviceId, count)
+            log.warn("Dispatch over capacity ({}), shed service {}. Total sheds: {}", reason, item.serviceId, count)
         }
-        recordSkipped(serviceId, reason, Instant.now())
+        recordSkipped(item, reason, Instant.now())
     }
 
     /**
@@ -215,9 +242,12 @@ class DispatchQueue(
      * Non-blocking by contract: the channel refuses rather than suspends, so this
      * is safe to call from a Quartz thread, from a dispatch worker, or from the
      * error path of either.
+     *
+     * A run asked for under an id is recorded under that id, so its handle
+     * reads the skip as its answer.
      */
-    private fun recordSkipped(serviceId: UUID, reason: String, at: Instant) {
-        val result = shedChannel.trySend(ShedRecord(serviceId, reason, at))
+    private fun recordSkipped(item: DispatchItem, reason: String, at: Instant) {
+        val result = shedChannel.trySend(ShedRecord(item, reason, at))
         if (result.isFailure) {
             val lost = unrecordedSheds.incrementAndGet()
             if (lost % 100 == 1L) {
@@ -229,10 +259,10 @@ class DispatchQueue(
     /** Writes one queued shed to the result queue. Runs on this queue's own threads. */
     private fun writeSkipped(record: ShedRecord) {
         try {
-            val ctx = transaction { resolveContext(record.serviceId) } ?: return
+            val ctx = transaction { resolveContext(record.item.serviceId) } ?: return
             resultPublisher.publish(
                 jobId = UUID.randomUUID(),
-                serviceId = record.serviceId,
+                serviceId = record.item.serviceId,
                 agentId = null,
                 projectId = ctx.projectId,
                 workspaceId = ctx.workspaceId,
@@ -246,10 +276,14 @@ class DispatchQueue(
                 // got to it — the row belongs to the minute it was due.
                 startedAt = record.at,
                 agentEgressBytes = 0L, // nothing was dispatched to an agent
+                resultId = record.item.runId ?: UUID.randomUUID(),
+                trigger = record.item.trigger,
+                runId = record.item.runId,
+                runSize = 1,
             )
         } catch (e: Exception) {
             // Never let bookkeeping break the scheduling path.
-            log.debug("failed to record skipped probe for {}: {}", record.serviceId, e.message)
+            log.warn("failed to record skipped probe for {}: {}", record.item.serviceId, e.message)
         }
     }
 
@@ -258,8 +292,8 @@ class DispatchQueue(
         repeat(workers) { workerId ->
             scope.launch(dispatchThreads) {
                 log.debug("Dispatcher worker {} started", workerId)
-                for (serviceId in channel) {
-                    dispatch(serviceId, workerId)
+                for (item in channel) {
+                    dispatch(item, workerId)
                 }
             }
         }
@@ -294,17 +328,29 @@ class DispatchQueue(
      * learned about the target, and nothing about the target or the agents
      * explains it.
      */
-    private suspend fun dispatch(serviceId: UUID, workerId: Int) {
+    private suspend fun dispatch(item: DispatchItem, workerId: Int) {
         val accounted = AtomicBoolean(false)
         try {
-            runDispatch(serviceId, accounted)
+            runDispatch(item, accounted)
         } catch (e: Exception) {
-            log.error("Dispatcher worker {} failed for service {}: {}", workerId, serviceId, e.message, e)
-            if (!accounted.get()) recordSkipped(serviceId, "dispatch_error", Instant.now())
+            log.error("Dispatcher worker {} failed for service {}: {}", workerId, item.serviceId, e.message, e)
+            if (!accounted.get()) recordSkipped(item, "dispatch_error", Instant.now())
         }
     }
 
-    private suspend fun runDispatch(serviceId: UUID, accounted: AtomicBoolean) {
+    /**
+     * Answers a run asked for under an id that this dispatch is not going to
+     * make, where a scheduled tick would leave no trace: a skipped row under
+     * the run's id, naming why.
+     */
+    private fun answerRun(item: DispatchItem, reason: String, accounted: AtomicBoolean) {
+        if (item.runId == null) return
+        recordSkipped(item, reason, Instant.now())
+        accounted.set(true)
+    }
+
+    private suspend fun runDispatch(item: DispatchItem, accounted: AtomicBoolean) {
+        val serviceId = item.serviceId
         // Off the queue — the next tick for this service may enqueue again
         // (concurrent-run protection is the probe_active lock, not this set).
         queuedServices.remove(serviceId)
@@ -326,6 +372,7 @@ class DispatchQueue(
         if (service == null || service[Services.deleted] || !service[Services.isActive]) {
             log.debug("service {} is inactive/deleted — unscheduling", serviceId)
             quartzManager.unscheduleService(serviceId)
+            answerRun(item, RunTrigger.SKIP_SERVICE_INACTIVE, accounted)
             return
         }
 
@@ -338,6 +385,8 @@ class DispatchQueue(
         if (!DispatchGate.provider.allows(serviceId)) {
             log.debug("service {} is held by the dispatch gate — skipping", serviceId)
             accounted.set(true)
+            // Somebody is waiting on this one: they are told, under its id.
+            answerRun(item, RunTrigger.SKIP_HELD, accounted)
             return
         }
 
@@ -349,6 +398,7 @@ class DispatchQueue(
             ServiceWindowEvaluator.isInWindow(windowSpec, orgDefaultTimezone(service[Services.projectId]))
         ) {
             log.debug("service {} is in service window — skipping", serviceId)
+            answerRun(item, RunTrigger.SKIP_IN_SERVICE_WINDOW, accounted)
             return
         }
 
@@ -356,9 +406,18 @@ class DispatchQueue(
         // dispatch uses (below), so the lock cannot lapse mid-dispatch. The
         // returned token is required to release only our own lock.
         val lockTimeoutMs = probeConfig.defaultTimeoutMs
-        val acquisition = queuePolicy.tryAcquire(serviceId, service[Services.queuePolicy], lockTimeoutMs)
+        val acquisition = queuePolicy.tryAcquire(serviceId, service[Services.queuePolicy], lockTimeoutMs, item.runId)
         if (acquisition.result != QueuePolicyManager.AcquireResult.ACQUIRED) {
             log.debug("service {} lock not acquired ({})", serviceId, acquisition.result)
+            // ENQUEUED carries the run's id with the pending run; SKIPPED is
+            // the run's answer.
+            if (acquisition.result == QueuePolicyManager.AcquireResult.SKIPPED) {
+                answerRun(
+                    item,
+                    if (service[Services.queuePolicy] == "enqueue_once") RunTrigger.SKIP_ALREADY_QUEUED else RunTrigger.SKIP_ALREADY_RUNNING,
+                    accounted,
+                )
+            }
             return
         }
         val lockToken = acquisition.token!!
@@ -367,6 +426,7 @@ class DispatchQueue(
             val rawScript = service[Services.script]
             if (rawScript.isBlank()) {
                 log.debug("service {} has no script — skipping", serviceId)
+                answerRun(item, RunTrigger.SKIP_SCRIPT_MISSING, accounted)
                 return
             }
 
@@ -389,7 +449,7 @@ class DispatchQueue(
                     "service {} uses variables that will not decrypt ({}) — skipping",
                     serviceId, resolution.unreadable.joinToString(),
                 )
-                recordSkipped(serviceId, SKIP_VARIABLE_UNREADABLE, Instant.now())
+                recordSkipped(item, SKIP_VARIABLE_UNREADABLE, Instant.now())
                 accounted.set(true)
                 return
             }
@@ -424,7 +484,7 @@ class DispatchQueue(
                 // target, and a synthetic failure would read as downtime for a
                 // service that may be perfectly healthy. The reason names the
                 // policy so the gap is explicable from the history alone.
-                recordSkipped(serviceId, target.reason ?: "target_blocked", Instant.now())
+                recordSkipped(item, target.reason ?: "target_blocked", Instant.now())
                 accounted.set(true)
                 return
             }
@@ -464,7 +524,7 @@ class DispatchQueue(
                 // A skipped row for the same reason the address policy writes
                 // one: nothing was learned about the target, and a synthetic
                 // failure would read as downtime for a service that is fine.
-                recordSkipped(serviceId, SKIP_TARGET_OPTED_OUT, Instant.now())
+                recordSkipped(item, SKIP_TARGET_OPTED_OUT, Instant.now())
                 accounted.set(true)
                 return
             }
@@ -489,7 +549,7 @@ class DispatchQueue(
                             "service {} uses includes() against unverified domains — skipping (anti-scraping, §18.4)",
                             serviceId,
                         )
-                        recordSkipped(serviceId, SKIP_UNVERIFIED_INCLUDES, Instant.now())
+                        recordSkipped(item, SKIP_UNVERIFIED_INCLUDES, Instant.now())
                         accounted.set(true)
                         return
                     }
@@ -498,13 +558,13 @@ class DispatchQueue(
                             "service {} targets unverified domains with {} calls (max {}) — skipping",
                             serviceId, policy.callCount, DomainPolicy.MAX_CALLS,
                         )
-                        recordSkipped(serviceId, SKIP_UNVERIFIED_MAX_CALLS, Instant.now())
+                        recordSkipped(item, SKIP_UNVERIFIED_MAX_CALLS, Instant.now())
                         accounted.set(true)
                         return
                     }
                     if (!queuePolicy.allowUnverifiedTick(serviceId, DomainPolicy.MIN_INTERVAL_SECONDS)) {
                         log.debug("service {} throttled (unverified domains, 5m minimum)", serviceId)
-                        recordSkipped(serviceId, SKIP_UNVERIFIED_THROTTLE, Instant.now())
+                        recordSkipped(item, SKIP_UNVERIFIED_THROTTLE, Instant.now())
                         accounted.set(true)
                         return
                     }
@@ -550,18 +610,58 @@ class DispatchQueue(
                 // failing its health challenge) used to produce a log line and
                 // nothing else.
                 log.warn("service {} has no eligible probe executor", serviceId)
-                recordSkipped(serviceId, "no_eligible_agent", startedAt)
+                recordSkipped(item, "no_eligible_agent", startedAt)
                 accounted.set(true)
                 return
             }
 
             var published = 0
-            for (execution in executions) {
+            // The run's id goes to its first result. In `simultaneous` mode the
+            // others are siblings of it under the same job, with ids of their
+            // own; every one says which run it belongs to and how many there
+            // are, so the run reads complete only once all of them are in.
+            // A run asked for under an id counts every agent it went to: one
+            // that produced nothing is a skipped result of the run, naming
+            // why, so the missing agent shows and the run's verdict counts it.
+            // The id itself goes to the first execution that produced a
+            // result (the first of all when none did), so the result filed
+            // under it is a real one whenever there is one.
+            val runSize = executions.size
+            val idHolder = executions.indexOfFirst { it.result != null }.coerceAtLeast(0)
+            for ((index, execution) in executions.withIndex()) {
+                val resultId = if (index == idHolder) item.runId ?: UUID.randomUUID() else UUID.randomUUID()
                 // No result: the backend exhausted every agent it was allowed
-                // to re-run on. Handled after the loop — in `simultaneous` mode
-                // a sibling execution may still have produced one, and one
-                // agent failing is not the same as the tick observing nothing.
-                val result = execution.result ?: continue
+                // to re-run on. Without a run id this is handled after the loop
+                // — in `simultaneous` mode a sibling execution may still have
+                // produced one, and one agent failing is not the same as the
+                // tick observing nothing.
+                val result = execution.result
+                if (result == null) {
+                    if (item.runId == null) continue
+                    // As a scheduled skip is recorded: no agent, nothing sent.
+                    resultPublisher.publish(
+                        jobId = jobId,
+                        serviceId = serviceId,
+                        agentId = null,
+                        projectId = ctx.projectId,
+                        workspaceId = ctx.workspaceId,
+                        organizationId = ctx.orgId,
+                        rawResult = buildJsonObject {
+                            put("outcome", "skipped")
+                            put("reason", execution.failureReason ?: "agent_unreachable")
+                            put("elapsedMs", 0)
+                        },
+                        startedAt = startedAt,
+                        agentEgressBytes = 0L,
+                        resultId = resultId,
+                        trigger = item.trigger,
+                        runId = item.runId,
+                        runSize = runSize,
+                    )
+                    published++
+                    accounted.set(true)
+                    continue
+                }
                 // Strip any secret plaintext the executor echoed back (e.g. a
                 // secret placed in a request URL/header) before it is persisted.
                 val redacted = ResultRedactor.redact(result, secretValues)
@@ -577,6 +677,10 @@ class DispatchQueue(
                     agentEgressBytes = execution.egressBytes,
                     bodiesWithheld = bodiesWithheld,
                     endpointKeys = endpointKeys,
+                    resultId = resultId,
+                    trigger = item.trigger,
+                    runId = item.runId,
+                    runSize = runSize,
                 )
                 published++
                 accounted.set(true)
@@ -593,7 +697,7 @@ class DispatchQueue(
                 // loud; the row is what makes the gap visible.
                 val reason = executions.firstNotNullOfOrNull { it.failureReason } ?: "agent_unreachable"
                 log.warn("service {} produced no result from {} execution(s): {}", serviceId, executions.size, reason)
-                recordSkipped(serviceId, reason, startedAt)
+                recordSkipped(item, reason, startedAt)
                 accounted.set(true)
                 return
             }
@@ -603,15 +707,17 @@ class DispatchQueue(
             // A lock release that fails must not be mistaken for a tick that
             // produced nothing — by this point the results are already on the
             // queue.
-            val hasPending = try {
-                queuePolicy.release(serviceId, lockToken)
+            val released = try {
+                queuePolicy.releaseWithPending(serviceId, lockToken)
             } catch (e: Exception) {
                 log.warn("failed to release lock for service {}: {}", serviceId, e.message)
-                false
+                QueuePolicyManager.Released(false, null)
             }
-            if (hasPending) {
+            if (released.hasPending) {
                 log.debug("service {} has pending run — re-enqueueing", serviceId)
-                enqueue(serviceId)
+                // A pending run somebody asked for under an id runs under it.
+                val pendingRun = released.pendingRunId
+                enqueue(if (pendingRun != null) DispatchItem(serviceId, manual = true, runId = pendingRun) else DispatchItem.scheduled(serviceId))
             }
         }
     }

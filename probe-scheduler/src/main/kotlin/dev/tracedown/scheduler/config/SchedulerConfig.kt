@@ -138,8 +138,10 @@ data class SchedulerConfig(
                     dispatchWorkers = dispatchWorkers,
                 ),
                 probe = ProbeConfig(
+                    // A value below 1 is unset, as the gateway reads the same
+                    // variable (its run handles' bound is derived from it).
                     defaultTimeoutMs = config.propertyOrNull("probe.defaultTimeoutMs")
-                        ?.getString()?.toIntOrNull() ?: 30_000,
+                        ?.getString()?.toIntOrNull()?.takeIf { it > 0 } ?: 30_000,
                     maxTimeoutMs = config.propertyOrNull("probe.maxTimeoutMs")
                         ?.getString()?.toIntOrNull() ?: 300_000,
                     maxRedirects = config.propertyOrNull("probe.maxRedirects")

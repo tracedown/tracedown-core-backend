@@ -2,6 +2,7 @@ package dev.tracedown.gateway.data.agents
 
 import dev.tracedown.common.validation.Validatable
 import dev.tracedown.common.validation.Validators
+import io.ktor.openapi.JsonSchema
 import kotlinx.serialization.Serializable
 import java.net.InetAddress
 import java.net.URI
@@ -114,10 +115,16 @@ data class AgentRenewRequest(
 
 /**
  * An agent as the key-authenticated API lists it: the slug a service's agent
- * list names it by, and its label. No address, no credentials, no state.
+ * list names it by, its label, and how it is doing — the same verdict the
+ * dashboard's health roster shows. No address, no credentials.
  */
 @Serializable
 data class PublicAgentSummary(
     val slug: String,
     val label: String,
+    @JsonSchema.Enum("healthy", "degraded", "down", "unknown")
+    @JsonSchema.Description("`healthy`, `degraded` (answering, but slower than its own usual), `down` (failing its health checks), or `unknown`.")
+    val status: String = "unknown",
+    @JsonSchema.Description("When the agent's health was last checked; null until it has been (`status` is then `unknown`).")
+    val lastCheckAt: String? = null,
 )

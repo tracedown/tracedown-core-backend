@@ -5,6 +5,7 @@ import dev.tracedown.common.audit.AuditService
 import dev.tracedown.common.audit.auditDiff
 import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.canAccessResource
+import dev.tracedown.common.auth.canRead
 import dev.tracedown.common.auth.canWriteResource
 import dev.tracedown.common.config.DeletionRetention
 import dev.tracedown.common.domain.DomainPolicy
@@ -34,6 +35,7 @@ import dev.tracedown.common.variables.SystemVariableSeeder
 import dev.tracedown.common.variables.SystemVariables
 import dev.tracedown.common.variables.VariableLimits
 import dev.tracedown.gateway.controllers.metrics.DashboardMetricsController
+import dev.tracedown.gateway.controllers.runs.RunRequestController
 import dev.tracedown.gateway.data.CreateVariableRequest
 import dev.tracedown.gateway.data.UpdateVariableRequest
 import dev.tracedown.gateway.data.VariableSummary
@@ -43,6 +45,10 @@ import dev.tracedown.gateway.data.services.FailedAssertion
 import dev.tracedown.gateway.data.services.LastFailureInfo
 import dev.tracedown.gateway.data.services.SKIPPED_DETAIL_LIMIT
 import dev.tracedown.gateway.data.services.ScopedToggleResult
+import dev.tracedown.gateway.data.services.BlockedTarget
+import dev.tracedown.gateway.data.services.ScriptLimits
+import dev.tracedown.gateway.data.services.ScriptTargets
+import dev.tracedown.gateway.data.services.ScriptValidation
 import dev.tracedown.gateway.data.services.ScriptValidationError
 import dev.tracedown.gateway.data.services.ServiceSnapshot
 import dev.tracedown.gateway.data.services.ServiceSummary
@@ -122,30 +128,35 @@ object ServiceController {
     /** Publishes a schedule nudge so the scheduler picks up changes immediately. */
     private fun publishNudge(serviceId: UUID) = ScheduleNudge.publish(serviceId)
 
-    /** Publishes a run-now trigger so the scheduler dispatches one immediate probe. */
-    private fun publishTriggerRun(serviceId: UUID) = ScheduleNudge.trigger(serviceId)
+    /** A run that was asked for: its handle, and when. */
+    data class RunTicket(val runId: UUID, val requestedAt: Instant)
 
     /**
      * Requests an immediate one-off probe run for a service. Requires write access.
      * The actual dispatch (lock, queue policy, active/script guards) happens in the
-     * scheduler when it receives the `probe:trigger` message.
+     * scheduler when it receives the request (see `RunTrigger`).
      */
-    fun triggerRun(orgId: UUID, serviceId: UUID, userId: UUID) {
+    fun triggerRun(orgId: UUID, serviceId: UUID, userId: UUID): RunTicket =
         triggerRun(orgId, serviceId, userId, refuseUnrunnable = false)
-    }
 
     /**
      * As [triggerRun]; with [refuseUnrunnable], a service the scheduler would
      * not run is refused here instead of being queued for nothing: 409
      * `script_missing` when it has no script, 409 `service_inactive` when it
      * is switched off. Checked after the caller's access, so the answer never
-     * says anything about a service they may not run. Returns when the run
-     * was asked for.
+     * says anything about a service they may not run.
+     *
+     * The run gets its id here, and the request is recorded under it in the
+     * same transaction as its audit entry ([RunRequestController.record]) —
+     * before the scheduler is told, so the handle answers `pending` from the
+     * moment it is handed out, and the result is filed under the same id.
+     * Returns the id and when the run was asked for.
      */
-    fun triggerRun(orgId: UUID, serviceId: UUID, userId: UUID, refuseUnrunnable: Boolean): Instant {
+    fun triggerRun(orgId: UUID, serviceId: UUID, userId: UUID, refuseUnrunnable: Boolean): RunTicket {
         // To the second: run start times are stored that way, and a `since`
         // with a fraction would miss a run started in the same second.
         val requestedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS)
+        val runId = UUID.randomUUID()
         transaction {
             val ctx = ResourceResolver.resolveService(serviceId, orgId)
             val cached = requireCachedPermissions(orgId, userId)
@@ -160,10 +171,14 @@ object ServiceController {
                 if (!svcRow[Services.isActive]) throw ConflictException(ErrorCodes.SERVICE_INACTIVE)
             }
 
+            RunRequestController.record(runId, serviceId, orgId, userId, requestedAt)
             AuditService.log(orgId, userId, "run.service", "service", serviceId.toString(), entityDisplayName = svcRow[Services.name])
         }
-        publishTriggerRun(serviceId)
-        return requestedAt
+        // Redis says no scheduler heard it: nothing will ever run it, so its
+        // handle says so now. Not knowing (Redis did not answer) is not that —
+        // the handle waits out its bound.
+        if (ScheduleNudge.trigger(serviceId, runId) == 0L) RunRequestController.settleUndelivered(runId)
+        return RunTicket(runId, requestedAt)
     }
 
     /** Combined detail + recent probe points for the service live channel. */
@@ -479,12 +494,7 @@ object ServiceController {
             // resolveScopedVarsForPolicy).
             val policyVars by lazy { resolveScopedVarsForPolicy(effectiveScript, serviceId) }
             if (request.script != null) {
-                val targets = dev.tracedown.common.net.ProbeTargetPolicy.evaluateSyntax(
-                    effectiveScript,
-                    policyVars.values,
-                    probeTargetPolicy,
-                )
-                if (!targets.allowed) {
+                blockedTargets(effectiveScript, policyVars).firstOrNull()?.let { targets ->
                     // The target as written: the substituted one can carry a
                     // decrypted value.
                     log.info(
@@ -495,24 +505,13 @@ object ServiceController {
                 }
             }
 
-            val intervalTooShort =
-                DomainPolicy.minIntervalMinutes(effectiveSchedule) < DomainPolicy.MIN_INTERVAL_MINUTES
+            val intervalTooShort = intervalTooShort(effectiveSchedule)
             val policyRelevant = request.script != null ||
                 (request.schedule != null && intervalTooShort)
-            if (!trustedDomainMode && policyRelevant) {
-                val policy = DomainPolicy.evaluate(effectiveScript, policyVars.values, orgId, policyVars.concealed)
-                if (!policy.covered) {
-                    // includes() against an unverified target is a scraping oracle —
-                    // refuse it at save time (dispatch would refuse it anyway).
-                    if (request.script != null && policy.usesIncludes) {
-                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_INCLUDES)
-                    }
-                    if (request.script != null && policy.callCount > DomainPolicy.MAX_CALLS) {
-                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_CALL_LIMIT)
-                    }
-                    if (intervalTooShort) {
-                        throw BadRequestException(ErrorCodes.UNVERIFIED_DOMAIN_INTERVAL)
-                    }
+            if (policyRelevant) {
+                domainEvaluation(effectiveScript, policyVars, orgId)?.let { policy ->
+                    domainRefusals(policy, scriptChanged = request.script != null, intervalTooShort = intervalTooShort)
+                        .firstOrNull()?.let { throw BadRequestException(it) }
                 }
             }
 
@@ -1037,6 +1036,142 @@ object ServiceController {
             if (failed.isEmpty()) null else LastFailureInfo(assertions = failed)
         } catch (_: Exception) {
             null
+        }
+    }
+
+    // ── The save-time judgement of a script, shared by a save and a dry run ──
+
+    /**
+     * Every call of [script] whose target this installation will not probe,
+     * judged without DNS as a save judges it, with [vars] substituted. Each
+     * names its call as the script writes it.
+     */
+    private fun blockedTargets(script: String, vars: PolicyVars): List<dev.tracedown.common.net.ProbeTargetPolicy.Decision> =
+        dev.tracedown.common.net.ProbeTargetPolicy.refusalsBySyntax(script, vars.values, probeTargetPolicy)
+
+    /**
+     * The unverified-domain evaluation a save makes of [script] with [vars];
+     * null in trusted-domain mode, where there is none. In a transaction.
+     */
+    private fun domainEvaluation(script: String, vars: PolicyVars, orgId: UUID): DomainPolicy.Evaluation? =
+        if (trustedDomainMode) null else DomainPolicy.evaluate(script, vars.values, orgId, vars.concealed)
+
+    /** Whether [schedule] runs more often than the unverified-domain floor. */
+    private fun intervalTooShort(schedule: String): Boolean =
+        DomainPolicy.minIntervalMinutes(schedule) < DomainPolicy.MIN_INTERVAL_MINUTES
+
+    /**
+     * The codes the unverified-domain rules refuse a save with, given
+     * [policy], in the order a save meets them — a save throws the first.
+     * Nothing when every target is on a verified domain. The script-only
+     * rules apply when the save carries a script ([scriptChanged]).
+     */
+    private fun domainRefusals(policy: DomainPolicy.Evaluation, scriptChanged: Boolean, intervalTooShort: Boolean): List<String> =
+        buildList {
+            if (policy.covered) return@buildList
+            // includes() against an unverified target is a scraping oracle —
+            // refuse it at save time (dispatch would refuse it anyway).
+            if (scriptChanged && policy.usesIncludes) add(ErrorCodes.UNVERIFIED_DOMAIN_INCLUDES)
+            if (scriptChanged && policy.callCount > DomainPolicy.MAX_CALLS) add(ErrorCodes.UNVERIFIED_DOMAIN_CALL_LIMIT)
+            if (intervalTooShort) add(ErrorCodes.UNVERIFIED_DOMAIN_INTERVAL)
+        }
+
+    /**
+     * What a save of [script] would make of it, without saving it: the Lace
+     * validator's findings, then every refusal the save-time policies would
+     * make — through the functions a save uses ([blockedTargets],
+     * [DomainPolicy], [domainRefusals]) and, with [serviceId], the very
+     * variables a save and a dispatch resolve ([resolveScopedVarsForPolicy]),
+     * so this cannot pass what a save refuses or refuse what it accepts. Read
+     * access to the service is all it takes, and it writes nothing.
+     *
+     * **It judges with what the caller could know, and no more** — otherwise
+     * it would be an oracle: a script naming `$s.TOKEN` in a host, judged
+     * against the decrypted value, would answer questions about a secret its
+     * caller may not read. So values that had to be decrypted are used only
+     * for a caller with write on the service (who may save the script, and so
+     * learn the same from the save); for a reader, a call whose host needs one
+     * is listed as unresolved and judged by neither policy. Without
+     * [serviceId] there are no variables at all. Verified-domain coverage is
+     * judged only for a caller who may read the organization's domains
+     * (`domainsChecked` says whether it was), and only over the calls whose
+     * hosts are known. `complete` says whether the verdict is a save's.
+     * Every target is named as the script writes it.
+     */
+    fun validate(orgId: UUID, userId: UUID, script: String, serviceId: UUID?): ScriptValidation {
+        // Parsing is pure and can be slow — off the transaction, as on a save.
+        val laceErrors = validateScript(script)
+        return transaction {
+            val vars: PolicyVars
+            val schedule: String?
+            // Whether every value a save would judge with was used: only then
+            // is a call with an unresolved host judged (as a save judges it).
+            val allValues: Boolean
+            val judgeDomains: Boolean
+            if (serviceId != null) {
+                val ctx = ResourceResolver.resolveService(serviceId, orgId)
+                val cached = requireCachedPermissions(orgId, userId)
+                requireServiceAccess(ctx.serviceId, ctx.projectId, ctx.workspaceId, cached)
+                schedule = Services.select(Services.schedule)
+                    .where { (Services.id eq serviceId) and (Services.deleted eq false) }
+                    .firstOrNull()?.get(Services.schedule) ?: throw NotFoundException()
+                val resolved = resolveScopedVarsForPolicy(script, serviceId)
+                allValues = canWriteResource(cached, "service", ctx.serviceId, listOf("project::${ctx.projectId}", "workspace::${ctx.workspaceId}"))
+                vars = if (allValues) resolved else PolicyVars(resolved.values - resolved.concealed, emptySet())
+            } else {
+                // 403 not_org_member when the membership is gone.
+                requireCachedPermissions(orgId, userId)
+                schedule = null
+                vars = PolicyVars(emptyMap(), emptySet())
+                allValues = false
+            }
+            // Which hosts the organization has proven it owns is the domains
+            // section's to show — with a service or without one: judging a
+            // host against them would answer the question for anyone.
+            judgeDomains = dev.tracedown.common.auth.resolveOrgPermissions(orgId, userId)?.domains?.canRead() == true
+
+            val urls = dev.tracedown.common.net.ProbeTargetPolicy.targetUrls(script)
+            // A host still assembled from a variable after substitution: one
+            // with no value here, or none given at all.
+            val unresolved = urls.filter { raw ->
+                val url = dev.tracedown.common.net.ProbeTargetPolicy.substituteVars(raw, vars.values)
+                '$' in url && dev.tracedown.common.net.ProbeTargetPolicy.hostOf(url) == null
+            }.distinct()
+            val blocked = blockedTargets(script, vars).filter { allValues || it.source !in unresolved }
+            // Judged over the calls whose hosts are known here: a host that is
+            // not cannot be found unverified, and would only make a refusal up.
+            val domain = if (judgeDomains && !trustedDomainMode) {
+                DomainPolicy.evaluateCalls(urls.filter { it !in unresolved }, DomainPolicy.usesIncludes(script), vars.values, orgId, vars.concealed)
+            } else null
+            val tooShort = schedule != null && intervalTooShort(schedule)
+            val limited = domain != null && !domain.covered
+
+            val errors = laceErrors +
+                blocked.map {
+                    ScriptValidationError(code = ErrorCodes.BLOCKED_PROBE_TARGET, callIndex = it.callIndex, detail = it.reason)
+                } +
+                (domain?.let { domainRefusals(it, scriptChanged = true, intervalTooShort = tooShort) } ?: emptyList())
+                    .map { ScriptValidationError(code = it) }
+            ScriptValidation(
+                valid = errors.isEmpty(),
+                errors = errors,
+                domainsChecked = domain != null,
+                // Everything a save would judge was judged here.
+                // Every rule judged: no host unknown, and where verified
+                // domains are asked for, judged — with a service, whose
+                // schedule the interval rule needs.
+                complete = unresolved.isEmpty() && (trustedDomainMode || (domain != null && serviceId != null)),
+                targets = ScriptTargets(
+                    blocked = blocked.map { BlockedTarget(source = it.source ?: "", reason = it.reason ?: "") },
+                    unverified = domain?.unverifiedHosts ?: emptyList(),
+                    unresolved = unresolved,
+                ),
+                limits = ScriptLimits(
+                    callCount = urls.size,
+                    maxCalls = if (limited) DomainPolicy.MAX_CALLS else null,
+                    minIntervalMinutes = if (limited) DomainPolicy.MIN_INTERVAL_MINUTES else null,
+                ),
+            )
         }
     }
 

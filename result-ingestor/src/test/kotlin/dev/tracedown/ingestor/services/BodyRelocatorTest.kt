@@ -73,4 +73,37 @@ class BodyRelocatorTest {
         )
         assertNull(uri)
     }
+
+    @Test
+    fun `relocating a body that already moved is the same move`(@TempDir root: Path) {
+        // An earlier attempt at the same result moved it, then its transaction
+        // did not commit: the retry finds the body where it belongs.
+        val client = BodyStorageClient(confinement = BodyConfinement(filesystemRoot = root))
+        val agentPath = root.resolve("agent/call_0.json")
+        Files.createDirectories(agentPath.parent)
+        Files.writeString(agentPath, "{\"kept\":true}")
+        val first = client.relocate("file://$agentPath", "org/svc/res/call_0.json")
+        val again = client.relocate("file://$agentPath", "org/svc/res/call_0.json")
+        assertTrue(first == again, "$first / $again")
+        assertTrue(Files.readString(root.resolve("org/svc/res/call_0.json")).contains("kept"))
+    }
+
+    @Test
+    fun `an object that already moved is the same move`() {
+        val bucket = "relocate-${UUID.randomUUID().toString().take(8)}"
+        dev.tracedown.ingestor.TestS3.bucket(bucket)
+        val client = BodyStorageClient(
+            s3Config = dev.tracedown.common.storage.S3Config(
+                endpoint = dev.tracedown.ingestor.TestS3.endpoint,
+                accessKey = dev.tracedown.ingestor.TestS3.USER,
+                secretKey = dev.tracedown.ingestor.TestS3.PASSWORD,
+            ),
+            confinement = BodyConfinement(s3Bucket = bucket),
+        )
+        dev.tracedown.ingestor.TestS3.put(bucket, "agent/call_0.json", "{}".toByteArray())
+        val first = client.relocate("s3://$bucket/agent/call_0.json", "org/svc/res/call_0.json")
+        val again = client.relocate("s3://$bucket/agent/call_0.json", "org/svc/res/call_0.json")
+        assertTrue(first == again, "$first / $again")
+        assertTrue(dev.tracedown.ingestor.TestS3.get(bucket, "org/svc/res/call_0.json").isNotEmpty())
+    }
 }

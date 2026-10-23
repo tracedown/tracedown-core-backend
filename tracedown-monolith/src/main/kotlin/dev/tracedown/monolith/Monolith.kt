@@ -111,7 +111,12 @@ fun main(args: Array<String>) {
         val server = embeddedServer(
             Netty,
             applicationEnvironment { this.config = HoconApplicationConfig(config) },
-            configure = { connector { this.port = port } },
+            configure = {
+                connector { this.port = port }
+                // The gateway streams a stored body under a stall bound of its
+                // own; the engine's per-write timeout must not be shorter.
+                responseWriteTimeoutSeconds = dev.tracedown.gateway.controllers.results.ProbeResultController.ENGINE_WRITE_TIMEOUT_SECONDS
+            },
         )
         server.start(wait = false)
         servers.add(server)

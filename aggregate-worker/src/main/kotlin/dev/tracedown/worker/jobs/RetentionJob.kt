@@ -5,6 +5,7 @@ import dev.tracedown.common.config.ioTransaction
 import dev.tracedown.common.models.BodyNotStoredReasons
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.ProbeSteps
+import dev.tracedown.common.models.RunRequests
 import dev.tracedown.common.storage.BodyStorageClient
 import dev.tracedown.worker.data.JobWatermarks
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +50,9 @@ private val log = LoggerFactory.getLogger("dev.tracedown.worker.jobs.RetentionJo
  *    [BodyStorageClient] and blanks `probe_steps.response_body_storage_url`,
  *    recording [BodyNotStoredReasons.BODY_EXPIRED] in its place. The result, its
  *    steps and their timings all stay.
+ *  - **Run requests** (before either) — the handles of runs somebody asked
+ *    for, deleted on the `purge_after` the gateway stamped on them from the
+ *    result window ([purgeRunRequests]).
  *
  * The two windows are independent settings but not independent lifetimes: a
  * body is reachable only through its `probe_steps` row, so the result pass takes
@@ -116,6 +120,20 @@ class RetentionJob(
     private var resumeFrom: UUID? = null
 
     override suspend fun execute() {
+        // Before the windows are consulted: a run request carries its own date
+        // (`purge_after`, stamped by the gateway from the window that applied
+        // when it was made), so it goes on that date whatever the job thinks
+        // of the windows now.
+        // On its own: a failure here must not cost the tick its result pass.
+        try {
+            val runRequests = purgeRunRequests(clock())
+            if (runRequests > 0) log.info("Retention: deleted {} run requests past their purge date", runRequests)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.warn("Retention: the run request pass failed, carrying on with results: {}", e.message)
+        }
+
         if (defaultRetentionDays < 0 && defaultBodyRetentionDays < 0) {
             log.debug(
                 "Retention disabled (resultRetentionDays={}, bodyRetentionDays={})",
@@ -523,6 +541,29 @@ class RetentionJob(
                 RetentionBatching.Verdict.BUDGET_SPENT -> return deleted to true
                 RetentionBatching.Verdict.CONTINUE -> Unit
             }
+        }
+    }
+
+    /**
+     * Deletes the run requests whose `purge_after` has passed, a bounded page
+     * at a time — the handles of runs whose results the result window has
+     * taken, or is about to. The table is one row per run somebody asked for,
+     * a small fraction of `probe_results`, so the pass is short; it is bounded
+     * all the same, by pages and by the tick budget.
+     */
+    internal suspend fun purgeRunRequests(now: Instant): Long {
+        val start = clock()
+        var deleted = 0L
+        while (true) {
+            val removed = ioTransaction {
+                val page = RunRequests.select(RunRequests.id)
+                    .where { RunRequests.purgeAfter less now }
+                    .limit(batchSize)
+                    .map { it[RunRequests.id] }
+                if (page.isEmpty()) 0 else RunRequests.deleteWhere { RunRequests.id inList page }
+            }
+            deleted += removed
+            if (removed < batchSize || RetentionBatching.budgetSpent(Duration.between(start, clock()), tickBudget)) return deleted
         }
     }
 

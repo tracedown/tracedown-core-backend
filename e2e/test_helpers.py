@@ -29,12 +29,14 @@ tests_skipped = 0
 
 # ── HTTP ──
 
-def api(method, path, body=None, token=None):
-    """Make an HTTP request to the gateway API."""
+def api(method, path, body=None, token=None, headers=None):
+    """Make an HTTP request to the gateway API. `headers` are sent as well."""
     url = f"{GATEWAY_URL}{path}"
+    extra = headers or {}
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    headers.update(extra)
 
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)

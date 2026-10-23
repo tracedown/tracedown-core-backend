@@ -60,3 +60,22 @@ internal fun ApplicationCall.instantQuery(name: String): Instant? {
         throw fieldError(name)
     }
 }
+
+/**
+ * A set of values from [allowed] in the query: the parameter repeated, a
+ * comma-separated list, or both. Empty when absent; anything outside
+ * [allowed], or an empty item, is 400 `field_invalid`.
+ */
+internal fun ApplicationCall.valuesQuery(name: String, allowed: Set<String>): Set<String> {
+    val raw = request.queryParameters.getAll(name) ?: return emptySet()
+    val values = raw.flatMap { it.split(',') }.map { it.trim() }
+    if (values.any { it !in allowed }) throw fieldError(name)
+    return values.toSet()
+}
+
+/** One value from [allowed] in the query, null when absent; anything else is 400 `field_invalid`. */
+internal fun ApplicationCall.choiceQuery(name: String, allowed: Set<String>): String? {
+    val raw = request.queryParameters[name] ?: return null
+    if (raw !in allowed) throw fieldError(name)
+    return raw
+}

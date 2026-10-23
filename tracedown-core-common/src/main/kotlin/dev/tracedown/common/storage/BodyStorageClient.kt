@@ -394,6 +394,30 @@ open class BodyStorageClient(
         }
     }
 
+    /** What a store says about one body without handing it over: its size, and its content type where the store keeps one. */
+    data class Stat(val size: Long, val contentType: String?)
+
+    /**
+     * [sizeOf], with the content type an object store keeps beside the body
+     * (a file has none) — the same single stat or HEAD, nothing downloaded.
+     * Null when nothing is there. Confinement applies, as for [sizeOf].
+     */
+    open fun statOf(uri: String): Stat? {
+        return when (val parsed = StorageUri.parse(uri)) {
+            is StorageUri.File -> sizeOf(uri)?.let { Stat(it, null) }
+            is StorageUri.S3 -> {
+                confineS3(parsed.bucket, parsed.key)
+                val client = s3Client ?: throw StorageUnconfiguredException("S3 config not provided but s3:// URI encountered")
+                try {
+                    val head = client.headObject(HeadObjectRequest.builder().bucket(parsed.bucket).key(parsed.key).build())
+                    Stat(head.contentLength() ?: 0L, head.contentType())
+                } catch (e: AwsServiceException) {
+                    if (isMissing(e)) null else throw e
+                }
+            }
+        }
+    }
+
     /**
      * Reads the bytes at [uri], never more than [maxBytes]. Confinement applies
      * (throws [StorageConfinementException]); an unreachable store or refused
@@ -714,13 +738,16 @@ open class BodyStorageClient(
             ?: throw StorageConfinementException("filesystem relocation requires a confined root")
         // Confine + canonicalize the SOURCE (rejects escapes like /app/application.conf).
         val source = confineFilePath(sourcePath)
-        if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
-            throw StorageConfinementException("source body does not exist: $source")
-        }
         // The dest key is server-derived; still normalize + confine it defensively.
         val dest = root.resolve(sanitizeKey(destKey)).normalize()
         if (!dest.startsWith(root)) {
             throw StorageConfinementException("dest key $destKey escapes confined root $root")
+        }
+        if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
+            // Moved already — by an earlier attempt at the same result, whose
+            // transaction then did not commit. The body is where it belongs.
+            if (Files.isRegularFile(dest, LinkOption.NOFOLLOW_LINKS)) return "file://$dest"
+            throw StorageConfinementException("source body does not exist: $source")
         }
         dest.parent?.let { Files.createDirectories(it) }
         Files.move(source, dest, StandardCopyOption.REPLACE_EXISTING)
@@ -736,6 +763,24 @@ open class BodyStorageClient(
         val prefix = conf.normalizedS3Prefix
         val cleanDest = sanitizeKey(destKey)
         val destFullKey = if (prefix.isEmpty()) cleanDest else "$prefix/$cleanDest"
+        // Moved already — by an earlier attempt at the same result, whose
+        // transaction then did not commit: the source is gone and the copy is
+        // where it belongs.
+        val sourceThere = try {
+            client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build())
+            true
+        } catch (e: AwsServiceException) {
+            if (isMissing(e)) false else throw e
+        }
+        if (!sourceThere) {
+            val destThere = try {
+                client.headObject(HeadObjectRequest.builder().bucket(allowedBucket).key(destFullKey).build())
+                true
+            } catch (e: AwsServiceException) {
+                if (isMissing(e)) false else throw e
+            }
+            if (destThere) return "s3://$allowedBucket/$destFullKey"
+        }
         client.copyObject(
             CopyObjectRequest.builder()
                 .sourceBucket(bucket)
