@@ -48,6 +48,19 @@ gateway.data.VariableSummary = dev.tracedown.gateway.data.VariableSummary
 gateway.data.UpdateVariableRequest = dev.tracedown.gateway.data.UpdateVariableRequest
 gateway.data.VariableHierarchyResponse = dev.tracedown.gateway.data.VariableHierarchyResponse
 gateway.data.publicapi.PublicApiError = dev.tracedown.gateway.data.publicapi.PublicApiError
+gateway.data.results.RunStatus = dev.tracedown.gateway.data.results.RunStatus
+gateway.data.services.ValidateScriptRequest = dev.tracedown.gateway.data.services.ValidateScriptRequest
+gateway.data.services.ScriptValidation = dev.tracedown.gateway.data.services.ScriptValidation
+common.pfs.Page<gateway.data.presets.RulePresetSummary> = dev.tracedown.common.pfs.Page
+gateway.data.presets.CreateRulePresetRequest = dev.tracedown.gateway.data.presets.CreateRulePresetRequest
+gateway.data.presets.RulePresetSummary = dev.tracedown.gateway.data.presets.RulePresetSummary
+gateway.data.presets.UpdateRulePresetRequest = dev.tracedown.gateway.data.presets.UpdateRulePresetRequest
+common.pfs.Page<gateway.data.notifications.NotificationTemplateSummary> = dev.tracedown.common.pfs.Page
+gateway.data.notifications.CreateNotificationTemplateRequest = dev.tracedown.gateway.data.notifications.CreateNotificationTemplateRequest
+gateway.data.notifications.NotificationTemplateSummary = dev.tracedown.gateway.data.notifications.NotificationTemplateSummary
+gateway.data.notifications.UpdateNotificationTemplateRequest = dev.tracedown.gateway.data.notifications.UpdateNotificationTemplateRequest
+common.pfs.Page<gateway.data.alerts.PublicSystemAlert> = dev.tracedown.common.pfs.Page
+gateway.data.events.EventPage = dev.tracedown.gateway.data.events.EventPage
 
 dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.VariableSummary>
   items: List<dev.tracedown.gateway.data.VariableSummary>
@@ -690,3 +703,89 @@ dev.tracedown.gateway.data.silences.SilenceSummary
   config: kotlin.String?
   quietHours: kotlin.String?
   resourceName: kotlin.String? optional
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.alerts.PublicSystemAlert>
+  items: List<dev.tracedown.gateway.data.alerts.PublicSystemAlert>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.notifications.NotificationTemplateSummary>
+  items: List<dev.tracedown.gateway.data.notifications.NotificationTemplateSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.common.pfs.Page<dev.tracedown.gateway.data.presets.RulePresetSummary>
+  items: List<dev.tracedown.gateway.data.presets.RulePresetSummary>
+  total: kotlin.Long
+  page: kotlin.Int
+  pageSize: kotlin.Int
+
+dev.tracedown.gateway.data.alerts.PublicSystemAlert
+  id: kotlin.String
+  type: kotlin.String
+  subject: kotlin.String
+  severity: kotlin.String
+  data: JsonObject? optional
+  firstSeenAt: kotlin.String
+  lastSeenAt: kotlin.String
+  dismissedAt: kotlin.String? optional
+
+dev.tracedown.gateway.data.events.EventPage
+  items: List<dev.tracedown.gateway.data.events.FeedEvent>
+  next: kotlin.String
+  more: kotlin.Boolean optional
+
+dev.tracedown.gateway.data.events.EventResource
+  type: kotlin.String
+  id: kotlin.String
+
+dev.tracedown.gateway.data.events.FeedEvent
+  id: kotlin.String
+  type: kotlin.String
+  occurredAt: kotlin.String
+  resource: dev.tracedown.gateway.data.events.EventResource
+  data: JsonObject
+
+dev.tracedown.gateway.data.notifications.CreateNotificationTemplateRequest
+  name: kotlin.String
+  text: kotlin.String
+  projectIds: List<kotlin.String>? optional
+
+dev.tracedown.gateway.data.notifications.NotificationTemplateSummary
+  id: kotlin.String
+  name: kotlin.String
+  text: kotlin.String
+  projectIds: List<kotlin.String>
+  createdAt: kotlin.String
+
+dev.tracedown.gateway.data.notifications.UpdateNotificationTemplateRequest
+  name: kotlin.String? optional
+  text: kotlin.String? optional
+
+dev.tracedown.gateway.data.presets.CreateRulePresetRequest
+  name: kotlin.String
+  script: kotlin.String
+  workspaceId: kotlin.String? optional
+
+dev.tracedown.gateway.data.presets.RulePresetSummary
+  id: kotlin.String
+  name: kotlin.String
+  script: kotlin.String
+  scope: kotlin.String
+  workspaceId: kotlin.String? optional
+
+dev.tracedown.gateway.data.presets.UpdateRulePresetRequest
+  name: kotlin.String? optional
+  script: kotlin.String? optional
+
+dev.tracedown.gateway.data.services.CreateServiceRequest
+  projectId: kotlin.String
+  name: kotlin.String
+  label: kotlin.String? optional
+  schedule: kotlin.String? optional
+  saveResponseBodies: kotlin.Boolean? optional
+  script: kotlin.String? optional
+  isActive: kotlin.Boolean? optional
+  presetId: kotlin.String? optional

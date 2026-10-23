@@ -62,6 +62,11 @@ fun Application.module() {
     // Redis: sync connection for publishing, pub/sub for nudge subscription
     val redisConn = RedisFactory.createConnection(config.redisAUrl)
     val redis = redisConn.sync()
+    // Wake the event feed's waiting reads once what this process wrote to the
+    // outbox has committed.
+    dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
+        redis.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
+    }
     val pubSubConnection = RedisFactory.createPubSubConnection(config.redisAUrl)
 
     // Services

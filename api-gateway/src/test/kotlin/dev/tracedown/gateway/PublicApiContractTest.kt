@@ -59,6 +59,7 @@ class PublicApiContractTest {
     companion object {
         const val ROUTES_FILE = "public-api-v1.routes.txt"
         const val TYPES_FILE = "public-api-v1.types.txt"
+        const val EVENTS_FILE = "public-api-v1.events.txt"
 
         private const val DELIBERATE =
             "The key-authenticated API is a published contract: within v1 a change must be deliberate and " +
@@ -381,6 +382,39 @@ class PublicApiContractTest {
             val (encode, golden) = sample
             kotlin.test.assertEquals(golden, encode(), "The serialized shape of $name changed. $DELIBERATE")
         }
+    }
+
+    /**
+     * The event feed's contract: each type, what its `resource` is, and the
+     * fields its `data` carries. Append only, as the other baselines: a type
+     * stays, keeps its resource and keeps every field; new types and new
+     * fields pass.
+     */
+    @Test
+    fun `every baseline event type keeps its resource and its data`() {
+        val current = dev.tracedown.gateway.controllers.events.EventTypes.ALL.map { type ->
+            "$type ${dev.tracedown.gateway.controllers.events.EventTypes.RESOURCE.getValue(type)} " +
+                dev.tracedown.gateway.controllers.events.EventTypes.DATA.getValue(type).joinToString(",")
+        }
+        val written = writeCurrent(EVENTS_FILE, current.joinToString("\n", postfix = "\n"))
+        val pinned = baseline(EVENTS_FILE).replace("\r\n", "\n").lines().filter { it.isNotBlank() }
+        assertTrue(pinned.isNotEmpty(), "The events baseline is empty")
+        val now = current.associate { line -> line.split(' ', limit = 3).let { it[0] to (it[1] to it.getOrElse(2) { "" }) } }
+        val problems = pinned.mapNotNull { line ->
+            val parts = line.split(' ', limit = 3)
+            val type = parts[0]
+            val resource = parts[1]
+            val fields = parts.getOrElse(2) { "" }.split(',').filter { it.isNotEmpty() }
+            val (nowResource, nowFields) = now[type] ?: return@mapNotNull "$type is gone"
+            when {
+                nowResource != resource -> "$type is now about $nowResource, not $resource"
+                !nowFields.split(',').containsAll(fields) -> "$type lost data fields: ${fields - nowFields.split(',').toSet()}"
+                else -> null
+            }
+        }
+        assertTrue(problems.isEmpty(), problems.joinToString("\n", postfix = "\n") + "$DELIBERATE (Current events: $written)")
+        val unpinned = now.keys - pinned.map { it.substringBefore(' ') }.toSet()
+        assertTrue(unpinned.isEmpty(), "Event types not in the baseline: $unpinned — append them to $EVENTS_FILE")
     }
 
     @Test

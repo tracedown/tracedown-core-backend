@@ -55,6 +55,7 @@ object Tables {
         OrgVariables,
         Outbox,
         OutboxCursors,
+        OutboxRetention,
         PasswordResetTokens,
         PendingBodyDeletions,
         ProbeAgents,

@@ -74,6 +74,11 @@ fun Application.module() {
     // Variable decryption
     VariableCrypto.init(config.aesKey)
     dev.tracedown.common.realtime.RealtimePublisher.init { redis }
+    // Wake the event feed's waiting reads once what this process wrote to the
+    // outbox has committed.
+    dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
+        redis.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
+    }
 
     // mTLS client certificate
     val certService = SchedulerCertService(config.aesKey)

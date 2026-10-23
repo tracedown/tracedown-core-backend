@@ -45,6 +45,8 @@ data class IngestorConfig(
      */
     val bodyStorePrivateEndpoints: Boolean,
     val deploymentEnvironment: String?,
+    /** `MAX_VARS_PER_RESOURCE` — the gateway's cap on variables per resource, which writeback keeps to as well. */
+    val maxVarsPerResource: Int,
 ) {
     companion object {
         /** Loads configuration from the Ktor application environment. */
@@ -82,6 +84,8 @@ data class IngestorConfig(
                 bodyStorePrivateEndpoints = config.propertyOrNull("storage.stores.privateEndpoints")
                     ?.getString()?.trim()?.lowercase() == "true",
                 deploymentEnvironment = config.propertyOrNull("deployment.environment")?.getString(),
+                maxVarsPerResource = config.propertyOrNull("systemLimits.maxVarsPerResource")?.getString()?.toIntOrNull()
+                    ?: dev.tracedown.common.variables.VariableLimits.DEFAULT_MAX_PER_RESOURCE,
             )
         }
     }

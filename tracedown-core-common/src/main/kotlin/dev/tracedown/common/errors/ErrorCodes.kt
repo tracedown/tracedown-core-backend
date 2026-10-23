@@ -165,6 +165,12 @@ object ErrorCodes {
     /** The webhook is already bound to that resource. */
     const val BINDING_EXISTS = "binding_exists"
 
+    // ── Event feed ──
+    /** The cursor points before events the platform no longer keeps; `details.oldest` is where to start again. */
+    const val CURSOR_EXPIRED = "cursor_expired"
+    /** The key already has as many event reads waiting as it may; one has to return first. */
+    const val TOO_MANY_EVENT_POLLS = "too_many_event_polls"
+
     // ── General ──
     const val INTERNAL_ERROR = "internal_error"
     const val NOT_SUPPORTED = "not_supported"

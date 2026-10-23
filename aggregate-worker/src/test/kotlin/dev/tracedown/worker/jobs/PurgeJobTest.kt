@@ -81,7 +81,11 @@ class PurgeJobTest {
     /** Records deletions instead of touching storage; optionally fails. */
     private class FakeStorage(private val failWith: Exception? = null) : BodyStorageClient() {
         val deleted = mutableListOf<String>()
+
+        /** Whether any deletion was asked for while a transaction was open. */
+        var calledInTransaction = false
         override fun delete(uri: String): Boolean {
+            if (org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager.currentOrNull() != null) calledInTransaction = true
             failWith?.let { throw it }
             deleted.add(uri)
             return true
@@ -871,6 +875,7 @@ class PurgeJobTest {
             assertNull(user[Users.selectedOrgId], "persisted org selection cleared")
 
             assertEquals(listOf("file:///tmp/org-body-1"), fake.deleted, "org purge removed stored bodies")
+            assertFalse(fake.calledInTransaction, "storage was talked to with a transaction open")
         }
     }
 

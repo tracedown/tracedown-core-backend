@@ -1,6 +1,10 @@
 package dev.tracedown.gateway.routes.publicapi
 
+import dev.tracedown.gateway.controllers.events.EventFeedController
+import dev.tracedown.gateway.controllers.events.EventTypes
+import dev.tracedown.gateway.controllers.alerts.SystemAlertController
 import dev.tracedown.gateway.data.publicapi.PublicApiError
+import dev.tracedown.gateway.util.EventPollSlots
 import dev.tracedown.gateway.util.Idempotency
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -92,7 +96,9 @@ private val API_SUMMARY = """
 
     **Rate budget**: 300 requests a minute per key (the operator may set another). Requests that reached a key's
     budget carry `X-RateLimit-Limit` and `X-RateLimit-Remaining`; a refusal is 429 `rate_limited` with
-    `Retry-After` in seconds. An address that keeps sending tokens that name no key (or no token) is refused 429
+    `Retry-After` in seconds. The event feed (`/events`) is charged per look instead of per request: the first look
+    of a read that waits is free, and every later look, every answer given without waiting and every 410 costs one
+    request; a key whose budget is spent is refused on arrival. Its answers carry no `X-RateLimit-*` headers. An address that keeps sending tokens that name no key (or no token) is refused 429
     `too_many_unknown_keys`, also with `Retry-After`.
 
     **Lists.** Paged lists answer `{items, total, page, pageSize}` and page with `page` (from 1) and `pageSize` (at
@@ -115,10 +121,12 @@ private val STATUS_CODES: Map<HttpStatusCode, String> = mapOf(
     HttpStatusCode.MethodNotAllowed to "`method_not_allowed`.",
     HttpStatusCode.Conflict to "`already_exists`, `version_conflict`, `binding_exists`, `script_missing`, `service_inactive`.",
     HttpStatusCode.UnprocessableEntity to "`idempotency_key_reused` — the `Idempotency-Key` was used with a different request.",
-    HttpStatusCode.Gone to "`body_gone` — the step recorded a body that is no longer there.",
+    HttpStatusCode.Gone to "`body_gone` — the step recorded a body that is no longer there; `cursor_expired` — the " +
+        "event cursor is older than the events kept (`details.oldest` is where to start again).",
     HttpStatusCode.PayloadTooLarge to "`request_body_too_large` (the request), or `body_too_large` (a stored body; " +
         "`details.maxBytes`).",
-    HttpStatusCode.TooManyRequests to "`rate_limited` (the key's budget) or `too_many_unknown_keys` (the address). " +
+    HttpStatusCode.TooManyRequests to "`rate_limited` (the key's budget), `too_many_unknown_keys` (the address) or " +
+        "`too_many_event_polls` (event reads open). " +
         "`Retry-After` says when to come back.",
     HttpStatusCode.ServiceUnavailable to "`body_store_unavailable` — retry with backoff after `Retry-After`.",
 )
@@ -215,7 +223,7 @@ internal fun Operation.Builder.describe(operation: PublicOperation) {
 
 /** Path and query parameters that hold an id. */
 private val ID_PARAMETERS = setOf(
-    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId", "runId",
+    "id", "varId", "resultId", "stepId", "resourceId", "workspaceId", "projectId", "runId", "templateId",
 )
 
 /** Bounds and defaults of the integer query parameters: name to (minimum, maximum, default). */
@@ -224,11 +232,28 @@ private val INTEGER_PARAMETERS = mapOf(
     "pageSize" to Triple(1, 100, 50),
     "hours" to Triple(1, 168, 24),
     "days" to Triple(1, 365, 90),
+    "wait" to Triple(0, EventFeedController.MAX_WAIT_SECONDS, 0),
+    "limit" to Triple(1, EventFeedController.MAX_LIMIT, EventFeedController.MAX_LIMIT),
+)
+
+/**
+ * The closed value sets of string fields, by component and property — kept
+ * here, beside their sources, rather than as annotations that could drift
+ * from them.
+ */
+private val FIELD_ENUMS: Map<String, Map<String, List<String>>> = mapOf(
+    "FeedEvent" to mapOf("type" to EventTypes.ALL),
+    "EventResource" to mapOf("type" to EventTypes.RESOURCE.values.distinct()),
+    "PublicSystemAlert" to mapOf("severity" to listOf("warning", "error")),
+    "RulePresetSummary" to mapOf("scope" to listOf("org", "workspace")),
 )
 
 /** The query parameters held to a set of values, and the values: the operations' own. */
 private val PARAMETER_VALUES: Map<String, List<String>> = PublicApiOperations.all
     .flatMap { it.query }.mapNotNull { q -> q.values?.let { q.name to it } }.toMap()
+
+/** The defaults of the query parameters held to a set of values. */
+private val PARAMETER_DEFAULTS = mapOf("order" to "desc", "state" to SystemAlertController.ACTIVE)
 
 /** String fields that hold an instant, beyond those named `…At`. */
 private val INSTANT_FIELDS = setOf("since", "until", "coveredFrom", "coveredTo", "lastStatusSince", "lastCheck")
@@ -244,7 +269,9 @@ private fun refine(doc: JsonObject): JsonObject {
             // Any JSON value, not an object: rawResult, a header value, an assertion field.
             key == "JsonElement" -> buildJsonObject { put("description", "Any JSON value.") }
             key == "PublicApiError" -> errorSchema()
-            else -> descriptors[key]?.let { refineClass(schema.jsonObject, it, responseOnly = key !in requestClasses) } ?: schema
+            else -> descriptors[key]?.let {
+                withEnums(refineClass(schema.jsonObject, it, responseOnly = key !in requestClasses), FIELD_ENUMS[key])
+            } ?: schema
         }
     }
     val paths = doc["paths"]?.jsonObject?.mapValues { (_, item) -> refinePathItem(item.jsonObject) } ?: emptyMap()
@@ -277,6 +304,17 @@ private fun publicDescriptors(types: List<KType> = PublicApiOperations.types): M
 
 private fun componentKey(serialName: String): String =
     serialName.split('.').dropWhile { it.firstOrNull()?.isLowerCase() == true }.joinToString(".")
+
+/** [schema] with the closed value sets [enums] declared on its properties. */
+private fun withEnums(schema: JsonObject, enums: Map<String, List<String>>?): JsonObject {
+    if (enums == null) return schema
+    val properties = schema["properties"]?.jsonObject ?: return schema
+    val refined = properties.mapValues { (name, property) ->
+        val values = enums[name] ?: return@mapValues property
+        JsonObject(property.jsonObject + ("enum" to JsonArray(values.map { JsonPrimitive(it) })))
+    }
+    return JsonObject(schema + ("properties" to JsonObject(refined)))
+}
 
 private fun refineClass(schema: JsonObject, descriptor: SerialDescriptor, responseOnly: Boolean): JsonObject {
     val properties = schema["properties"]?.jsonObject ?: return schema
@@ -346,6 +384,15 @@ private fun errorSchema(): JsonObject = buildJsonObject {
                     put("description", "A script's validation errors: `{code, callIndex, field, detail}`.")
                 })
                 put("reason", buildJsonObject { put("type", "string"); put("description", "A short cause.") })
+                put("oldest", buildJsonObject {
+                    put("type", "string")
+                    put("description", "On `cursor_expired`: the event cursor to start again from.")
+                })
+                put("bound", buildJsonObject {
+                    put("type", "string")
+                    put("enum", JsonArray(EventPollSlots.Bound.entries.map { JsonPrimitive(it.wire) }))
+                    put("description", "On `too_many_event_polls`: which bound is reached.")
+                })
             })
             put("additionalProperties", buildJsonObject { })
         })
@@ -462,7 +509,7 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
                 put("enum", JsonArray(PARAMETER_VALUES.getValue(name).map { JsonPrimitive(it) }))
             }))
         name in PARAMETER_VALUES -> JsonObject(schema + ("enum" to JsonArray(PARAMETER_VALUES.getValue(name).map { JsonPrimitive(it) })) +
-            (if (name == "order") mapOf("default" to JsonPrimitive("desc")) else emptyMap()))
+            (PARAMETER_DEFAULTS[name]?.let { mapOf("default" to JsonPrimitive(it)) } ?: emptyMap()))
         name == "window" -> JsonObject(schema + ("enum" to JsonArray(listOf("24h", "7d", "30d", "90d").map { JsonPrimitive(it) })) +
             ("default" to JsonPrimitive("24h")))
         name == "resourceType" -> JsonObject(schema + ("enum" to JsonArray(listOf("workspace", "project", "service").map { JsonPrimitive(it) })))
@@ -474,7 +521,7 @@ private fun refineParameter(parameter: JsonObject): JsonObject {
     }
     // `status` is repeated or comma-separated: explode=true takes the first,
     // and the comma form is described in the parameter's text.
-    val style = if (name == "status") mapOf("style" to JsonPrimitive("form"), "explode" to JsonPrimitive(true)) else emptyMap()
+    val style = if (name == "status" || name == "types") mapOf("style" to JsonPrimitive("form"), "explode" to JsonPrimitive(true)) else emptyMap()
     return JsonObject(parameter + ("schema" to refined) + style)
 }
 

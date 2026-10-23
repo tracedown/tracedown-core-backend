@@ -42,6 +42,12 @@ import dev.tracedown.common.models.ProbeSteps
 import dev.tracedown.common.models.Users
 import dev.tracedown.common.interceptors.Interceptors
 import dev.tracedown.gateway.controllers.orgs.GroupController
+import dev.tracedown.gateway.controllers.notifications.NotificationTemplateController
+import dev.tracedown.gateway.controllers.presets.RulePresetController
+import dev.tracedown.gateway.data.notifications.CreateNotificationTemplateRequest
+import dev.tracedown.gateway.data.presets.CreateRulePresetRequest
+import dev.tracedown.common.models.SystemAlerts
+import kotlinx.serialization.json.JsonPrimitive
 import dev.tracedown.gateway.controllers.orgs.OrgVariableController
 import dev.tracedown.gateway.controllers.orgs.ResourceAccessController
 import dev.tracedown.gateway.controllers.projects.ProjectController
@@ -57,6 +63,8 @@ import dev.tracedown.gateway.data.silences.CreateSilenceRequest
 import dev.tracedown.gateway.data.webhooks.CreateWebhookRequest
 import dev.tracedown.gateway.data.webhooks.WebhookBindingRequest
 import dev.tracedown.gateway.data.workspaces.CreateWorkspaceRequest
+import dev.tracedown.gateway.data.workspaces.UpdateWorkspaceRequest
+import dev.tracedown.gateway.data.services.UpdateServiceRequest
 import dev.tracedown.gateway.routes.publicapi.PublicApi
 import dev.tracedown.gateway.util.ApiRateLimit
 import dev.tracedown.gateway.util.Idempotency
@@ -341,6 +349,9 @@ class ApiKeyResourcesTest {
 
     /** A script that validates and names nothing anyone has to verify. */
     private val SCRIPT = "get(\"https://example.com\").expect(status: 200)"
+
+    /** [SCRIPT] as it is written inside a JSON string. */
+    private val ESCAPED_SCRIPT = SCRIPT.replace("\"", "\\\"")
     private val jsonType = "application/json".toMediaType()
 
     // ── Fixtures ──
@@ -380,6 +391,14 @@ class ApiKeyResourcesTest {
         /** Bound to nothing. */
         val spareWebhook: UUID,
         val binding: UUID,
+        /** An organization-wide script preset. */
+        val preset: UUID,
+        /** A notification template bound to [project]. */
+        val template: UUID,
+        /** A notification template bound to nothing. */
+        val spareTemplate: UUID,
+        /** A system alert of the organization. */
+        val alert: UUID,
         /** A run asked for on [service], by its handle. */
         val run: UUID,
     )
@@ -481,6 +500,23 @@ class ApiKeyResourcesTest {
         val spare = WebhookController.create(o, CreateWebhookRequest(name = "Spare hook", url = "https://example.com/spare"), u).id
         val binding = WebhookController.createBinding(o, "service", svcId, WebhookBindingRequest(webhook), u).id
         GroupController.createGroup(o, "Fixture group", u)
+        val preset = RulePresetController.create(o, u, CreateRulePresetRequest("Fixture preset", SCRIPT)).id
+        val template = NotificationTemplateController.create(
+            o, CreateNotificationTemplateRequest("Fixture template", "\${s.name} is \${trigger}", listOf(proj.toString())), u,
+        ).id
+        val spareTemplate = NotificationTemplateController.create(o, CreateNotificationTemplateRequest("Spare template", "Spare"), u).id
+        val alert = UUID.randomUUID()
+        transaction {
+            SystemAlerts.insert {
+                it[id] = alert
+                it[organizationId] = o
+                it[alertType] = "agent_down"
+                it[subject] = "fixture-agent"
+                it[severity] = "warning"
+                it[createdAt] = Instant.now().minusSeconds(120)
+                it[lastSeenAt] = Instant.now().minusSeconds(60)
+            }
+        }
         ResourceAccessController.upsert(o, "service", svcId, UpsertAccessRequest("user", grantee.userId.toString(), 2), u)
 
         val resultId = UUID.randomUUID()
@@ -534,6 +570,8 @@ class ApiKeyResourcesTest {
             silence = UUID.fromString(silence),
             webhook = UUID.fromString(webhook), spareWebhook = UUID.fromString(spare),
             binding = UUID.fromString(binding),
+            preset = UUID.fromString(preset), template = UUID.fromString(template),
+            spareTemplate = UUID.fromString(spareTemplate), alert = alert,
             run = run,
         )
     }
@@ -630,6 +668,27 @@ class ApiKeyResourcesTest {
             JsonObject(c + ("response" to JsonObject(response.mapValues { (k, v) -> if (k.endsWith("Path") || k.endsWith("Uri")) JsonNull else v })))
         }
         if (calls == null) o else JsonObject(o + ("rawResult" to JsonObject(raw + ("calls" to JsonArray(calls)))))
+    }
+
+    /** A dashboard list as the public page of it: the first page, at the default size. */
+    private val asFirstPage: (JsonElement?) -> JsonElement? = { element ->
+        val items = element as JsonArray
+        JsonObject(mapOf(
+            "items" to items, "total" to JsonPrimitive(items.size),
+            "page" to JsonPrimitive(1), "pageSize" to JsonPrimitive(50),
+        ))
+    }
+
+    /** The dashboard's banner list as the public alert page: public names, not dismissed. */
+    private val asAlertPage: (JsonElement?) -> JsonElement? = { element ->
+        asFirstPage(JsonArray((element as JsonArray).map { item ->
+            val a = item.jsonObject
+            JsonObject(mapOf(
+                "id" to a["id"]!!, "type" to a["alertType"]!!, "subject" to a["subject"]!!, "severity" to a["severity"]!!,
+                "data" to (a["data"] ?: JsonNull), "firstSeenAt" to a["createdAt"]!!, "lastSeenAt" to a["lastSeenAt"]!!,
+                "dismissedAt" to JsonNull,
+            ))
+        }))
     }
 
     private fun hasFields(vararg names: String): (JsonElement?) -> Unit = { element ->
@@ -884,6 +943,50 @@ class ApiKeyResourcesTest {
             { """{"enabled":false}""" }, shape = { e -> hasFields("id", "enabled")(e); assertEquals("false", e!!.jsonObject.str("enabled")) }),
         Case("DELETE", "/webhooks/bindings/{id}", { "/webhooks/bindings/${it.binding}" }, { "$v1/webhooks/bindings/${it.binding}" },
             shape = ok),
+
+        // Presets
+        Case("GET", "/presets", { "/presets" }, { "$v1/rule-presets" },
+            shape = page("id", "name", "script", "scope"), twinView = asFirstPage),
+        Case("POST", "/presets", { "/presets" }, { "$v1/rule-presets" }, { """{"name":"Made by key","script":"get(\"https://example.com\").expect(status: 200)"}""" },
+            shape = hasFields("id", "name", "script", "scope")),
+        Case("GET", "/presets/{id}", { "/presets/${it.preset}" }, { "$v1/rule-presets/${it.preset}" },
+            shape = hasFields("id", "name", "script", "scope")),
+        Case("PATCH", "/presets/{id}", { "/presets/${it.preset}" }, { "$v1/rule-presets/${it.preset}" },
+            { """{"name":"Renamed"}""" }, shape = { e -> hasFields("id", "name")(e); assertEquals("Renamed", e!!.jsonObject.str("name")) }),
+        Case("DELETE", "/presets/{id}", { "/presets/${it.preset}" }, { "$v1/rule-presets/${it.preset}" }, shape = ok),
+
+        // Notification templates
+        Case("GET", "/notification-templates", { "/notification-templates" }, { "$v1/notification-templates" },
+            shape = page("id", "name", "text", "projectIds")),
+        Case("POST", "/notification-templates", { "/notification-templates" }, { "$v1/notification-templates" },
+            { """{"name":"Made by key","text":"${'$'}{s.name} changed"}""" }, shape = hasFields("id", "name", "text")),
+        Case("GET", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}" }, shape = hasFields("id", "name", "text", "projectIds")),
+        Case("PATCH", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}" }, { """{"text":"Changed"}""" }, shape = hasFields("id", "text")),
+        Case("DELETE", "/notification-templates/{id}", { "/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}" }, shape = ok),
+        // No dashboard twin: the dashboard lists a project's templates with a
+        // PFS filter, and binds with a POST — see the tests of their own below.
+        Case("GET", "/projects/{id}/notification-templates", { "/projects/${it.project}/notification-templates" }, null,
+            shape = { e -> page("id", "name")(e); assertEquals(1, e!!.jsonObject["items"]!!.jsonArray.size) }),
+        Case("PUT", "/projects/{id}/notification-templates/{templateId}",
+            { "/projects/${it.project}/notification-templates/${it.spareTemplate}" }, null,
+            shape = { e -> hasFields("id", "projectIds")(e); assertTrue(e!!.jsonObject["projectIds"]!!.jsonArray.isNotEmpty()) }),
+        Case("DELETE", "/projects/{id}/notification-templates/{templateId}",
+            { "/projects/${it.project}/notification-templates/${it.template}" },
+            { "$v1/notification-templates/${it.template}/projects/${it.project}" },
+            shape = { e -> hasFields("id", "projectIds")(e); assertTrue(e!!.jsonObject["projectIds"]!!.jsonArray.isEmpty()) }),
+
+        // Alerts
+        Case("GET", "/alerts", { "/alerts" }, { "$v1/system-alerts" },
+            shape = pageExactly("id", "type", "subject", "severity", "data", "firstSeenAt", "lastSeenAt", "dismissedAt"),
+            twinView = asAlertPage),
+        Case("POST", "/alerts/{id}/dismiss", { "/alerts/${it.alert}/dismiss" }, { "$v1/system-alerts/${it.alert}/dismiss" },
+            shape = ok),
+
+        // Events: no dashboard twin — see the feed's tests below.
+        Case("GET", "/events", { "/events" }, null, shape = hasFields("items", "next")),
     )
 
     /**
@@ -2274,6 +2377,1014 @@ class ApiKeyResourcesTest {
         }
     }
 
+    // ── Presets ──
+
+    @Test
+    fun `a service made from a preset starts with its script, copied`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val (status, raw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"From preset","presetId":"${fx.preset}"}""",
+        )
+        assertEquals(200, status, raw)
+        val made = obj(raw)
+        assertEquals(SCRIPT, made.str("script"))
+        assertEquals("true", made.str("isActive"), "A preset's script switches the service on, as a script does")
+
+        // Copied: changing the preset later does not reach the service.
+        RulePresetController.update(fx.owner.orgId, fx.owner.userId, fx.preset,
+            dev.tracedown.gateway.data.presets.UpdateRulePresetRequest(script = "get(\"https://example.com/changed\").expect(status: 200)"))
+        val again = obj(send(address, "GET", "${PublicApi.V1}/services/${made.str("id")}", fx.readKey).second)
+        assertEquals(SCRIPT, again.str("script"))
+
+        // Not both.
+        val (bothStatus, bothRaw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"Both","script":"$ESCAPED_SCRIPT","presetId":"${fx.preset}"}""",
+        )
+        assertEquals(400, bothStatus, bothRaw)
+        assertEquals("presetId", obj(bothRaw)["details"]!!.jsonObject.str("field"))
+
+        // A workspace's preset is for services in that workspace only, and a
+        // refused create leaves nothing behind.
+        val otherWs = UUID.fromString(WorkspaceController.create(fx.owner.orgId, CreateWorkspaceRequest("Other WS"), fx.owner.userId).id)
+        val scoped = RulePresetController.create(fx.owner.orgId, fx.owner.userId,
+            CreateRulePresetRequest("Other's preset", SCRIPT, otherWs.toString())).id
+        val (wrongStatus, wrongRaw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"Wrong workspace","presetId":"$scoped"}""",
+        )
+        assertEquals(404, wrongStatus, wrongRaw)
+        assertEquals("presetId", obj(wrongRaw)["details"]!!.jsonObject.str("field"))
+        val names = obj(send(address, "GET", "${PublicApi.V1}/services?projectId=${fx.project}", fx.readKey).second)["items"]!!
+            .jsonArray.map { it.jsonObject.str("name") }
+        assertFalse("Wrong workspace" in names, "A refused create left a service behind: $names")
+    }
+
+    @Test
+    fun `a workspace's preset is read only by those who may see the workspace`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val scoped = RulePresetController.create(fx.owner.orgId, fx.owner.userId,
+            CreateRulePresetRequest("Workspace preset", SCRIPT, fx.workspace.toString())).id
+
+        assertEquals(200, send(address, "GET", "${PublicApi.V1}/presets/$scoped", fx.readKey).first)
+        val (keyStatus, keyRaw) = send(address, "GET", "${PublicApi.V1}/presets/$scoped", fx.memberKey)
+        val (sessionStatus, sessionRaw) = send(address, "GET", "/api/v1/rule-presets/$scoped", fx.memberSession)
+        assertEquals(404, keyStatus, keyRaw)
+        assertEquals(sessionStatus, keyStatus, sessionRaw)
+
+        val listed = obj(send(address, "GET", "${PublicApi.V1}/presets?workspaceId=${fx.workspace}", fx.memberKey).second)
+        assertEquals(listOf(fx.preset.toString()), listed["items"]!!.jsonArray.map { it.jsonObject.str("id") })
+        val ownerListed = obj(send(address, "GET", "${PublicApi.V1}/presets?workspaceId=${fx.workspace}", fx.readKey).second)
+        assertEquals(setOf(fx.preset.toString(), scoped), ownerListed["items"]!!.jsonArray.map { it.jsonObject.str("id") }.toSet())
+    }
+
+    // ── Notification templates ──
+
+    @Test
+    fun `binding a template twice binds it once, and only for those who may change notifications`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val path = "${PublicApi.V1}/projects/${fx.project}/notification-templates/${fx.spareTemplate}"
+        repeat(2) {
+            val (status, raw) = send(address, "PUT", path, fx.writeKey)
+            assertEquals(200, status, raw)
+            assertEquals(listOf(fx.project.toString()), obj(raw)["projectIds"]!!.jsonArray.map { it.jsonPrimitive.content })
+        }
+        val bound = obj(send(address, "GET", "${PublicApi.V1}/projects/${fx.project}/notification-templates", fx.readKey).second)
+        assertEquals(setOf(fx.template.toString(), fx.spareTemplate.toString()),
+            bound["items"]!!.jsonArray.map { it.jsonObject.str("id") }.toSet())
+
+        // A member without the section: what their session is told by the
+        // dashboard's binding and list.
+        val (keyStatus, keyRaw) = send(address, "PUT", path, fx.memberKey)
+        val (sessionStatus, sessionRaw) = send(
+            address, "POST", "/api/v1/notification-templates/${fx.spareTemplate}/projects", fx.memberSession,
+            """{"projectId":"${fx.project}"}""",
+        )
+        assertEquals(403, keyStatus, keyRaw)
+        assertEquals(sessionStatus to errorOf(sessionRaw), keyStatus to errorOf(keyRaw))
+        val (listStatus, listRaw) = send(address, "GET", "${PublicApi.V1}/projects/${fx.project}/notification-templates", fx.memberKey)
+        val (twinStatus, twinRaw) = send(address, "GET", "/api/v1/notification-templates", fx.memberSession)
+        assertEquals(403, listStatus, listRaw)
+        assertEquals(twinStatus to errorOf(twinRaw), listStatus to errorOf(listRaw))
+    }
+
+    @Test
+    fun `a workspace preset the caller cannot see is not there for them, to read, change, delete or use`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val scoped = RulePresetController.create(fx.owner.orgId, fx.owner.userId,
+            CreateRulePresetRequest("Hidden preset", SCRIPT, fx.workspace.toString())).id
+        for ((method, body) in listOf("GET" to null, "PATCH" to """{"name":"Mine now"}""", "DELETE" to null)) {
+            val (status, raw) = send(address, method, "${PublicApi.V1}/presets/$scoped", fx.memberKey, body)
+            assertEquals(404, status, "$method: $raw")
+            assertEquals(Json.parseToJsonElement("""{"error":"not_found"}"""), parse(raw), "$method: $raw")
+        }
+        assertEquals("Hidden preset", RulePresetController.get(fx.owner.orgId, fx.owner.userId, UUID.fromString(scoped)).name)
+
+        // Naming it for a service is 404 too — naming the field it came in.
+        val (status, raw) = send(
+            address, "POST", "${PublicApi.V1}/services", fx.writeKey,
+            """{"projectId":"${fx.project}","name":"Unknown preset","presetId":"${UUID.randomUUID()}"}""",
+        )
+        assertEquals(404, status, raw)
+        assertEquals("presetId", obj(raw)["details"]!!.jsonObject.str("field"))
+
+        // A change is checked as a save is, naming what is wrong.
+        for ((body, field) in listOf("""{"name":"  "}""" to "name", """{"script":"not lace"}""" to "script")) {
+            val (badStatus, badRaw) = send(address, "PATCH", "${PublicApi.V1}/presets/${fx.preset}", fx.writeKey, body)
+            assertEquals(400, badStatus, badRaw)
+            assertEquals(field, obj(badRaw)["details"]!!.jsonObject.str("field"), badRaw)
+        }
+    }
+
+    @Test
+    fun `template names are unique even when two writes race, and binding races to one binding`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+        try {
+            val creates = (1..8).map {
+                pool.submit<Int> { send(address, "POST", "${PublicApi.V1}/notification-templates", fx.writeKey, """{"name":"Raced","text":"x"}""").first }
+            }.map { it.get() }
+            assertEquals(1, creates.count { it == 200 }, "$creates")
+            assertTrue(creates.filter { it != 200 }.all { it == 409 }, "$creates")
+
+            val path = "${PublicApi.V1}/projects/${fx.project}/notification-templates/${fx.spareTemplate}"
+            val binds = (1..8).map { pool.submit<Int> { send(address, "PUT", path, fx.writeKey).first } }.map { it.get() }
+            assertEquals(List(8) { 200 }, binds)
+            val bound = transaction {
+                dev.tracedown.common.models.ProjectNotificationTemplates.selectAll().where {
+                    dev.tracedown.common.models.ProjectNotificationTemplates.notificationTemplateId eq fx.spareTemplate
+                }.count()
+            }
+            assertEquals(1L, bound)
+
+            // A rename onto another's name is 409, and a blank field is named.
+            val (renameStatus, renameRaw) = send(address, "PATCH", "${PublicApi.V1}/notification-templates/${fx.spareTemplate}",
+                fx.writeKey, """{"name":"Fixture template"}""")
+            assertEquals(409, renameStatus, renameRaw)
+            val (blankStatus, blankRaw) = send(address, "PATCH", "${PublicApi.V1}/notification-templates/${fx.spareTemplate}",
+                fx.writeKey, """{"text":"  "}""")
+            assertEquals(400, blankStatus, blankRaw)
+            assertEquals("text", obj(blankRaw)["details"]!!.jsonObject.str("field"))
+        } finally {
+            pool.shutdownNow()
+        }
+
+        // A project's list is that project's templates only.
+        val otherProject = UUID.fromString(ProjectController.create(fx.owner.orgId, fx.workspace,
+            CreateProjectRequest(fx.workspace.toString(), "Template-less"), fx.owner.userId).id)
+        val listed = obj(send(address, "GET", "${PublicApi.V1}/projects/$otherProject/notification-templates", fx.readKey).second)
+        assertEquals(0, listed["items"]!!.jsonArray.size, listed.toString())
+        val ownList = obj(send(address, "GET", "${PublicApi.V1}/projects/${fx.project}/notification-templates", fx.readKey).second)
+        assertEquals(setOf(fx.template.toString(), fx.spareTemplate.toString()),
+            ownList["items"]!!.jsonArray.map { it.jsonObject.str("id") }.toSet())
+    }
+
+    // ── Alerts ──
+
+    @Test
+    fun `the warning log shows every episode, with the caller's own dismissal`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        fun alerts(query: String) = obj(send(address, "GET", "${PublicApi.V1}/alerts$query", fx.writeKey).second)["items"]!!
+            .jsonArray.map { it.jsonObject }
+
+        assertEquals(listOf(fx.alert.toString()), alerts("").map { it.str("id") })
+        assertTrue(alerts("?state=all").single()["dismissedAt"] is JsonNull)
+
+        assertEquals(200, send(address, "POST", "${PublicApi.V1}/alerts/${fx.alert}/dismiss", fx.writeKey).first)
+        assertEquals(emptyList<JsonObject>(), alerts(""), "A dismissed alert is not active for its dismisser")
+        Instant.parse(alerts("?state=all").single().str("dismissedAt"))
+
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/alerts?state=open", fx.writeKey)
+        assertEquals(400, status, raw)
+        assertEquals("state", obj(raw)["details"]!!.jsonObject.str("field"))
+    }
+
+    // ── The event feed ──
+
+    private fun events(address: String, key: String, query: String = ""): JsonObject {
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/events$query", key)
+        assertEquals(200, status, raw)
+        return obj(raw)
+    }
+
+    private fun JsonObject.types(): List<String> = this["items"]!!.jsonArray.map { it.jsonObject.str("type") }
+
+    /** A recorded result's outbox row, as the result ingestor writes it. */
+    private fun recordResult(
+        fx: Fx,
+        status: String,
+        previous: String?,
+        service: UUID = fx.service,
+        project: UUID = fx.project,
+        workspace: UUID = fx.workspace,
+    ): UUID {
+        val resultId = UUID.randomUUID()
+        transaction {
+            Outbox.insert {
+                it[id] = UUID.randomUUID()
+                it[Outbox.organizationId] = fx.owner.orgId
+                it[aggregateType] = "probe_result"
+                it[aggregateId] = resultId
+                it[eventType] = if (status == "skipped") "probe_result.skipped" else "probe_result.created"
+                it[payload] = kotlinx.serialization.json.buildJsonObject {
+                    put("resultId", JsonPrimitive(resultId.toString()))
+                    put("serviceId", JsonPrimitive(service.toString()))
+                    put("projectId", JsonPrimitive(project.toString()))
+                    put("workspaceId", JsonPrimitive(workspace.toString()))
+                    put("organizationId", JsonPrimitive(fx.owner.orgId.toString()))
+                    put("status", JsonPrimitive(status))
+                    if (status == "skipped") {
+                        put("reason", JsonPrimitive("dispatch_queue_full"))
+                    } else {
+                        put("runDurationMs", JsonPrimitive(12))
+                        put("statusChanged", JsonPrimitive(previous != status))
+                        previous?.let { put("previousStatus", JsonPrimitive(it)) }
+                    }
+                }
+                it[published] = false
+                it[createdAt] = Instant.now()
+            }
+        }
+        return resultId
+    }
+
+    /** A read key for [fx]'s grantee, who holds write on its service and nothing else. */
+    private fun granteeKey(fx: Fx, address: String): String = mintKey(login(fx.grantee, address), "read", address)
+
+    @Test
+    fun `each key reads only the events of what its user may see, and never a variable's value`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val granteeSession = login(fx.grantee, address)
+        val granteeKey = mintKey(granteeSession, "read", address)
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+        val start = mapOf(
+            "owner" to events(address, fx.readKey).str("next"),
+            "member" to events(address, fx.memberKey).str("next"),
+            "grantee" to events(address, granteeKey).str("next"),
+        )
+
+        // In the grantee's reach: their service, and — as the dashboard lets
+        // them see the parents of what they hold — its project and workspace.
+        WorkspaceController.update(o, fx.workspace, UpdateWorkspaceRequest("Feed WS"), u)
+        ProjectController.createVariable(o, fx.project, CreateVariableRequest("PROJ_SECRET", "project-secret-value", "secret"), u)
+        ServiceController.update(o, fx.service, UpdateServiceRequest(name = "Feed service"), u)
+        ServiceController.createVariable(o, fx.service, CreateVariableRequest("SVC_PLAIN", "service-plain-value"), u)
+        val resultId = recordResult(fx, "failure", "success")
+        val skippedId = recordResult(fx, "skipped", null)
+        // A run asked for that no scheduler hears settles at once, as skipped.
+        stopListeningForRuns()
+        val settledRun = try {
+            ServiceController.triggerRun(o, fx.service, u).runId
+        } finally {
+            listenForRuns()
+        }
+        // Out of it: a project of another workspace, which they hold nothing in.
+        // (One in the same workspace is not: holding a service lets them read
+        // its workspace, and a workspace's readers read its projects.)
+        val otherWs = UUID.fromString(WorkspaceController.create(o, CreateWorkspaceRequest("Other WS"), u).id)
+        val other = UUID.fromString(ProjectController.create(o, otherWs, CreateProjectRequest(otherWs.toString(), "Other project"), u).id)
+        ProjectController.createVariable(o, other, CreateVariableRequest("OTHER_VAR", "other-value"), u)
+        val otherService = UUID.fromString(
+            ServiceController.create(o, other, CreateServiceRequest(projectId = other.toString(), name = "Other service"), u).id,
+        )
+        recordResult(fx, "success", null, service = otherService, project = other, workspace = otherWs)
+        // And the warning log, which takes the settings section.
+        dev.tracedown.common.alerts.SystemAlertService.raise(o, "agent_down", "feed-agent-${o.toString().take(8)}")
+
+        val (ownerStatus, ownerRaw) = send(address, "GET", "${PublicApi.V1}/events?after=${start["owner"]}", fx.readKey)
+        assertEquals(200, ownerStatus, ownerRaw)
+        val owner = obj(ownerRaw)
+        assertEquals(
+            listOf("workspace.updated", "variable.created", "service.updated", "variable.created",
+                "result.recorded", "service.status_changed", "result.recorded", "run.settled",
+                "workspace.created", "project.created", "variable.created", "service.created", "result.recorded",
+                "service.status_changed", "alert.raised"),
+            owner.types(),
+        )
+        val grantee = events(address, granteeKey, "?after=${start["grantee"]}")
+        assertEquals(
+            listOf("workspace.updated", "variable.created", "service.updated", "variable.created", "result.recorded",
+                "service.status_changed", "result.recorded", "run.settled"),
+            grantee.types(),
+        )
+        val seen = grantee["items"]!!.jsonArray.map { it.jsonObject }
+        assertFalse(seen.any { listOf(otherWs, other, otherService).any { id -> id.toString() in it.toString() } },
+            "The grantee was told about a project they hold nothing in: $grantee")
+        // What their session is told by the dashboard, for the same two projects.
+        assertEquals(200, send(address, "GET", "/api/v1/projects/${fx.project}/variables", granteeSession).first)
+        assertEquals(404, send(address, "GET", "/api/v1/projects/$other/variables", granteeSession).first)
+
+        val member = events(address, fx.memberKey, "?after=${start["member"]}")
+        assertEquals(emptyList<String>(), member.types(), "A member with no grant saw: $member")
+        assertTrue(member.str("next") != start["member"], "An empty read still moves the cursor")
+
+        for (raw in listOf(ownerRaw, grantee.toString())) {
+            assertFalse(listOf("project-secret-value", "service-plain-value", "other-value").any { it in raw },
+                "A variable's value reached the feed: $raw")
+        }
+        val items = owner["items"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("PROJ_SECRET", "SVC_PLAIN", "OTHER_VAR"),
+            items.filter { it.str("type") == "variable.created" }.map { it["data"]!!.jsonObject.str("key") })
+        // Every type carries exactly the data the description lists for it.
+        for (item in items) {
+            assertEquals(
+                dev.tracedown.gateway.controllers.events.EventTypes.DATA.getValue(item.str("type")).toSet(),
+                item["data"]!!.jsonObject.keys, "data of $item",
+            )
+        }
+        val skipped = items.single { it.str("type") == "result.recorded" && it["data"]!!.jsonObject.str("resultId") == skippedId.toString() }
+        assertEquals("skipped", skipped["data"]!!.jsonObject.str("status"))
+        assertEquals("dispatch_queue_full", skipped["data"]!!.jsonObject.str("reason"))
+        assertTrue(skipped["data"]!!.jsonObject["runDurationMs"] is JsonNull)
+        val run = items.single { it.str("type") == "run.settled" }["data"]!!.jsonObject
+        assertEquals(settledRun.toString(), run.str("runId"))
+        assertEquals(fx.service.toString(), run.str("serviceId"))
+        assertEquals("skipped", run.str("state"))
+        assertEquals("run_not_delivered", run.str("reason"))
+        assertTrue(run["status"] is JsonNull, run.toString())
+        val alert = items.single { it.str("type") == "alert.raised" }
+        assertEquals("agent_down", alert["data"]!!.jsonObject.str("type"))
+        val result = items.first { it.str("type") == "result.recorded" }
+        assertEquals(resultId.toString(), result["data"]!!.jsonObject.str("resultId"))
+        assertEquals(fx.service.toString(), result["resource"]!!.jsonObject.str("id"))
+        val changed = items.first { it.str("type") == "service.status_changed" }
+        assertEquals("success", changed["data"]!!.jsonObject.str("previousStatus"))
+        assertTrue(items.last { it.str("type") == "service.status_changed" }["data"]!!.jsonObject["previousStatus"] is JsonNull)
+
+        // Narrowed by type, and the same position reads the same events again.
+        val narrowed = events(address, fx.readKey, "?after=${start["owner"]}&types=alert.raised,project.created")
+        assertEquals(listOf("project.created", "alert.raised"), narrowed.types())
+        assertEquals(owner.str("next"), narrowed.str("next"))
+        val paged = events(address, fx.readKey, "?after=${start["owner"]}&limit=2")
+        assertEquals(listOf("workspace.updated", "variable.created"), paged.types())
+        assertEquals(owner.types().drop(2), events(address, fx.readKey, "?after=${paged.str("next")}").types())
+
+        // The answer fits the schema the description gives it.
+        val doc = obj(send(address, "GET", PublicApi.DESCRIPTION_PATH, null).second)
+        val schema = doc["paths"]!!.jsonObject["${PublicApi.V1}/events"]!!.jsonObject["get"]!!.jsonObject["responses"]!!
+            .jsonObject["200"]!!.jsonObject["content"]!!.jsonObject["application/json"]!!.jsonObject["schema"]!!
+        assertConforms(schema, owner, doc["components"]!!.jsonObject["schemas"]!!.jsonObject)
+    }
+
+    // ── The feed, while a read waits ──
+
+    /**
+     * Runs [action] just before the read's look number [look] (1-based) — so a
+     * test changes the world between two looks of one read, without sleeping
+     * and hoping the read is where it should be. Uninstalls itself.
+     */
+    private fun beforeLook(look: Int, action: () -> Unit) {
+        val count = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = {
+            if (count.incrementAndGet() == look) {
+                action()
+                dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = null
+            }
+        }
+    }
+
+    private fun clearLookHook() {
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = null
+    }
+
+    @Test
+    fun `a grant withdrawn while a read waits stops delivery at once`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val granteeKey = granteeKey(fx, address)
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+
+        // While the grant holds, the grantee is told.
+        val before = events(address, granteeKey).str("next")
+        ServiceController.update(o, fx.service, UpdateServiceRequest(name = "Still granted"), u)
+        val granted = events(address, granteeKey, "?after=$before")
+        assertEquals(listOf("service.updated"), granted.types())
+
+        // Between a read's first look and its second, the grant goes and a
+        // change is made: the second look does not show it.
+        val cursor = granted.str("next")
+        try {
+            beforeLook(2) {
+                ResourceAccessController.remove(o, "service", fx.service, "user", fx.grantee.userId.toString(), u)
+                ServiceController.update(o, fx.service, UpdateServiceRequest(name = "No longer granted"), u)
+            }
+            val after = events(address, granteeKey, "?after=$cursor&wait=2")
+            assertEquals(emptyList<String>(), after.types(), "Delivered after the grant was withdrawn: $after")
+        } finally {
+            clearLookHook()
+        }
+
+        // The owner, reading from the same place, is told.
+        assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `a waiting read returns as soon as an event arrives`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val looked = CompletableDeferred<Unit>()
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = { looked.complete(Unit) }
+        try {
+            val waiting = java.util.concurrent.CompletableFuture.supplyAsync {
+                events(address, fx.readKey, "?after=$cursor&wait=25")
+            }
+            runBlocking { looked.await() }
+            clearLookHook()
+            val started = System.nanoTime()
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Wake up"), fx.owner.userId)
+            val page = waiting.get(30, java.util.concurrent.TimeUnit.SECONDS)
+            val elapsed = Duration.ofNanos(System.nanoTime() - started)
+            assertEquals(listOf("service.updated"), page.types())
+            // Woken by the commit's nudge, not by the read's own schedule (its
+            // next look would be over 12 seconds away).
+            assertTrue(elapsed < Duration.ofSeconds(4), "The read took $elapsed to see the event")
+        } finally {
+            clearLookHook()
+        }
+
+        // And with nothing to report, it answers empty when the wait is up.
+        val quiet = System.nanoTime()
+        val next = events(address, fx.readKey).str("next")
+        val empty = events(address, fx.readKey, "?after=$next&wait=1")
+        assertEquals(emptyList<String>(), empty.types())
+        assertTrue(Duration.ofNanos(System.nanoTime() - quiet) >= Duration.ofMillis(900))
+    }
+
+    /** [fx]'s organization's last outbox row, as a position. */
+    private fun lastPosition(fx: Fx): dev.tracedown.gateway.util.EventCursor.Position.At = transaction {
+        Outbox.selectAll().where { Outbox.organizationId eq fx.owner.orgId }
+            .map { dev.tracedown.gateway.util.EventCursor.Position.At(it[Outbox.xid]!!, it[Outbox.seq]) }
+            .max()
+    }
+
+    private fun setMark(xid: Long, seq: Long) = transaction {
+        dev.tracedown.common.models.OutboxRetention.update({ dev.tracedown.common.models.OutboxRetention.id eq 1 }) {
+            it[purgedXid] = xid
+            it[purgedSeq] = seq
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a cursor older than what is kept is refused with where to start again, also while it waits`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Kept"), fx.owner.userId)
+        val purged = lastPosition(fx)
+        try {
+            setMark(purged.xid, purged.seq)
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
+            assertEquals(410, status, raw)
+            assertEquals("cursor_expired", errorOf(raw))
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            assertEquals(purged, dev.tracedown.gateway.util.EventCursor.decode(fx.owner.orgId, oldest))
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+
+            // A read whose first look was fine is told at its second, when the
+            // purge passed it in between.
+            setMark(0, 0)
+            val from = events(address, fx.readKey).str("next")
+            beforeLook(2) {
+                ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Purged past"), fx.owner.userId)
+                val passed = lastPosition(fx)
+                setMark(passed.xid, passed.seq)
+            }
+            val (waitStatus, waitRaw) = send(address, "GET", "${PublicApi.V1}/events?after=$from&wait=2", fx.readKey)
+            assertEquals(410, waitStatus, waitRaw)
+            assertEquals("cursor_expired", errorOf(waitRaw))
+        } finally {
+            clearLookHook()
+            setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a quiet organization's cursor keeps up, so another's purged rows do not expire it`() {
+        val address = nextAddress()
+        val quiet = fixtures(address)
+        val busy = fixtures(nextAddress())
+        val first = events(address, quiet.readKey).str("next")
+        ServiceController.update(busy.owner.orgId, busy.service, UpdateServiceRequest(name = "Busy"), busy.owner.userId)
+        // An empty read moves the cursor up to everything settled.
+        val refreshed = events(address, quiet.readKey, "?after=$first")
+        assertEquals(emptyList<String>(), refreshed.types())
+        assertTrue(refreshed.str("next") != first)
+        val purged = lastPosition(busy)
+        try {
+            setMark(purged.xid, purged.seq)
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=${refreshed.str("next")}", quiet.readKey).first)
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$first", quiet.readKey).first)
+        } finally {
+            setMark(0, 0)
+        }
+    }
+
+    private val At = dev.tracedown.gateway.util.EventCursor.Position::At
+
+    /** The oldest transaction open now, and the next id to be given out. */
+    private fun horizonNow(): Pair<Long, Long> = transaction {
+        var out = 0L to 0L
+        exec("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint, pg_snapshot_xmax(pg_current_snapshot())::text::bigint") { rs ->
+            rs.next(); out = rs.getLong(1) to rs.getLong(2)
+        }
+        out
+    }
+
+    private fun markNow(): dev.tracedown.gateway.util.EventCursor.Position.At = transaction {
+        dev.tracedown.common.models.OutboxRetention.selectAll().single().let {
+            At(it[dev.tracedown.common.models.OutboxRetention.purgedXid], it[dev.tracedown.common.models.OutboxRetention.purgedSeq])
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a cursor from another history is refused, and the feed starts again from the present`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val (horizon, xmax) = horizonNow()
+        // A row of another history: written by a transaction this database has not reached.
+        transaction {
+            exec(
+                "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id, xid) " +
+                    "VALUES (gen_random_uuid(), 'workspace', '${fx.workspace}', 'resource.workspace.updated', " +
+                    "'{\"id\":\"${fx.workspace}\",\"orgId\":\"${fx.owner.orgId}\"}'::jsonb, false, now(), '${fx.owner.orgId}', ${xmax + 1_000_000})",
+            )
+        }
+        try {
+            // Past the horizon: no position this history handed out.
+            val beyond = dev.tracedown.gateway.util.EventCursor.encode(fx.owner.orgId, At(horizon + 1_000, 0))
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$beyond", fx.readKey)
+            assertEquals(410, status, raw)
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            // The fresh start is a cursor that works.
+            events(address, fx.readKey, "?after=$oldest")
+            assertTrue(markNow() >= At(horizon - 1, Long.MAX_VALUE), "the mark starts at the present: ${markNow()}")
+            // The other history's row lost its place: never delivered, never counted.
+            val stray = transaction {
+                Outbox.selectAll().where { Outbox.organizationId eq fx.owner.orgId }.map { it[Outbox.xid] }.filter { it == null }
+            }
+            assertEquals(1, stray.size)
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "After the move"), fx.owner.userId)
+            assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=$oldest").types())
+        } finally {
+            setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a database that went back in time is noticed by the horizon it has seen`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        try {
+            // A horizon seen before, far above today's: what a restore looks like from here.
+            redis.sync().set("feed:hw", Long.MAX_VALUE.div(4).toString())
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.readKey)
+            assertEquals(410, status, raw)
+            val oldest = obj(raw)["details"]!!.jsonObject.str("oldest")
+            assertTrue(redis.sync().get("feed:hw")!!.toLong() < Long.MAX_VALUE / 4, "the high-water mark starts again")
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+            // Seen once, settled: the next read is ordinary.
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$oldest", fx.readKey).first)
+        } finally {
+            redis.close()
+            setMark(0, 0)
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.parallel.ResourceLock("outbox_retention")
+    fun `a key with no budget left is refused before any work, and a refused cursor is paid for`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        val cursor = events(address, key).str("next")
+
+        // A refusal that reads the mark is a request's worth of work.
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Past it"), fx.owner.userId)
+        val passed = lastPosition(fx)
+        try {
+            setMark(passed.xid, passed.seq)
+            var before = budgetLeft(key)
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$cursor&wait=2", key).first)
+            assertEquals(2L, before - budgetLeft(key), "the refused first look was charged")
+            before = budgetLeft(key)
+            val foreign = fixtures(nextAddress()).let { events(nextAddress(), it.readKey).str("next") }
+            assertEquals(410, send(address, "GET", "${PublicApi.V1}/events?after=$foreign&wait=2", key).first)
+            assertEquals(2L, before - budgetLeft(key), "a cursor that does not open was charged")
+        } finally {
+            setMark(0, 0)
+        }
+
+        // Spent out: refused at the door — no look, and nothing more spent.
+        val digest = dev.tracedown.common.auth.TokenHasher.sha256Hex(key)
+        val window = System.currentTimeMillis() / 1000 / ONE_WINDOW.toLong()
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        val looks = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = { looks.incrementAndGet() }
+        try {
+            redis.sync().set("rate:api:$digest:$window", "1000000")
+            repeat(3) {
+                val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", key)
+                assertEquals(429, status, raw)
+                assertEquals("rate_limited", errorOf(raw))
+            }
+            assertEquals(0, looks.get(), "a refused read looked at the feed")
+            assertEquals("1000000", redis.sync().get("rate:api:$digest:$window"), "a refused read spent budget")
+        } finally {
+            clearLookHook()
+            redis.sync().del("rate:api:$digest:$window")
+            redis.close()
+        }
+    }
+
+    /**
+     * Opens a transaction on a connection of its own that writes an outbox row
+     * for [fx]. With [xidFirst], the transaction takes its id before anything
+     * else is written — so its row's `seq` comes after rows written meanwhile.
+     */
+    private fun openWrite(fx: Fx, name: String, xidFirst: Boolean = false): Pair<java.sql.Connection, () -> Unit> {
+        val connection = java.sql.DriverManager.getConnection(postgres.jdbcUrl, postgres.username, postgres.password)
+        connection.autoCommit = false
+        val insert = {
+            connection.prepareStatement(
+                "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id) " +
+                    "VALUES (?, 'workspace', ?, 'resource.workspace.updated', ?::jsonb, false, now(), ?)",
+            ).use { stmt ->
+                stmt.setObject(1, UUID.randomUUID())
+                stmt.setObject(2, fx.workspace)
+                stmt.setString(3, """{"id":"${fx.workspace}","orgId":"${fx.owner.orgId}","name":"$name"}""")
+                stmt.setObject(4, fx.owner.orgId)
+                stmt.executeUpdate()
+            }
+            Unit
+        }
+        if (xidFirst) {
+            connection.prepareStatement("SELECT pg_current_xact_id()").use { it.executeQuery().close() }
+        } else {
+            insert()
+        }
+        return connection to insert
+    }
+
+    @Test
+    fun `a row whose transaction commits late is not passed over, however late`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val (late, _) = openWrite(fx, "late")
+        try {
+            // Written and committed after the open one: its row is readable, the
+            // open one's is not yet.
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "On time"), fx.owner.userId)
+            repeat(2) {
+                val held = events(address, fx.readKey, "?after=$cursor")
+                assertEquals(emptyList<String>(), held.types(), "Read past a transaction still open: $held")
+                assertEquals(cursor, held.str("next"))
+            }
+            late.commit()
+        } finally {
+            late.close()
+        }
+        assertEquals(listOf("workspace.updated", "service.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `rows come in the order of their transactions, not of their numbers`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        // The open transaction has its id first; its row is written last, so
+        // its `seq` is after the other row's.
+        val (early, insert) = openWrite(fx, "early", xidFirst = true)
+        try {
+            ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "Numbered first"), fx.owner.userId)
+            insert()
+            early.commit()
+        } finally {
+            early.close()
+        }
+        val page = events(address, fx.readKey, "?after=$cursor")
+        assertEquals(listOf("workspace.updated", "service.updated"), page.types())
+        // And a read from between them gives the second only.
+        val first = events(address, fx.readKey, "?after=$cursor&limit=1")
+        assertEquals(listOf("service.updated"), events(address, fx.readKey, "?after=${first.str("next")}").types())
+    }
+
+    @Test
+    fun `reading from now takes in a row whose transaction is still open`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val (inFlight, _) = openWrite(fx, "in flight")
+        val cursor = try {
+            events(address, fx.readKey).str("next").also { inFlight.commit() }
+        } finally {
+            inFlight.close()
+        }
+        assertEquals(listOf("workspace.updated"), events(address, fx.readKey, "?after=$cursor").types())
+    }
+
+    @Test
+    fun `a key revoked, or a second factor required, while a read waits is refused on the next look`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        try {
+            beforeLook(2) {
+                transaction {
+                    dev.tracedown.common.models.ApiKeys.update({
+                        dev.tracedown.common.models.ApiKeys.keyHash eq dev.tracedown.common.auth.TokenHasher.sha256Hex(key)
+                    }) { it[revoked] = true }
+                }
+            }
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?wait=2", key)
+            assertEquals(401, status, raw)
+            assertEquals("api_key_revoked", errorOf(raw))
+
+            // A member (not the owner, whom the rule does not stop) whose
+            // organization starts requiring a second factor mid-read.
+            val memberKey = fx.memberKey
+            setOrgSettings(fx, fx.member, 1)
+            beforeLook(2) {
+                transaction {
+                    Organizations.update({ Organizations.id eq fx.owner.orgId }) { it[totpRequired] = true }
+                    dev.tracedown.common.auth.PermissionCacheService.recomputeForOrg(fx.owner.orgId)
+                }
+            }
+            val (totpStatus, totpRaw) = send(address, "GET", "${PublicApi.V1}/events?wait=2", memberKey)
+            assertEquals(403, totpStatus, totpRaw)
+            assertEquals("totp_enrollment_required", errorOf(totpRaw))
+        } finally {
+            clearLookHook()
+            transaction { Organizations.update({ Organizations.id eq fx.owner.orgId }) { it[totpRequired] = false } }
+        }
+    }
+
+    /** Gives [account] [level] on [fx]'s organization's settings section, as the permission screens do. */
+    private fun setOrgSettings(fx: Fx, account: Account, level: Short) {
+        transaction {
+            OrgUsers.update({ (OrgUsers.organizationId eq fx.owner.orgId) and (OrgUsers.userId eq account.userId) }) {
+                it[orgSettings] = level
+            }
+            dev.tracedown.common.auth.PermissionCacheService.recomputeForOrg(fx.owner.orgId)
+        }
+    }
+
+    @Test
+    fun `a cursor is sealed to its organization and to the key it was sealed under`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val other = fixtures(nextAddress())
+        val cursor = events(address, fx.readKey).str("next")
+        // Sealed: the position it names is nowhere in it in the clear.
+        val position = dev.tracedown.gateway.util.EventCursor.decode(fx.owner.orgId, cursor)!!
+        val sealed = java.util.Base64.getUrlDecoder().decode(cursor.removePrefix("ev2."))
+        val seqBytes = java.nio.ByteBuffer.allocate(8).putLong(position.seq).array()
+        assertFalse(sealed.toList().windowed(8).any { it == seqBytes.toList() }, "The cursor shows its position: $cursor")
+        // Another organization's key: a cursor that does not open there, 410.
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/events?after=$cursor", other.readKey)
+        assertEquals(410, status, raw)
+        assertEquals("cursor_expired", errorOf(raw))
+        // Not a cursor at all: 400, naming it.
+        val (badStatus, badRaw) = send(address, "GET", "${PublicApi.V1}/events?after=ev2.abc", fx.readKey)
+        assertEquals(400, badStatus, badRaw)
+        assertEquals("after", obj(badRaw)["details"]!!.jsonObject.str("field"))
+        // The same position, asked twice, is the same cursor.
+        assertEquals(events(address, fx.readKey, "?after=$cursor").str("next"), events(address, fx.readKey, "?after=$cursor").str("next"))
+    }
+
+    /** Requests a read and gives back its status, error and `details.bound`. */
+    private fun bounded(address: String, key: String, query: String): Triple<Int, String?, String?> {
+        val (status, raw) = send(address, "GET", "${PublicApi.V1}/events$query", key)
+        val bound = (parse(raw) as? JsonObject)?.get("details")?.jsonObject?.get("bound")?.jsonPrimitive?.content
+        return Triple(status, errorOf(raw), bound)
+    }
+
+    @Test
+    fun `reads open are bounded per key, user and organization, and in this process without Redis`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val cursor = events(address, fx.readKey).str("next")
+        val held = CompletableDeferred<Unit>()
+        val looks = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = {
+            if (looks.incrementAndGet() == 2) held.complete(Unit)
+        }
+        try {
+            val open = (1..2).map {
+                java.util.concurrent.CompletableFuture.supplyAsync { events(address, fx.readKey, "?after=$cursor&wait=3") }
+            }
+            runBlocking { held.await() }
+            val request = Request.Builder().url("http://localhost:$serverPort${PublicApi.V1}/events?after=$cursor")
+                .header("X-Forwarded-For", address).header("Authorization", "Bearer ${fx.readKey}").build()
+            client.newCall(request).execute().use { response ->
+                assertEquals(429, response.code)
+                val body = obj(response.body.string())
+                assertEquals("too_many_event_polls", body.str("error"))
+                assertEquals("key", body["details"]!!.jsonObject.str("bound"))
+                assertNotNull(response.header("Retry-After"))
+            }
+            // Another key of the same user is not held back by this one's.
+            assertEquals(200, send(address, "GET", "${PublicApi.V1}/events?after=$cursor", fx.writeKey).first)
+            open.forEach { it.get(20, java.util.concurrent.TimeUnit.SECONDS) }
+        } finally {
+            clearLookHook()
+        }
+
+        // The user's and the organization's bounds, as Redis counts them.
+        val redis = io.lettuce.core.RedisClient.create(TestRedis.url).connect()
+        try {
+            val future = (System.currentTimeMillis() + 60_000).toDouble()
+            val userKey = "events:polls:user:${fx.owner.userId}"
+            repeat(dev.tracedown.gateway.util.EventPollSlots.PER_USER) { redis.sync().zadd(userKey, future, "held-$it") }
+            assertEquals("user", bounded(address, fx.readKey, "?after=$cursor").third)
+            redis.sync().del(userKey)
+            val orgKey = "events:polls:org:${fx.owner.orgId}"
+            repeat(dev.tracedown.gateway.util.EventPollSlots.PER_ORG) { redis.sync().zadd(orgKey, future, "held-$it") }
+            assertEquals("org", bounded(address, fx.readKey, "?after=$cursor").third)
+            redis.sync().del(orgKey)
+            assertEquals(200, bounded(address, fx.readKey, "?after=$cursor").first)
+        } finally {
+            redis.close()
+        }
+
+        // Without Redis, the key is still held to its bound in this process.
+        val redisProvider = dev.tracedown.gateway.util.EventPollSlots.provider()
+        dev.tracedown.gateway.util.EventPollSlots.init { error("Redis is away") }
+        val again = CompletableDeferred<Unit>()
+        val count = AtomicInteger(0)
+        dev.tracedown.gateway.controllers.events.EventFeedController.beforeEachLook = {
+            if (count.incrementAndGet() == 2) again.complete(Unit)
+        }
+        try {
+            val open = (1..2).map {
+                java.util.concurrent.CompletableFuture.supplyAsync { events(address, fx.readKey, "?after=$cursor&wait=3") }
+            }
+            runBlocking { again.await() }
+            assertEquals(Triple(429, "too_many_event_polls", "key"), bounded(address, fx.readKey, "?after=$cursor"))
+            open.forEach { it.get(20, java.util.concurrent.TimeUnit.SECONDS) }
+        } finally {
+            clearLookHook()
+            dev.tracedown.gateway.util.EventPollSlots.init(redisProvider)
+        }
+    }
+
+    /** What is left of [key]'s request budget, after spending one unit to ask. */
+    private fun budgetLeft(key: String): Long =
+        dev.tracedown.gateway.util.ApiRateLimit.spend(dev.tracedown.common.auth.TokenHasher.sha256Hex(key))!!.remaining.toLong()
+
+    @Test
+    fun `a read spends the budget for every look after the first and for every answer it does not wait for`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val key = mintKey(fx.ownerSession, "read", address)
+        val cursor = events(address, key).str("next")
+
+        // wait=0: one request.
+        var before = budgetLeft(key)
+        events(address, key, "?after=$cursor")
+        assertEquals(2L, before - budgetLeft(key))
+
+        // Waiting with nothing to find: three looks, the first free.
+        before = budgetLeft(key)
+        val quiet = events(address, key, "?after=$cursor&wait=2")
+        assertEquals(emptyList<String>(), quiet.types())
+        assertEquals(3L, before - budgetLeft(key), "two looks after the first")
+
+        // Waiting, with events already there: answered at once, one request.
+        ServiceController.update(fx.owner.orgId, fx.service, UpdateServiceRequest(name = "There already"), fx.owner.userId)
+        before = budgetLeft(key)
+        assertEquals(listOf("service.updated"), events(address, key, "?after=${quiet.str("next")}&wait=5").types())
+        assertEquals(2L, before - budgetLeft(key))
+    }
+
+    /** Writes [count] outbox rows of [fx]'s workspace's updates, for [fx]'s organization, in one statement. */
+    private fun workspaceUpdates(fx: Fx, count: Int) = transaction {
+        exec(
+            "INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, published, created_at, organization_id) " +
+                "SELECT gen_random_uuid(), 'workspace', '${fx.workspace}', 'resource.workspace.updated', " +
+                "'{\"id\":\"${fx.workspace}\",\"orgId\":\"${fx.owner.orgId}\"}'::jsonb, false, now(), '${fx.owner.orgId}' " +
+                "FROM generate_series(1, $count)",
+        )
+    }
+
+    @Test
+    fun `more says whether a read stopped short, whether or not it found anything`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val memberStart = events(address, fx.memberKey).str("next")
+        val ownerStart = events(address, fx.readKey).str("next")
+        workspaceUpdates(fx, dev.tracedown.gateway.controllers.events.EventFeedController.SCAN_ROWS + 1)
+
+        // The member sees none of it: a full look of nothing, then the rest.
+        val first = events(address, fx.memberKey, "?after=$memberStart")
+        assertEquals(emptyList<String>(), first.types())
+        assertEquals("true", first.str("more"))
+        val second = events(address, fx.memberKey, "?after=${first.str("next")}")
+        assertEquals(emptyList<String>(), second.types())
+        assertEquals("false", second.str("more"))
+
+        // The owner sees all of it, a page at a time.
+        val page = events(address, fx.readKey, "?after=$ownerStart&limit=100")
+        assertEquals(100, page.types().size)
+        assertEquals("true", page.str("more"))
+        var next = page.str("next")
+        var seen = 100
+        while (true) {
+            val more = events(address, fx.readKey, "?after=$next&limit=100")
+            seen += more.types().size
+            next = more.str("next")
+            if (more.str("more") == "false") break
+        }
+        assertEquals(dev.tracedown.gateway.controllers.events.EventFeedController.SCAN_ROWS + 1, seen)
+    }
+
+    @Test
+    fun `an event is shown by what the database says it is about, never by what its row claims`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val granteeKey = granteeKey(fx, address)
+        val other = fixtures(nextAddress())
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+        // A service of another workspace of the same organization, out of the grantee's reach.
+        val hiddenWs = UUID.fromString(WorkspaceController.create(o, CreateWorkspaceRequest("Hidden WS"), u).id)
+        val hiddenProject = UUID.fromString(ProjectController.create(o, hiddenWs, CreateProjectRequest(hiddenWs.toString(), "Hidden"), u).id)
+        val hidden = UUID.fromString(ServiceController.create(o, hiddenProject, CreateServiceRequest(projectId = hiddenProject.toString(), name = "Hidden"), u).id)
+        val start = events(address, granteeKey).str("next")
+        val ownerStart = events(address, fx.readKey).str("next")
+
+        // A row naming the hidden service under the grantee's own project and workspace.
+        recordResult(fx, "failure", "success", service = hidden)
+        // A row of this organization naming another organization's service.
+        recordResult(fx, "failure", "success", service = other.service, project = other.project, workspace = other.workspace)
+        // And another organization's own row.
+        ServiceController.update(other.owner.orgId, other.service, UpdateServiceRequest(name = "Theirs"), other.owner.userId)
+
+        assertEquals(emptyList<String>(), events(address, granteeKey, "?after=$start").types())
+        // The owner may see the hidden service; never the other organization's.
+        val owner = events(address, fx.readKey, "?after=$ownerStart")
+        assertEquals(listOf("result.recorded", "service.status_changed"), owner.types())
+        val result = owner["items"]!!.jsonArray.first().jsonObject
+        assertEquals(hidden.toString(), result["resource"]!!.jsonObject.str("id"))
+        assertEquals(hiddenProject.toString(), result["data"]!!.jsonObject.str("projectId"), "the project the database names")
+        // A status change's id is an id of its own, stable from read to read.
+        val statusId = owner["items"]!!.jsonArray[1].jsonObject.str("id")
+        UUID.fromString(statusId)
+        assertEquals(statusId, events(address, fx.readKey, "?after=$ownerStart")["items"]!!.jsonArray[1].jsonObject.str("id"))
+    }
+
+    @Test
+    fun `organization variables need the settings section to read, and alerts need it to write`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        val o = fx.owner.orgId
+        val u = fx.owner.userId
+        setOrgSettings(fx, fx.member, 1)
+        val start = events(address, fx.memberKey).str("next")
+        OrgVariableController.create(o, CreateVariableRequest("ORG_SEEN", "org-value"), u)
+        dev.tracedown.common.alerts.SystemAlertService.raise(o, "agent_down", "settings-read-${o.toString().take(8)}")
+        // Settings read: the organization's variable, not the alert.
+        val read = events(address, fx.memberKey, "?after=$start")
+        assertEquals(listOf("variable.created"), read.types())
+        assertEquals("org", read["items"]!!.jsonArray.single().jsonObject["data"]!!.jsonObject.str("scope"))
+        // Settings write: the alert too.
+        setOrgSettings(fx, fx.member, 2)
+        assertEquals(listOf("variable.created", "alert.raised"), events(address, fx.memberKey, "?after=$start").types())
+        // No settings at all: neither.
+        setOrgSettings(fx, fx.member, 0)
+        assertEquals(emptyList<String>(), events(address, fx.memberKey, "?after=$start").types())
+    }
+
+    @Test
+    fun `the feed's parameters are named when they are wrong`() {
+        val address = nextAddress()
+        val fx = fixtures(address)
+        for ((query, field) in listOf(
+            "?wait=31" to "wait", "?wait=soon" to "wait", "?limit=0" to "limit", "?limit=101" to "limit",
+            "?types=result.recorded,result.deleted" to "types", "?after=not-a-cursor" to "after", "?after=" to "after",
+        )) {
+            val (status, raw) = send(address, "GET", "${PublicApi.V1}/events$query", fx.readKey)
+            assertEquals(400, status, "$query: $raw")
+            assertEquals(field, obj(raw)["details"]!!.jsonObject.str("field"), query)
+        }
+    }
+
     // ── Run handles ──
 
     /** A result row of [fx]'s service under [id], as the ingestor writes one. */
@@ -3476,7 +4587,7 @@ class ApiKeyResourcesTest {
     }
 
     /** The writes that take no body: a run is asked for, not described. */
-    private val BODILESS_WRITES = setOf("runService")
+    private val BODILESS_WRITES = setOf("runService", "dismissAlert", "bindProjectNotificationTemplate")
 
     private val HTTP_METHODS = setOf("get", "put", "post", "delete", "patch", "head", "options")
 }

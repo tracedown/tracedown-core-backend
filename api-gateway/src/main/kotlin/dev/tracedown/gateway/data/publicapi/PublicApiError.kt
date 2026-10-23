@@ -12,7 +12,9 @@ import kotlinx.serialization.json.JsonObject
  * fault; `max` — the largest count allowed (a page size, an hour range);
  * `maxBytes` — the largest size allowed, in bytes; `unknown` — the values that
  * name nothing (agent slugs); `errors` — a script's validation errors; `reason`
- * — a short machine-readable or human-readable cause.
+ * — a short machine-readable or human-readable cause; `oldest` — the event
+ * cursor to start again from; `bound` — which bound on open event reads is
+ * reached.
  */
 @Serializable
 data class PublicApiError(val error: String, val details: JsonObject? = null)

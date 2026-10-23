@@ -1,0 +1,16 @@
+result.recorded service resultId,status,runDurationMs,reason,projectId,workspaceId
+service.status_changed service status,previousStatus,resultId
+workspace.created workspace
+workspace.updated workspace
+workspace.deleted workspace
+project.created project workspaceId
+project.updated project workspaceId
+project.deleted project workspaceId
+service.created service projectId,workspaceId
+service.updated service projectId,workspaceId
+service.deleted service projectId,workspaceId
+variable.created variable scope,scopeId,key
+variable.updated variable scope,scopeId,key
+variable.deleted variable scope,scopeId,key
+alert.raised alert type,subject,severity
+run.settled service runId,serviceId,state,status,reason,superseded

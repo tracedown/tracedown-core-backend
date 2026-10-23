@@ -24,11 +24,18 @@ data class CreateServiceRequest(
      */
     @JsonSchema.MaxLength(65536)
     val script: String? = null,
-    /** Whether the service starts switched on. True needs a [script]. */
+    /** Whether the service starts switched on. True needs a [script] or a [presetId]. */
     val isActive: Boolean? = null,
+    /**
+     * A script preset whose script the service starts with, instead of a
+     * [script] — copied, as the editor copies it: a later change to the
+     * preset does not reach the service. Not both.
+     */
+    val presetId: String? = null,
 ) : Validatable {
     override fun validate() = buildList {
         Validators.maxLen("script", script, 65536)?.let(::add)
+        Validators.uuid("presetId", presetId)?.let(::add)
         Validators.notBlank("projectId", projectId)?.let(::add)
         Validators.uuid("projectId", projectId)?.let(::add)
         Validators.notBlank("name", name)?.let(::add)

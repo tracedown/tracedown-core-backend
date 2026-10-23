@@ -42,7 +42,8 @@ private fun JdbcTransaction.execCount(sql: String): Long =
  * [PurgeScheduleRepair].
  *
  * Stored response bodies referenced by probe_steps rows are deleted from body
- * storage *before* the rows are purged, mirroring [RetentionJob]. A failing
+ * storage *before* the rows are purged, mirroring [RetentionJob] — a page at a
+ * time, with no transaction open while storage is talked to. A failing
  * storage backend never blocks the database purge; the URI it could not delete
  * is written to `pending_body_deletions` first, so the object stays referenced
  * after the row naming it is gone and [BodyDeletionRetryJob] can finish the
@@ -67,6 +68,11 @@ class PurgeJob(
 
         for (unit in purgeUnits) {
             try {
+                // A container's stored bodies first, with no transaction open
+                // while storage is talked to: a slow store must not hold one
+                // (the pool ends a transaction left idle), and deleting them
+                // is safe to repeat if the cascade then fails.
+                unit.storedBodies?.let { deleteStoredBodies(it) }
                 totalDeleted += ioTransaction { unit.purge(this) }
             } catch (e: Exception) {
                 failedGroups++
@@ -82,8 +88,15 @@ class PurgeJob(
         }
     }
 
-    /** One independently-purged entity group. Runs inside its own transaction. */
-    private class PurgeUnit(val entity: String, val purge: JdbcTransaction.() -> Long)
+    /**
+     * One independently-purged entity group. Runs inside its own transaction,
+     * after the stored bodies of the results [storedBodies] selects, if any.
+     */
+    private class PurgeUnit(
+        val entity: String,
+        val storedBodies: String? = null,
+        val purge: JdbcTransaction.() -> Long,
+    )
 
     private val purgeUnits: List<PurgeUnit> = buildList {
         // ── Crypto-shredding: purging orgs lose their data-encryption key FIRST ──
@@ -131,20 +144,16 @@ class PurgeJob(
         add(PurgeUnit("org_users") { CASCADE_ORG_USERS.sumOf { execCount(it) } })
 
         // ── Container entities, each cascading its dependents ──
-        add(PurgeUnit("services") {
-            deleteStoredBodies(RESULTS_OF_PURGING_SERVICES)
+        add(PurgeUnit("services", storedBodies = RESULTS_OF_PURGING_SERVICES) {
             CASCADE_SERVICES.sumOf { execCount(it) }
         })
-        add(PurgeUnit("projects") {
-            deleteStoredBodies(RESULTS_OF_PURGING_PROJECTS)
+        add(PurgeUnit("projects", storedBodies = RESULTS_OF_PURGING_PROJECTS) {
             CASCADE_PROJECTS.sumOf { execCount(it) }
         })
-        add(PurgeUnit("workspaces") {
-            deleteStoredBodies(RESULTS_OF_PURGING_WORKSPACES)
+        add(PurgeUnit("workspaces", storedBodies = RESULTS_OF_PURGING_WORKSPACES) {
             CASCADE_WORKSPACES.sumOf { execCount(it) }
         })
-        add(PurgeUnit("organizations") {
-            deleteStoredBodies(RESULTS_OF_PURGING_ORGS)
+        add(PurgeUnit("organizations", storedBodies = RESULTS_OF_PURGING_ORGS) {
             // An organization's body stores are removed by the FK's own
             // ON DELETE CASCADE, and that cascade is blocked by anything still
             // pointing at a store. Agents and bootstrap tokens are platform
@@ -168,33 +177,48 @@ class PurgeJob(
      * A body kept in an `in_place` body store (`body_store_id` set) is not the
      * platform's: its retention belongs to the store's owner, so it is left
      * where it is and only the row goes.
+     *
+     * Read a page at a time in short transactions, and deleted between them
+     * with none open, as retention does: storage can be slow, and an open
+     * transaction left idle is ended by the pool. Deleting an object twice is
+     * harmless, so a cascade that fails afterwards just repeats this next run.
      */
-    private fun JdbcTransaction.deleteStoredBodies(purgingResults: String) {
-        val uris = mutableListOf<String>()
-        exec(
-            "SELECT response_body_storage_url FROM probe_steps " +
-                "WHERE response_body_storage_url IS NOT NULL AND body_store_id IS NULL " +
-                "AND probe_result_id IN ($purgingResults)"
-        ) { rs ->
-            while (rs.next()) uris.add(rs.getString(1))
-        }
+    private suspend fun deleteStoredBodies(purgingResults: String) {
+        var after: String? = null
+        while (true) {
+            val page = mutableListOf<Pair<String, String>>()
+            ioTransaction {
+                val from = after?.let { "AND id > '$it' " } ?: ""
+                exec(
+                    "SELECT id, response_body_storage_url FROM probe_steps " +
+                        "WHERE response_body_storage_url IS NOT NULL AND body_store_id IS NULL " +
+                        "AND probe_result_id IN ($purgingResults) $from" +
+                        "ORDER BY id LIMIT $BODY_PAGE"
+                ) { rs ->
+                    while (rs.next()) page.add(rs.getString(1) to rs.getString(2))
+                }
+            }
+            if (page.isEmpty()) return
+            after = page.last().first
+            val uris = page.map { it.second }
 
-        // Refusals are not the purge's problem: the rows naming them are going
-        // regardless, and the body belongs to someone else's store.
-        val failed = storageClient.deleteAll(uris).failed.toList()
-        failed.forEach { (uri, error) -> log.error("Failed to delete stored response body {}: {}", uri, error) }
+            // Refusals are not the purge's problem: the rows naming them are going
+            // regardless, and the body belongs to someone else's store.
+            val failed = storageClient.deleteAll(uris).failed.toList()
+            failed.forEach { (uri, error) -> log.error("Failed to delete stored response body {}: {}", uri, error) }
 
-        // The rows naming these objects are about to go, so a failure here used
-        // to destroy the only reference to a live object — permanently, since
-        // nothing sweeps body storage. Hand the URI to [PendingBodyDeletion]
-        // first and [BodyDeletionRetryJob] finishes the job later.
-        failed.forEach { (uri, error) -> PendingBodyDeletion.record(listOf(uri), error) }
-
-        if (failed.isNotEmpty()) {
-            log.error(
-                "Purge: {} of {} stored bodies could not be deleted and were queued for retry",
-                failed.size, uris.size,
-            )
+            // The rows naming these objects are about to go, so a failure here used
+            // to destroy the only reference to a live object — permanently, since
+            // nothing sweeps body storage. Hand the URI to [PendingBodyDeletion]
+            // first and [BodyDeletionRetryJob] finishes the job later.
+            if (failed.isNotEmpty()) {
+                ioTransaction { failed.forEach { (uri, error) -> PendingBodyDeletion.record(listOf(uri), error) } }
+                log.error(
+                    "Purge: {} of {} stored bodies could not be deleted and were queued for retry",
+                    failed.size, uris.size,
+                )
+            }
+            if (page.size < BODY_PAGE) return
         }
     }
 
@@ -226,6 +250,9 @@ class PurgeJob(
     }
 
     companion object {
+        /** Stored bodies read, and deleted, per round. */
+        private const val BODY_PAGE = 500
+
         private const val PURGE_DUE = "purge_after IS NOT NULL AND purge_after < now()"
         private const val PURGE_OWN = "DELETE FROM %s WHERE $PURGE_DUE"
 

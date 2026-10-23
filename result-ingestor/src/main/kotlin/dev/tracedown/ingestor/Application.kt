@@ -36,6 +36,8 @@ fun main(args: Array<String>) = EngineMain.main(args)
 /** Ktor module — wires DB, Redis, and the consumer loop. */
 fun Application.module() {
     val config = IngestorConfig.load(environment)
+    // The same cap the gateway applies to variables, from the same setting.
+    dev.tracedown.common.variables.VariableLimits.init(config.maxVarsPerResource)
 
     // Fail fast in production if a published dev credential is still in place.
     // No-op in dev (see SecretGuard). This service ships no credential default
@@ -91,6 +93,11 @@ fun Application.module() {
 
     // Realtime events (system alerts raised on shed probes)
     dev.tracedown.common.realtime.RealtimePublisher.init { redis }
+    // Wake the event feed's waiting reads once what this process wrote to the
+    // outbox has committed.
+    dev.tracedown.common.models.OutboxEmit.onCommitted { orgId ->
+        redis.publish(dev.tracedown.common.models.OutboxEmit.NUDGE_CHANNEL, orgId.toString())
+    }
 
     // Body storage: relocate agent-uploaded bodies to server-derived, tenant-scoped
     // keys. Confined to the shared filesystem root / S3 bucket+prefix the agent
