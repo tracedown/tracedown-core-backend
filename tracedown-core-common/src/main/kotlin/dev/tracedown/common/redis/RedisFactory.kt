@@ -64,6 +64,14 @@ object RedisFactory {
         connectWithRetry(redisUrl) { it.connect() }
 
     /**
+     * Creates a standard connection with one attempt and no wait between
+     * retries — for a caller that must not be held while Redis is away
+     * ([LazyRedis]), and remembers the failure itself.
+     */
+    fun connectOnce(redisUrl: String): StatefulRedisConnection<String, String> =
+        connectWithRetry(redisUrl, attempts = 1) { it.connect() }
+
+    /**
      * Creates a connection dedicated to a blocking read (`BRPOP` / `BLMOVE`).
      *
      * [popTimeoutSeconds] is the pop timeout the consumer passes to the command;
@@ -86,6 +94,7 @@ object RedisFactory {
 
     private fun <T> connectWithRetry(
         redisUrl: String,
+        attempts: Int = CONNECT_ATTEMPTS,
         connect: (RedisClient) -> T,
     ): T {
         // Lettuce 7 dropped AbstractRedisClient.setDefaultTimeout; the client's
@@ -113,22 +122,22 @@ object RedisFactory {
             .build()
 
         var lastError: Exception? = null
-        for (attempt in 1..CONNECT_ATTEMPTS) {
+        for (attempt in 1..attempts) {
             try {
                 return connect(client)
             } catch (e: Exception) {
                 lastError = e
-                if (attempt == CONNECT_ATTEMPTS) break
+                if (attempt == attempts) break
                 log.warn(
                     "redis not reachable (attempt {}/{}): {} — retrying in {}ms",
-                    attempt, CONNECT_ATTEMPTS, e.message, CONNECT_RETRY_DELAY.toMillis(),
+                    attempt, attempts, e.message, CONNECT_RETRY_DELAY.toMillis(),
                 )
                 Thread.sleep(CONNECT_RETRY_DELAY.toMillis())
             }
         }
         runCatching { client.shutdown() }
         throw IllegalStateException(
-            "redis unreachable after $CONNECT_ATTEMPTS attempts", lastError,
+            "redis unreachable after $attempts attempts", lastError,
         )
     }
 }

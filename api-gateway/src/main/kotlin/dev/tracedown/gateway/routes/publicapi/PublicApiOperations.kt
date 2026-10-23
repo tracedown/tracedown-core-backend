@@ -7,7 +7,19 @@ import dev.tracedown.gateway.data.CreateVariableRequest
 import dev.tracedown.gateway.data.UpdateVariableRequest
 import dev.tracedown.gateway.data.VariableHierarchyResponse
 import dev.tracedown.gateway.data.VariableSummary
+import dev.tracedown.gateway.util.EventPollSlots
+import dev.tracedown.gateway.controllers.alerts.SystemAlertController
+import dev.tracedown.gateway.controllers.events.EventFeedController
+import dev.tracedown.gateway.controllers.events.EventTypes
 import dev.tracedown.gateway.data.agents.PublicAgentSummary
+import dev.tracedown.gateway.data.alerts.PublicSystemAlert
+import dev.tracedown.gateway.data.events.EventPage
+import dev.tracedown.gateway.data.notifications.CreateNotificationTemplateRequest
+import dev.tracedown.gateway.data.notifications.NotificationTemplateSummary
+import dev.tracedown.gateway.data.notifications.UpdateNotificationTemplateRequest
+import dev.tracedown.gateway.data.presets.CreateRulePresetRequest
+import dev.tracedown.gateway.data.presets.RulePresetSummary
+import dev.tracedown.gateway.data.presets.UpdateRulePresetRequest
 import dev.tracedown.gateway.data.apikeys.ApiKeyInfo
 import dev.tracedown.gateway.data.metrics.AssertionFailuresDto
 import dev.tracedown.gateway.data.metrics.EndpointSeriesDto
@@ -182,6 +194,7 @@ object PublicApiOperations {
 
     private val CONFLICT = listOf(HttpStatusCode.Conflict)
 
+
     private fun variables(scope: String, prefix: String, tagHierarchy: Boolean): List<PublicOperation> {
         val name = scope.replaceFirstChar { it.uppercase() }
         val a = if (scope.first() in "aeiou") "an" else "a"
@@ -255,7 +268,9 @@ object PublicApiOperations {
                 "(default `*/5 * * * *`). A `script`, when given, is validated and saved as a script save is, and " +
                 "switches the service on unless `isActive` is false. While the organization works in verified-domain " +
                 "mode, a script may only call hosts on a verified domain with a few limits relaxed; see the guide " +
-                "(https://tracedown.dev/guide/api/).",
+                "(https://tracedown.dev/guide/api/). `presetId` instead of `script` starts it from a preset's script, " +
+                "copied: a preset the caller may read, and a workspace's only for a service in that workspace (404 " +
+                "naming `presetId` otherwise).",
             request = typeOf<CreateServiceRequest>(), response = typeOf<ServiceSummary>(),
             errors = listOf(HttpStatusCode.NotFound, HttpStatusCode.Conflict)),
         PublicOperation(get, "/services/{id}", "getService", "Services", "Returns a service", response = typeOf<ServiceSummary>()),
@@ -446,6 +461,135 @@ object PublicApiOperations {
             request = typeOf<Map<String, Boolean>>(), response = typeOf<WebhookBindingSummary>()),
         PublicOperation(delete, "/webhooks/bindings/{id}", "deleteWebhookBinding", "Webhooks", "Removes a binding",
             "The webhook itself stays.", response = OK),
+
+        // Presets
+        PublicOperation(get, "/presets", "listPresets", "Presets", "Lists script presets",
+            "The organization-wide presets, and — with `workspaceId` — that workspace's too when the caller may see it " +
+                "(a workspace they may not see, or one that is not there, lists the organization-wide ones only). By " +
+                "name, ties by id.",
+            query = listOf(QueryParameter("workspaceId", typeOf<String>(), "Also list this workspace's presets.")) + PAGING,
+            response = typeOf<Page<RulePresetSummary>>()),
+        PublicOperation(post, "/presets", "createPreset", "Presets", "Saves a script preset",
+            "Organization-wide, which needs write on the organization's workspaces, or in the workspace named by " +
+                "`workspaceId`, which needs write on it. `name` at most 128 characters, and need not be unique; " +
+                "`script` must be valid Lace, at most 16384 characters.",
+            request = typeOf<CreateRulePresetRequest>(), response = typeOf<RulePresetSummary>(), errors = listOf(HttpStatusCode.NotFound)),
+        PublicOperation(get, "/presets/{id}", "getPreset", "Presets", "Returns a script preset",
+            "A workspace's preset is found only by those who may see the workspace; to anyone else it is 404, for a " +
+                "change or a delete as well.", response = typeOf<RulePresetSummary>()),
+        PublicOperation(patch, "/presets/{id}", "updatePreset", "Presets", "Renames a preset or replaces its script",
+            "Fields left out are unchanged; a preset stays in its scope. Needs what saving into that scope needs.",
+            request = typeOf<UpdateRulePresetRequest>(), response = typeOf<RulePresetSummary>()),
+        PublicOperation(delete, "/presets/{id}", "deletePreset", "Presets", "Deletes a preset",
+            "Services made from it keep their script.", response = OK),
+
+        // Notification templates
+        PublicOperation(get, "/notification-templates", "listNotificationTemplates", "Notification templates",
+            "Lists notification templates", "Oldest first, ties by id. Needs read on the organization's notifications.",
+            query = PAGING, response = typeOf<Page<NotificationTemplateSummary>>()),
+        PublicOperation(post, "/notification-templates", "createNotificationTemplate", "Notification templates",
+            "Creates a notification template",
+            "`name` at most 64 characters and unique in the organization (409 otherwise); `text` at most 10000. " +
+                "`projectIds` binds it to those projects at once. Needs write on the organization's notifications. " +
+                TEMPLATE_TEXT,
+            request = typeOf<CreateNotificationTemplateRequest>(), response = typeOf<NotificationTemplateSummary>(),
+            errors = listOf(HttpStatusCode.NotFound, HttpStatusCode.Conflict)),
+        PublicOperation(get, "/notification-templates/{id}", "getNotificationTemplate", "Notification templates",
+            "Returns a notification template", response = typeOf<NotificationTemplateSummary>()),
+        PublicOperation(patch, "/notification-templates/{id}", "updateNotificationTemplate", "Notification templates",
+            "Renames a template or replaces its text",
+            "Fields left out are unchanged. A script names its template by `name`, so a rename breaks the scripts that " +
+                "use the old one. " + TEMPLATE_TEXT,
+            request = typeOf<UpdateNotificationTemplateRequest>(), response = typeOf<NotificationTemplateSummary>(), errors = CONFLICT),
+        PublicOperation(delete, "/notification-templates/{id}", "deleteNotificationTemplate", "Notification templates",
+            "Deletes a notification template", response = OK),
+        PublicOperation(get, "/projects/{id}/notification-templates", "listProjectNotificationTemplates", "Notification templates",
+            "Lists the templates bound to a project", "Oldest first, ties by id.",
+            query = PAGING, response = typeOf<Page<NotificationTemplateSummary>>()),
+        PublicOperation(put, "/projects/{id}/notification-templates/{templateId}", "bindProjectNotificationTemplate",
+            "Notification templates", "Binds a template to a project",
+            "Binding one that is bound already changes nothing. Answers the template.",
+            response = typeOf<NotificationTemplateSummary>()),
+        PublicOperation(delete, "/projects/{id}/notification-templates/{templateId}", "unbindProjectNotificationTemplate",
+            "Notification templates", "Unbinds a template from a project", "Answers the template.",
+            response = typeOf<NotificationTemplateSummary>()),
+
+        // Alerts
+        PublicOperation(get, "/alerts", "listAlerts", "Alerts", "Lists the organization's system alerts",
+            "`state=active` (default): the latest alert of each type the caller has not dismissed, as the dashboard's " +
+                "banners show them, most recently seen first. `state=all`: every episode, newest first, ties by id, each " +
+                "with when the caller dismissed it. Needs write on the organization's settings, as the banners do. " +
+                "An alert is never cleared by an event: it ends when the caller dismisses it (for them alone), and a " +
+                "condition that returns after a quiet spell is a new episode — so an integration re-reads this list " +
+                "rather than tracking alerts from the feed's `alert.raised`.",
+            query = listOf(QueryParameter("state", typeOf<String>(), "`active` (default) or `all`.", values = SystemAlertController.STATES)) + PAGING,
+            response = typeOf<Page<PublicSystemAlert>>()),
+        PublicOperation(post, "/alerts/{id}/dismiss", "dismissAlert", "Alerts", "Dismisses an alert for the caller",
+            "For the caller only, as in the dashboard; dismissing one twice changes nothing. A dismissal is the " +
+                "caller's own view of the warning log, not a change to the organization, so — as in the dashboard — it " +
+                "is not written to the audit log.", response = OK),
+
+        // Events
+        PublicOperation(get, "/events", "listEvents", "Events", "Reads the event feed",
+            "The events after the cursor `after` that the caller may see now, in the order they were written — " +
+                "decided on every read with the checks the dashboard's reads of the same resources make, so a grant " +
+                "withdrawn stops delivery at once, and one given shows only what happens from then on (re-list " +
+                "periodically to pick up what a new grant reveals). With none there, waits up to `wait` seconds for the " +
+                "first, and answers an empty page when none came — or sooner, see **Cost**. Pass `next` as `after` to " +
+                "read on; it moves even on an empty page. `more: true` means more may be there already: read on at " +
+                "once. A page holds at most `limit` events, or one more when a result and the status change it caused " +
+                "arrive together.\n\n" +
+                "**Starting.** Read once without `after` and keep `next`; then take your snapshot of what you track " +
+                "(the lists); then read from that cursor, applying each event by its `id` — delivery is at least once, " +
+                "so an event may come twice, and one read before the snapshot may show what the snapshot already has. " +
+                "To wait for a run, take a cursor before `POST /services/{id}/run`, then read for its `run.settled`. " +
+                "Events are kept 7 days; a cursor older than that is 410 `cursor_expired` with `details.oldest`, the " +
+                "cursor to start again from — after taking a new snapshot. A cursor works only for the organization it " +
+                "was given in, and only in the database history it was given in: one from another organization, one " +
+                "sealed before the platform key changed, and every cursor once the database has gone back in time (a " +
+                "backup restored, a point-in-time recovery, a dump loaded) are 410 the same way, with a fresh start " +
+                "in `details.oldest`.\n\n" +
+                "**Types** and their `data` (exactly these fields):\n\n" +
+                "| type | resource | data |\n|---|---|---|\n" +
+                EventTypes.DATA.entries.joinToString("\n") { (type, fields) ->
+                    "| `$type` | `${EventTypes.RESOURCE.getValue(type)}` | " +
+                        (fields.joinToString(", ") { "`$it`" }.ifEmpty { "—" }) + " |"
+                } + "\n\n" +
+                "`result.recorded`: `status` is the run's (`success`, `failure`, `timeout`, `error`, `skipped`); " +
+                "`runDurationMs` is null for a skipped run and `reason` is set only for one. `service.status_changed` " +
+                "follows the result that changed it, `previousStatus` null on a service's first run. A variable's " +
+                "events carry its scope (`org`, `workspace`, `project`, `service`), that scope's id and the key — " +
+                "never the value; `key` is null when the variable has since been purged. A script's writeback of a " +
+                "metric is a `variable.created`, or a `variable.updated` when its value changed. On `service.created`, " +
+                "re-list the service's variables: the platform seeds some that are not announced. Deleting a " +
+                "workspace or project deletes everything in it, and there is one event, for the container — its " +
+                "children are not announced; drop them. `alert.raised` is a new episode of a system alert and needs " +
+                "what the warning log needs; nothing announces an alert's end (see `GET /alerts`). `run.settled` is a " +
+                "run asked for by `POST /services/{id}/run` reaching `done` or `skipped` (`state`): `status` is the " +
+                "run's worst result's, null when it never ran (`reason` `run_not_delivered`: no scheduler took it); " +
+                "`reason` is set only when the whole run was skipped — `status` `skipped` with `state` `done` means " +
+                "some of its agents did not run it, and carries none. A run settled once can settle again — a " +
+                "skip that a result replaces, a late result after `run_not_delivered` — with `superseded: true`: the " +
+                "last `run.settled` for a `runId` wins. An `expired` run is never an event; it is what " +
+                "`GET /services/{id}/runs/{runId}` says once nothing has come. `occurredAt`: a result's run start, an " +
+                "alert's episode start, otherwise when the change was made.\n\n" +
+                "**Cost.** A read does at most ${EventFeedController.MAX_LOOKS} looks for events and then answers, even " +
+                "before `wait` is up. The first look of a read that waits is free of the request budget; every look " +
+                "after it, a read that answers without waiting (`wait=0`, or events already there), and every 410 " +
+                "spends one request of it; a key whose budget is spent is refused on arrival (429 `rate_limited`). " +
+                "Answers carry no `X-RateLimit-*` headers. A key holds at most ${EventPollSlots.PER_KEY} reads open at once (a user " +
+                "${EventPollSlots.PER_USER}, an organization ${EventPollSlots.PER_ORG}); beyond that, 429 " +
+                "`too_many_event_polls` with `details.bound` and `Retry-After`. A caller who can see nothing at all " +
+                "is answered at once. A transaction left open anywhere on the database server (any database, " +
+                "including prepared transactions) holds the feed back until it ends.",
+            query = listOf(
+                QueryParameter("after", typeOf<String>(), "A cursor: `next` of an earlier read."),
+                QueryParameter("wait", typeOf<Int>(), "Seconds to wait for an event when there is none, 0–30. Default 0."),
+                QueryParameter("types", typeOf<List<String>>(), "Only these event types: comma-separated, or the parameter repeated.",
+                    values = EventTypes.ALL),
+                QueryParameter("limit", typeOf<Int>(), "Events per page, 1–100. Default 100."),
+            ),
+            response = typeOf<EventPage>(), errors = listOf(HttpStatusCode.Gone, HttpStatusCode.TooManyRequests)),
     ) + variables("organization", "", tagHierarchy = false) +
         variables("workspace", "/workspaces/{id}", tagHierarchy = true) +
         variables("project", "/projects/{id}", tagHierarchy = true) +
@@ -458,6 +602,15 @@ object PublicApiOperations {
 
     /** The operation for [method] on [path] (relative to [PublicApi.V1]), if this module provides it. */
     fun find(method: HttpMethod, path: String): PublicOperation? = byKey["${method.value} $path"]
+
+    /** How a template's text is written — said on each operation that takes one. */
+    private const val TEMPLATE_TEXT =
+        "The text is plain, with `${'$'}{name}` placeholders filled in by name when a notification is sent — " +
+            "`${'$'}{s.name}`, `${'$'}{s.schedule}`, `${'$'}{w.name}`, `${'$'}{p.name}` (service, its schedule, " +
+            "workspace, project), `${'$'}{url}`, `${'$'}{status}`, `${'$'}{trigger}`, `${'$'}{conditions}`, " +
+            "`${'$'}{expected}`, `${'$'}{actual}`, `${'$'}{ms}`, `${'$'}{downtime}`, `${'$'}{text}`; an unknown name " +
+            "renders empty, and `\\${'$'}{` writes a literal `${'$'}{`. It is not checked when saved. A script sends it " +
+            "by the template's `name`, and only from a project the template is bound to."
 
     /** Every type a public handler receives or answers with, and the error body. */
     val types: List<KType> =
@@ -478,5 +631,9 @@ object PublicApiOperations {
         "Directory" to "The organization's members and groups.",
         "Webhooks" to "Attaching existing webhooks to resources.",
         "Scripts" to "Lace scripts, judged without being saved.",
+        "Presets" to "Script presets: Lace scripts a service can start from.",
+        "Notification templates" to "The text notifications are written with, and the projects that use it.",
+        "Alerts" to "The warning log: what the platform has noticed about the organization's agents and runs.",
+        "Events" to "A feed of what happens to the resources the caller may see.",
     )
 }

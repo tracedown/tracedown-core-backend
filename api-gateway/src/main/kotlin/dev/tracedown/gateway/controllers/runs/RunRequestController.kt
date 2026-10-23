@@ -2,6 +2,7 @@ package dev.tracedown.gateway.controllers.runs
 
 import dev.tracedown.common.audit.AuditActor
 import dev.tracedown.common.config.PlatformDefaults
+import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.ProbeAgents
 import dev.tracedown.common.models.ProbeResults
 import dev.tracedown.common.models.RunRequests
@@ -15,8 +16,10 @@ import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.jetbrains.exposed.v1.core.JoinType
 import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.and
@@ -89,23 +92,31 @@ object RunRequestController {
      */
     fun settleUndelivered(runId: UUID, reason: String = RunTrigger.SKIP_NOT_DELIVERED) {
         transaction {
-            RunRequests.update({ (RunRequests.id eq runId) and (RunRequests.state eq RunState.PENDING) }) {
+            val updated = RunRequests.update({ (RunRequests.id eq runId) and (RunRequests.state eq RunState.PENDING) }) {
                 it[state] = RunState.SKIPPED
                 it[RunRequests.reason] = reason
             }
+            if (updated == 0) return@transaction
+            // The settlement, for readers of the event feed, with the state.
+            val row = RunRequests.select(RunRequests.serviceId, RunRequests.organizationId)
+                .where { RunRequests.id eq runId }
+                .single()
+            OutboxEmit.emitResourceEvent(
+                RunState.SETTLED_EVENT, "run_request", runId,
+                buildJsonObject {
+                    put("runId", runId.toString())
+                    put("serviceId", row[RunRequests.serviceId].toString())
+                    put("orgId", row[RunRequests.organizationId].toString())
+                    put("state", RunState.SKIPPED)
+                    put("reason", reason)
+                },
+                organizationId = row[RunRequests.organizationId],
+            )
         }
     }
 
-    /**
-     * How bad each status is, worst first — the run's own status is its worst
-     * result's. A skipped result (an agent that did not run it) is worse than
-     * a success: the run did not happen everywhere it was meant to.
-     */
-    private val SEVERITY = listOf("failure", "timeout", "error", "skipped", "success")
-
-    /** The worst of [statuses] by [SEVERITY] — a status it does not know counts as the worst; null for none. */
-    internal fun worstOf(statuses: List<String>): String? =
-        statuses.minByOrNull { SEVERITY.indexOf(it).let { i -> if (i < 0) -1 else i } }
+    /** The worst of [statuses] — [RunState.worst], the one order the ingestor's settlement uses too. */
+    internal fun worstOf(statuses: List<String>): String? = RunState.worst(statuses)
 
     /** How far before its request a run's results are looked for when the one under its id is missing (clock skew). */
     private const val SIBLING_LOOKBACK_SECONDS = 60L

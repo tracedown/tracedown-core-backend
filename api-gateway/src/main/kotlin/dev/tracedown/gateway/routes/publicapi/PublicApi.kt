@@ -6,6 +6,10 @@ import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.net.PathCanonicalizer
 import dev.tracedown.gateway.context.Credential
 import dev.tracedown.gateway.routes.publicapi.v1.accessRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.alertRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.eventRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.notificationTemplateRoutes
+import dev.tracedown.gateway.routes.publicapi.v1.presetRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.directoryRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.keyRoutes
 import dev.tracedown.gateway.routes.publicapi.v1.metricsRoutes
@@ -208,6 +212,10 @@ object PublicApi {
         v1.directoryRoutes()
         v1.webhookRoutes()
         v1.scriptRoutes()
+        v1.presetRoutes()
+        v1.notificationTemplateRoutes()
+        v1.alertRoutes()
+        v1.eventRoutes()
         for (route in v1.endpoints()) {
             val (method, path) = route
             val operation = PublicApiOperations.find(method, path)
@@ -404,6 +412,22 @@ object PublicApi {
     }
 
     private val READ_METHODS = setOf(HttpMethod.Get, HttpMethod.Head)
+
+    /**
+     * Runs every registered [guard] again for a call already admitted — for a
+     * handler whose call outlasts its admission (a long-poll), so a host's
+     * refusal made meanwhile applies from its next step. Throws what a guard
+     * throws, and [AnsweredByGuard] when one answered the call itself.
+     */
+    internal suspend fun recheckGuards(caller: ApiCaller, call: ApplicationCall) {
+        for (guard in guards) {
+            guard(caller, call)
+            if (call.response.isCommitted) throw AnsweredByGuard()
+        }
+    }
+
+    /** A guard answered the call while its handler was still working: nothing more is to be sent. */
+    internal class AnsweredByGuard : RuntimeException(null, null, false, false)
 
     /**
      * POSTs that change nothing — a POST only because what they are given

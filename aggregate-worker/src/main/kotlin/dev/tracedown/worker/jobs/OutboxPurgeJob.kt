@@ -47,6 +47,11 @@ class OutboxPurgeJob(
 
     override val name = "OutboxPurgeJob"
 
+    private companion object {
+        /** Rows deleted per transaction. */
+        const val BATCH_SIZE = 5_000
+    }
+
     override suspend fun execute() {
         if (retentionDays <= 0) return
 
@@ -64,24 +69,73 @@ class OutboxPurgeJob(
 
         val floor = decision.floor
 
-        val deleted = ioTransaction {
-            // Never delete above the slowest honoured cursor; when none exists
-            // the floor is absent and this clause is dropped entirely.
-            // retentionDays and floor are numeric values under our control —
-            // safe to inline.
-            val cursorClause = if (floor != null) "AND seq <= $floor" else ""
-            val sql = """
-                DELETE FROM outbox
-                WHERE created_at < now() - make_interval(days => $retentionDays)
-                  $cursorClause
-                  AND (published = true OR event_type <> 'probe_result.created')
-            """.trimIndent()
-            val stmt = connection.prepareStatement(sql, false)
-            stmt.executeUpdate().toLong()
+        // In batches, each its own short transaction, so a large backlog never
+        // holds one long transaction open — which would hold back vacuum and
+        // every reader of the event feed for as long as it ran.
+        var deleted = 0L
+        val started = System.nanoTime()
+        while (true) {
+            val round = ioTransaction { deleteBatch(floor, connection.connection as java.sql.Connection) }
+            deleted += round
+            val verdict = RetentionBatching.verdict(
+                round.toInt(), BATCH_SIZE, Duration.ofNanos(System.nanoTime() - started), RetentionBatching.DEFAULT_TICK_BUDGET,
+            )
+            if (verdict != RetentionBatching.Verdict.CONTINUE) break
         }
 
         if (deleted > 0) {
             log.info("Outbox purge: deleted {} rows (retention={}d, cursorFloor={})", deleted, retentionDays, floor)
+        }
+    }
+
+    /**
+     * Deletes one batch of at most [BATCH_SIZE] rows past retention, below
+     * [floor] when there is one, and moves the retention mark; returns how many.
+     */
+    private fun deleteBatch(floor: Long?, conn: java.sql.Connection): Long {
+        // A row's age is how long ago it was written (inserted_at), not
+        // created_at: a probe result's row carries the run's start, so a
+        // result recorded late would be "old" the moment it lands. Rows
+        // older than the column have only created_at.
+        //
+        // The same statement moves the retention mark to the last row it
+        // deleted in the order the event feed reads (xid, then seq), so a
+        // reader can tell that it has been passed: what is deleted here is
+        // not a prefix (an unpublished result row outlives newer rows), so
+        // the first row left cannot say that. The mark is the furthest row any
+        // batch deleted, so it is right whatever order the batches go in.
+        val cursorClause = if (floor != null) "AND seq <= $floor" else ""
+        val sql = """
+            WITH gone AS (
+                DELETE FROM outbox
+                WHERE seq IN (
+                    SELECT seq FROM outbox
+                    WHERE COALESCE(inserted_at, created_at::timestamptz) < now() - make_interval(days => $retentionDays)
+                      $cursorClause
+                      AND (published = true OR event_type <> 'probe_result.created')
+                    LIMIT $BATCH_SIZE
+                )
+                RETURNING COALESCE(xid, 0) AS xid, seq
+            ), last AS (
+                -- Never past the oldest transaction still open: a reader's
+                -- position cannot be there yet, and a row past it (one of
+                -- another history, whose xid this database has not reached)
+                -- must not drag the mark beyond every reader.
+                SELECT
+                    CASE WHEN g.xid >= h.x THEN h.x - 1 ELSE g.xid END AS xid,
+                    CASE WHEN g.xid >= h.x THEN 9223372036854775807 ELSE g.seq END AS seq
+                FROM (SELECT xid, seq FROM gone ORDER BY xid DESC, seq DESC LIMIT 1) g,
+                     (SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS x) h
+            ), mark AS (
+                UPDATE outbox_retention r
+                SET purged_xid = last.xid, purged_seq = last.seq, updated_at = now()
+                FROM last
+                WHERE r.id = 1 AND (last.xid, last.seq) > (r.purged_xid, r.purged_seq)
+            )
+            SELECT COUNT(*) AS deleted FROM gone
+        """.trimIndent()
+        return conn.prepareStatement(sql).use { stmt ->
+            stmt.executeQuery().use { rs -> if (rs.next()) rs.getLong("deleted") else 0L }
         }
     }
 

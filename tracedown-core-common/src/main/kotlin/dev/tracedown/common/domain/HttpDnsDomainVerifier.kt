@@ -46,6 +46,7 @@ class HttpDnsDomainVerifier(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(20, TimeUnit.SECONDS)
         .followRedirects(false)
         .followSslRedirects(false)
         .build(),

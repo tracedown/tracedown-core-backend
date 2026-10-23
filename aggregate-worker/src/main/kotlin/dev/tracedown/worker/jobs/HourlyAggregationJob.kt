@@ -90,13 +90,15 @@ class HourlyAggregationJob(
 
             // Same transaction as the work it describes — see JobWatermarks.
             JobWatermarks.write(name, window.watermark)
+        }
 
-            // Push percentiles to Redis B cache
-            try {
-                updatePercentilesCache(conn)
-            } catch (e: Exception) {
-                log.warn("Failed to update percentiles cache in Redis B", e)
-            }
+        // Push percentiles to Redis B cache — read in a transaction of its own
+        // and written after it: a slow cache must not keep the aggregation's
+        // writes open, which holds back vacuum and the event feed.
+        try {
+            updatePercentilesCache(ioTransaction { readPercentiles(this.connection.connection as java.sql.Connection) })
+        } catch (e: Exception) {
+            log.warn("Failed to update percentiles cache in Redis B", e)
         }
 
         val buckets = ChronoUnit.HOURS.between(window.start, window.end)
@@ -110,33 +112,30 @@ class HourlyAggregationJob(
         }
     }
 
-    /**
-     * Reads the latest all-agents rollup percentiles from probe_aggregates
-     * and writes them to Redis B per service.
-     */
-    private fun updatePercentilesCache(conn: java.sql.Connection) {
-        val redis = redisB()
+    /** One service's latest all-agents percentiles. */
+    private data class Percentiles(val serviceId: String, val p50: Long, val p95: Long, val p99: Long)
+
+    /** Reads the latest all-agents rollup percentiles from probe_aggregates. */
+    private fun readPercentiles(conn: java.sql.Connection): List<Percentiles> =
         conn.prepareStatement(PERCENTILES_SQL).use { stmt ->
             val rs = stmt.executeQuery()
-            var count = 0
-            while (rs.next()) {
-                val serviceId = rs.getString("service_id")
-                val p50 = rs.getLong("p50")
-                val p95 = rs.getLong("p95")
-                val p99 = rs.getLong("p99")
-                val key = "metrics:svc:$serviceId:percentiles"
-                redis.hset(key, mapOf(
-                    "p50" to p50.toString(),
-                    "p95" to p95.toString(),
-                    "p99" to p99.toString(),
-                ))
-                redis.expire(key, 86400)
-                count++
-            }
-            if (count > 0) {
-                log.info("Updated percentiles cache for {} services", count)
+            buildList {
+                while (rs.next()) {
+                    add(Percentiles(rs.getString("service_id"), rs.getLong("p50"), rs.getLong("p95"), rs.getLong("p99")))
+                }
             }
         }
+
+    /** Writes [percentiles] to Redis B per service. */
+    private fun updatePercentilesCache(percentiles: List<Percentiles>) {
+        if (percentiles.isEmpty()) return
+        val redis = redisB()
+        for (p in percentiles) {
+            val key = "metrics:svc:${p.serviceId}:percentiles"
+            redis.hset(key, mapOf("p50" to p.p50.toString(), "p95" to p.p95.toString(), "p99" to p.p99.toString()))
+            redis.expire(key, 86400)
+        }
+        log.info("Updated percentiles cache for {} services", percentiles.size)
     }
 
     companion object {

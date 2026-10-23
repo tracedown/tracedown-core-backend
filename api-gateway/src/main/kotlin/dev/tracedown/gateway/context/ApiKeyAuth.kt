@@ -2,9 +2,13 @@ package dev.tracedown.gateway.context
 
 import dev.tracedown.common.auth.ApiKeyAuthenticator
 import dev.tracedown.common.auth.ApiKeyResult
+import dev.tracedown.common.auth.CachedPermissions
 import dev.tracedown.common.auth.TokenHasher
 import dev.tracedown.common.errors.ErrorCodes
 import dev.tracedown.common.models.ApiKeys
+import dev.tracedown.common.net.PathCanonicalizer
+import dev.tracedown.gateway.routes.publicapi.PublicApi
+import dev.tracedown.gateway.routes.publicapi.v1.EVENTS_PATH
 import dev.tracedown.gateway.util.ApiRateLimit
 import dev.tracedown.gateway.util.RateLimiter
 import dev.tracedown.gateway.util.TooManyRequestsException
@@ -12,6 +16,7 @@ import dev.tracedown.gateway.util.UnauthorizedException
 import dev.tracedown.gateway.util.clientIp
 import io.ktor.http.HttpHeaders
 import io.ktor.server.application.ApplicationCall
+import io.ktor.util.AttributeKey
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
@@ -61,8 +66,32 @@ internal object ApiKeyAuth {
      */
     private val markedGood = ConcurrentHashMap<String, Long>()
 
+    /** The permissions the key's user held when the key was let in. */
+    private val permissionsKey = AttributeKey<CachedPermissions>("ApiKeyPermissions")
+
+    /** What [permissionsKey] holds for this call, if a key was let in. */
+    fun permissionsOf(call: ApplicationCall): CachedPermissions? = call.attributes.getOrNull(permissionsKey)
+
+    /** The presented key's digest, for spending its budget later in the call. */
+    private val digestKey = AttributeKey<String>("ApiKeyDigest")
+
+    /**
+     * Spends one more unit of the calling key's request budget, for a call
+     * that does more than one request's worth of work (the event feed). False,
+     * with `Retry-After` set, when the budget is spent; true when there is no
+     * key or no limiter.
+     */
+    fun spendAgain(call: ApplicationCall): Boolean {
+        val digest = call.attributes.getOrNull(digestKey) ?: return true
+        val budget = ApiRateLimit.spend(digest) ?: return true
+        if (budget.allowed) return true
+        if (!call.response.isCommitted) call.response.headers.append(HttpHeaders.RetryAfter, budget.retryAfterSeconds.toString())
+        return false
+    }
+
     fun authenticate(call: ApplicationCall, token: String): ResolvedCaller {
         val digest = TokenHasher.sha256Hex(token)
+        call.attributes.put(digestKey, digest)
         val clientIp = call.clientIp()
         val now = Instant.now().epochSecond
 
@@ -76,7 +105,19 @@ internal object ApiKeyAuth {
             if (!admittedByMark) refuseAddress(call, spent)
         }
 
-        ApiRateLimit.spend(digest)?.let { budget ->
+        // The event feed spends the budget itself (`spendAgain`): a read that
+        // waits is one long request, and charging it here as well would make
+        // a long-poll that returns the moment something happens cost in
+        // proportion to how busy the organization is. What it does charge is
+        // every answer given without waiting and every look after the first.
+        // A key with nothing left is still refused here, before any lookup —
+        // only without spending.
+        if (isEventFeed(call)) {
+            ApiRateLimit.peek(digest)?.takeIf { !it.allowed }?.let { budget ->
+                call.response.headers.append(HttpHeaders.RetryAfter, budget.retryAfterSeconds.toString())
+                throw TooManyRequestsException()
+            }
+        } else ApiRateLimit.spend(digest)?.let { budget ->
             call.response.headers.append("X-RateLimit-Limit", budget.limit.toString())
             call.response.headers.append("X-RateLimit-Remaining", budget.remaining.toString())
             if (!budget.allowed) {
@@ -105,19 +146,11 @@ internal object ApiKeyAuth {
                 }
                 // Named by its digest, never by any part of the token itself.
                 log.debug("Refused API key {}…: {}", digest.take(12), result.reason)
-                throw UnauthorizedException(
-                    when (result.reason) {
-                        ApiKeyResult.Reason.NOT_FOUND -> ErrorCodes.INVALID_API_KEY
-                        ApiKeyResult.Reason.REVOKED -> ErrorCodes.API_KEY_REVOKED
-                        ApiKeyResult.Reason.EXPIRED -> ErrorCodes.API_KEY_EXPIRED
-                        ApiKeyResult.Reason.OWNER_GONE,
-                        ApiKeyResult.Reason.OWNER_INACTIVE,
-                        ApiKeyResult.Reason.NOT_MEMBER -> ErrorCodes.API_KEY_OWNER_INACTIVE
-                    },
-                )
+                throw UnauthorizedException(apiKeyRefusal(result.reason))
             }
         }
 
+        ctx.permissions?.let { call.attributes.put(permissionsKey, it) }
         return ResolvedCaller(
             principal = AuthPrincipal(
                 userId = ctx.userId,
@@ -159,6 +192,9 @@ internal object ApiKeyAuth {
         throw TooManyRequestsException(ErrorCodes.TOO_MANY_UNKNOWN_KEYS)
     }
 
+    private fun isEventFeed(call: ApplicationCall): Boolean =
+        PathCanonicalizer.canonicalize(call.request.local.uri) == PublicApi.V1 + EVENTS_PATH
+
     private fun recentlyMarked(digest: String, now: Long): Boolean =
         markedGood[digest]?.let { now - it < DEBOUNCE_SECONDS } ?: false
 
@@ -198,4 +234,14 @@ internal object ApiKeyAuth {
             log.debug("Could not stamp last_used_at for key {}: {}", keyId, e.message)
         }
     }
+}
+
+/** The code a key refused for [reason] is answered with. */
+internal fun apiKeyRefusal(reason: ApiKeyResult.Reason): String = when (reason) {
+    ApiKeyResult.Reason.NOT_FOUND -> ErrorCodes.INVALID_API_KEY
+    ApiKeyResult.Reason.REVOKED -> ErrorCodes.API_KEY_REVOKED
+    ApiKeyResult.Reason.EXPIRED -> ErrorCodes.API_KEY_EXPIRED
+    ApiKeyResult.Reason.OWNER_GONE,
+    ApiKeyResult.Reason.OWNER_INACTIVE,
+    ApiKeyResult.Reason.NOT_MEMBER -> ErrorCodes.API_KEY_OWNER_INACTIVE
 }

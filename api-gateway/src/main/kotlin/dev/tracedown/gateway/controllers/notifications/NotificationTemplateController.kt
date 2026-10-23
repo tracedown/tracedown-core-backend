@@ -15,9 +15,11 @@ import dev.tracedown.gateway.data.notifications.CreateNotificationTemplateReques
 import dev.tracedown.gateway.data.notifications.NotificationTemplateSummary
 import dev.tracedown.gateway.data.notifications.UpdateNotificationTemplateRequest
 import dev.tracedown.common.errors.ErrorCodes
-import dev.tracedown.gateway.util.BadRequestException
 import dev.tracedown.gateway.util.ConflictException
 import dev.tracedown.gateway.util.NotFoundException
+import dev.tracedown.gateway.util.isUniqueViolation
+import dev.tracedown.gateway.util.fieldError
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
 import dev.tracedown.gateway.util.requireOrgRead
 import dev.tracedown.gateway.util.requireOrgWrite
 import org.jetbrains.exposed.v1.core.and
@@ -45,7 +47,9 @@ object NotificationTemplateController {
         validateName(request.name)
         validateText(request.text)
 
-        return transaction {
+        // Two creates of one name at once both pass the check below; the
+        // unique index decides, and the loser is told as the check would.
+        return conflictOnDuplicate { transaction {
             requireOrgWrite(orgId, userId) { it.notifications }
 
             // Check name uniqueness within org
@@ -71,7 +75,7 @@ object NotificationTemplateController {
             }
 
             // Bind to projects if provided
-            request.projectIds?.forEach { projectIdStr ->
+            request.projectIds?.distinct()?.forEach { projectIdStr ->
                 val projectId = UUID.fromString(projectIdStr)
                 requireProjectInOrg(projectId, orgId)
                 ProjectNotificationTemplates.insert {
@@ -84,7 +88,15 @@ object NotificationTemplateController {
             AuditService.log(orgId, userId, "create.notification-template", "notification-template", id.toString(), entityDisplayName = request.name)
 
             templateSummary(id)
-        }
+        } }
+    }
+
+    /** Runs [block], answering a unique violation it ends in with 409. */
+    private fun <T> conflictOnDuplicate(block: () -> T): T = try {
+        block()
+    } catch (e: ExposedSQLException) {
+        if (isUniqueViolation(e)) throw ConflictException()
+        throw e
     }
 
     /** Lists all notification templates in the organization. */
@@ -110,7 +122,7 @@ object NotificationTemplateController {
                 (NotificationTemplates.organizationId eq orgId) and
                     (NotificationTemplates.deleted eq false)
             }
-            val (pagedQuery, total) = query.applyPfs(pfs)
+            val (pagedQuery, total) = query.applyPfs(pfs, DEFAULT_ORDER)
             val items = pagedQuery.map { row ->
                 val templateId = row[NotificationTemplates.id]
                 val projectIds = loadProjectIds(templateId)
@@ -119,6 +131,38 @@ object NotificationTemplateController {
             Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
         }
     }
+
+    /**
+     * The templates bound to one project, oldest first — [list] narrowed to
+     * the project, under the same permission. A project of another
+     * organization is not found.
+     */
+    fun listForProject(orgId: UUID, projectId: UUID, userId: UUID, pfs: PfsParams): Page<NotificationTemplateSummary> {
+        return transaction {
+            requireOrgRead(orgId, userId) { it.notifications }
+            requireProjectInOrg(projectId, orgId)
+
+            val query = NotificationTemplates.join(
+                ProjectNotificationTemplates,
+                org.jetbrains.exposed.v1.core.JoinType.INNER,
+                onColumn = NotificationTemplates.id,
+                otherColumn = ProjectNotificationTemplates.notificationTemplateId,
+            ).select(NotificationTemplates.columns).where {
+                (NotificationTemplates.organizationId eq orgId) and
+                    (NotificationTemplates.deleted eq false) and
+                    (ProjectNotificationTemplates.projectId eq projectId)
+            }
+            val (pagedQuery, total) = query.applyPfs(pfs, DEFAULT_ORDER)
+            val items = pagedQuery.map { row -> summaryFromRow(row, loadProjectIds(row[NotificationTemplates.id])) }
+            Page(items = items, total = total, page = pfs.page, pageSize = pfs.pageSize)
+        }
+    }
+
+    /** Oldest first, ties by id, when a list asks for no order of its own. */
+    private val DEFAULT_ORDER = listOf(
+        NotificationTemplates.createdAt to org.jetbrains.exposed.v1.core.SortOrder.ASC,
+        NotificationTemplates.id to org.jetbrains.exposed.v1.core.SortOrder.ASC,
+    )
 
     /** Returns a single notification template. */
     fun get(orgId: UUID, templateId: UUID, userId: UUID): NotificationTemplateSummary {
@@ -133,7 +177,8 @@ object NotificationTemplateController {
         request.name?.let { validateName(it) }
         request.text?.let { validateText(it) }
 
-        return transaction {
+        // As create: a rename racing another to the same name is 409, not 500.
+        return conflictOnDuplicate { transaction {
             requireOrgWrite(orgId, userId) { it.notifications }
             requireExists(templateId, orgId)
 
@@ -171,7 +216,7 @@ object NotificationTemplateController {
             )
 
             templateSummary(templateId)
-        }
+        } }
     }
 
     /** Soft-deletes a notification template. */
@@ -197,10 +242,32 @@ object NotificationTemplateController {
 
     // ── Project Bindings ──
 
-    /** Binds a template to a project. */
-    fun bindProject(orgId: UUID, templateId: UUID, request: BindProjectRequest, userId: UUID): NotificationTemplateSummary {
+    /**
+     * Binds a template to a project. A binding that is already there is 409 —
+     * or, with [alreadyBoundOk], the answer it would have been, with nothing
+     * written or audited: what a PUT of the binding means.
+     */
+    fun bindProject(
+        orgId: UUID,
+        templateId: UUID,
+        request: BindProjectRequest,
+        userId: UUID,
+        alreadyBoundOk: Boolean = false,
+    ): NotificationTemplateSummary {
         val projectId = UUID.fromString(request.projectId)
 
+        return try {
+            bind(orgId, templateId, projectId, userId, alreadyBoundOk)
+        } catch (e: ExposedSQLException) {
+            if (!isUniqueViolation(e)) throw e
+            // A bind of the same pair committed between the check and the
+            // insert: it is bound, which is what was asked for.
+            if (!alreadyBoundOk) throw ConflictException()
+            transaction { templateSummary(templateId) }
+        }
+    }
+
+    private fun bind(orgId: UUID, templateId: UUID, projectId: UUID, userId: UUID, alreadyBoundOk: Boolean): NotificationTemplateSummary {
         return transaction {
             requireOrgWrite(orgId, userId) { it.notifications }
             requireExists(templateId, orgId)
@@ -212,7 +279,10 @@ object NotificationTemplateController {
                         (ProjectNotificationTemplates.projectId eq projectId)
                 }
                 .any()
-            if (exists) throw ConflictException()
+            if (exists) {
+                if (alreadyBoundOk) return@transaction templateSummary(templateId)
+                throw ConflictException()
+            }
 
             ProjectNotificationTemplates.insert {
                 it[id] = UUID.randomUUID()
@@ -260,12 +330,12 @@ object NotificationTemplateController {
     // ── Internals ──
 
     private fun validateName(name: String) {
-        if (name.isBlank()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
-        if (name.length > 64) throw BadRequestException(ErrorCodes.FIELD_TOO_LONG)
+        if (name.isBlank()) throw fieldError("name", ErrorCodes.FIELD_REQUIRED)
+        if (name.length > 64) throw fieldError("name", ErrorCodes.FIELD_TOO_LONG)
     }
 
     private fun validateText(text: String) {
-        if (text.isBlank()) throw BadRequestException(ErrorCodes.FIELD_REQUIRED)
+        if (text.isBlank()) throw fieldError("text", ErrorCodes.FIELD_REQUIRED)
     }
 
     private fun requireExists(templateId: UUID, orgId: UUID) {

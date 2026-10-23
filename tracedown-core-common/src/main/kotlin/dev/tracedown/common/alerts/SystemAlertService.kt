@@ -1,5 +1,6 @@
 package dev.tracedown.common.alerts
 
+import dev.tracedown.common.models.OutboxEmit
 import dev.tracedown.common.models.SystemAlerts
 import dev.tracedown.common.realtime.RealtimePublisher
 import kotlinx.serialization.json.JsonObject
@@ -151,6 +152,9 @@ object SystemAlertService {
      */
     const val DEGRADED_RTT_MS = 1200
 
+    /** The outbox event a new episode writes, in the same transaction as its row. */
+    const val ALERT_RAISED_EVENT = "system_alert.raised"
+
     private const val RAISE_THROTTLE_SECONDS = 60L
 
     private val log = LoggerFactory.getLogger(javaClass)
@@ -192,8 +196,9 @@ object SystemAlertService {
                     }
                     false
                 } else {
+                    val alertId = UUID.randomUUID()
                     SystemAlerts.insert {
-                        it[id] = UUID.randomUUID()
+                        it[id] = alertId
                         it[organizationId] = orgId
                         it[SystemAlerts.alertType] = alertType
                         it[SystemAlerts.subject] = subject
@@ -202,6 +207,19 @@ object SystemAlertService {
                         it[createdAt] = now
                         it[lastSeenAt] = now
                     }
+                    // A new episode is an event; a refresh of one is not. The
+                    // same fields the banner's live update carries, and the
+                    // severity — never [data], which is for the warning log.
+                    OutboxEmit.emitResourceEvent(
+                        ALERT_RAISED_EVENT, "system_alert", alertId,
+                        buildJsonObject {
+                            put("orgId", orgId.toString())
+                            put("alertType", alertType)
+                            put("subject", subject)
+                            put("severity", severity)
+                        },
+                        createdAt = now,
+                    )
                     true
                 }
             }
