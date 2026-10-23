@@ -155,7 +155,12 @@ object NotificationBuilder {
         }
 
         // The notification's own text (recovery/error messages reference it).
-        vars["text"] = notificationObj?.get("value")?.jsonPrimitive?.contentOrNull ?: ""
+        // A connection error arrives structured, its message in `data.error`
+        // (laceNotifications), so fall back to that, then to the call's error.
+        vars["text"] = notificationObj?.get("value")?.jsonPrimitive?.contentOrNull
+            ?: (data as? JsonObject)?.get("error")?.jsonPrimitive?.contentOrNull
+            ?: call?.get("error")?.jsonPrimitive?.contentOrNull
+            ?: ""
 
         return vars
     }
