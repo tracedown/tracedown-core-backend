@@ -310,7 +310,7 @@ object PublicApiOperations {
                 "inclusive. A refused parameter is named in `details.field`. `order=asc` with `since` is not a cursor " +
                 "for following new runs: a run is filed when it is ingested, not when it started, so one can appear " +
                 "behind the last one seen — overlap `since` by a few minutes and skip the ids already seen. " +
-                "`trigger=manual` finds runs asked for from version 0.4.59 on; earlier ones, and ones made while " +
+                "`trigger=manual` finds runs asked for from version 0.4.63 on; earlier ones, and ones made while " +
                 "gateways and schedulers of both versions ran side by side, read as `schedule`.",
             query = listOf(
                 QueryParameter("since", typeOf<String>(), "An ISO-8601 instant: only runs started at or after it (to the second)."),

@@ -1,5 +1,5 @@
 -- Undo only after the gateway, scheduler, ingestor and worker are back on
--- 0.4.58: a newer gateway writes these rows on every run it is asked for, and
+-- 0.4.62: a newer gateway writes these rows on every run it is asked for, and
 -- a newer ingestor settles them.
 --
 -- Back to runs without a handle. The results the handles named stay in

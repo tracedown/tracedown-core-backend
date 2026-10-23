@@ -1,5 +1,5 @@
 -- Undo only after the gateway, scheduler, ingestor and worker are back on
--- 0.4.58: a newer ingestor writes this column on every result, and a newer
+-- 0.4.62: a newer ingestor writes this column on every result, and a newer
 -- gateway reads it on every results list.
 --
 -- Runs are no longer told apart by what started them, nor tied to the run that
