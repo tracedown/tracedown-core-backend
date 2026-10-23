@@ -460,4 +460,64 @@ class NotificationBuilderTest {
         // No calls array, so ms falls back to elapsedMs
         assertTrue(result.first().text.contains("3000ms"))
     }
+
+    @Test
+    fun `connection error renders the error message from a structured notification`() {
+        val rawResult = buildJsonObject {
+            put("outcome", "failure")
+            put("elapsedMs", 434)
+            putJsonArray("calls") {
+                addJsonObject {
+                    put("error", "[Errno 104] Connection reset by peer")
+                    putJsonObject("request") { put("url", "https://api.example.com/v1") }
+                    put("response", JsonNull)
+                }
+            }
+            putJsonObject("actions") {
+                putJsonArray("notifications") {
+                    addJsonObject {
+                        put("callIndex", 0)
+                        put("trigger", "error")
+                        put("conditionIndex", -1)
+                        putJsonObject("notification") {
+                            put("tag", "structured")
+                            putJsonObject("data") { put("error", "[Errno 104] Connection reset by peer") }
+                        }
+                    }
+                }
+            }
+        }
+
+        val result = NotificationBuilder.buildNotifications(rawResult, staticVars, orgId, projectId)
+        assertEquals(
+            "API Health in Production.Core call to https://api.example.com/v1 failed: [Errno 104] Connection reset by peer",
+            result.single().text,
+        )
+    }
+
+    @Test
+    fun `connection error without a message in its payload falls back to the call's error`() {
+        val rawResult = buildJsonObject {
+            put("outcome", "failure")
+            put("elapsedMs", 20)
+            putJsonArray("calls") {
+                addJsonObject {
+                    put("error", "Name or service not known")
+                    putJsonObject("request") { put("url", "https://api.example.com/v1") }
+                }
+            }
+            putJsonObject("actions") {
+                putJsonArray("notifications") {
+                    addJsonObject {
+                        put("callIndex", 0)
+                        put("trigger", "error")
+                        putJsonObject("notification") { put("tag", "structured") }
+                    }
+                }
+            }
+        }
+
+        val result = NotificationBuilder.buildNotifications(rawResult, staticVars, orgId, projectId)
+        assertTrue(result.single().text.endsWith("failed: Name or service not known"))
+    }
 }
