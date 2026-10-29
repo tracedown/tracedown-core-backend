@@ -1,5 +1,9 @@
 # Tracedown
 
+**Full Documentation: [Wiki](https://tracedown.dev)**
+
+**Quickstart: [Installer](https://tracedown.dev/install/installer/)**
+
 **Self-hosted API monitoring.** Tracedown runs automated checks against your
 HTTP APIs on a schedule, records what happened in full detail, and tells your
 team when something breaks or slows down.
@@ -7,12 +11,23 @@ team when something breaks or slows down.
 A check can be as simple as *"is this endpoint returning 200?"* or as involved as
 *"log in, fetch the order, verify the total changed, and warn me if the TLS
 handshake got slower"*. Probes are written in [Lace](https://lacelang.dev), a
-language built for exactly this — not YAML with an `if` bolted on, and not a
-general-purpose runtime you have to sandbox.
+purpose-built probe language aimed to provide maximum flexibility with user-defined checks.
 
-You run it on your own infrastructure, and it does not phone home.
+## Disclosure
 
-📖 **Documentation: [tracedown.dev](https://tracedown.dev)**
+The project runs a commercial hosted version at [tracedown.io](https://tracedown.io)
+(referred to as Tracedown Cloud, or just Cloud). Ongoing development is partially
+driven by features and issues identified while maintaining that version.
+
+The Core distribution is feature-complete: every feature exists in Core, and Cloud
+only layers minor QoL additions on top of it via injection seams. Core development
+will never be compromised in any way in favor of Cloud version.
+
+The backend and frontend injection seams, while designed with Cloud version in mind, 
+aim to be useful for anyone modifying their installations.
+
+AI assistance was used in the project's initial phases under strict human supervision.
+Moving forward, we intend to rely more on traditional manual development.
 
 ## What a probe looks like
 
