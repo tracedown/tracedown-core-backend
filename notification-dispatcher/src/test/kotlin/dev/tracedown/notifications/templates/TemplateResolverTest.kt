@@ -29,8 +29,7 @@ class TemplateResolverTest {
     fun `returns assert template for assert trigger`() {
         val template = TemplateResolver.defaultTemplate("assert")
         assertTrue(template.contains("assertion failed"))
-        assertTrue(template.contains("\${expected}"))
-        assertTrue(template.contains("\${actual}"))
+        assertTrue(template.contains("\${conditions}"))
         assertFalse(template.contains("\${scope}"))
     }
 

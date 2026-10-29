@@ -22,7 +22,10 @@ object TemplateResolver {
     // "[status: expected 200, got 500; totalDelayMs: expected 2, got 165]"
     // (baseline spikes render "average N" instead of "expected N").
     private val DEFAULT_STRUCTURED = "\${s.name} in \${w.name}.\${p.name} call to \${url} has \"\${trigger}\": \${conditions}"
-    private val DEFAULT_ASSERT = "\${s.name} in \${w.name}.\${p.name} call to \${url} assertion failed: expected \${expected}, got \${actual}"
+    // An .assert() condition carries no expectation, only its expression and
+    // the two operands it resolved, so ${conditions} reads
+    // "[this.body.page eq 1 (left: null, right: 1)]".
+    private val DEFAULT_ASSERT = "\${s.name} in \${w.name}.\${p.name} call to \${url} assertion failed: \${conditions}"
     private val DEFAULT_TIMEOUT = "\${s.name} call to \${url} timed out after \${ms}ms"
     private val DEFAULT_RECOVERED = "\${s.name} in \${w.name}.\${p.name} recovered after \${downtime} of downtime"
     private val DEFAULT_ERROR = "\${s.name} in \${w.name}.\${p.name} call to \${url} failed: \${text}"

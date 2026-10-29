@@ -109,9 +109,12 @@ object TemplateRenderer {
         return sb.toString()
     }
 
+    // A newline becomes <br>: HTML collapses it to a space, which ran the
+    // coalesced messages of one run together on a single line.
     private fun escapeHtml(text: String): String = text
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace("\"", "&quot;")
+        .replace("\n", "<br>\n")
 }
