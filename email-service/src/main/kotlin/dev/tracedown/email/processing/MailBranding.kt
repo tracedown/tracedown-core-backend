@@ -45,7 +45,7 @@ data class MailBranding(
     }
 
     /** The two placeholders, as the processor substitutes them. */
-    fun placeholders(footerFontSizePx: Int): Map<String, String> = mapOf(
+    fun placeholders(footerFontSizePx: Int = 8): Map<String, String> = mapOf(
         HEADER_KEY to headerRow(),
         FOOTER_KEY to footerRow(footerFontSizePx),
     )
