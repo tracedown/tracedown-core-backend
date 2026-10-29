@@ -38,16 +38,16 @@ data class MailBranding(
     }
 
     /** A full `<tr>` for the bottom of the mail card, or empty when there is no small print. */
-    fun footerRow(): String {
+    fun footerRow(fontSizePx: Int): String {
         val html = footerHtml?.trim().orEmpty()
         if (html.isEmpty()) return ""
-        return """<tr><td style="padding:20px 40px 28px;border-top:1px solid $RULE;"><p style="margin:0;font-size:12px;line-height:1.7;color:$TEXT_DIM;">$html</p></td></tr>"""
+        return """<tr><td style="padding:20px 40px 28px;border-top:1px solid $RULE;"><p style="margin:0;font-size:${fontSizePx}px;line-height:1.7;color:$TEXT_DIM;">$html</p></td></tr>"""
     }
 
     /** The two placeholders, as the processor substitutes them. */
-    fun placeholders(): Map<String, String> = mapOf(
+    fun placeholders(footerFontSizePx: Int): Map<String, String> = mapOf(
         HEADER_KEY to headerRow(),
-        FOOTER_KEY to footerRow(),
+        FOOTER_KEY to footerRow(footerFontSizePx),
     )
 
     companion object {

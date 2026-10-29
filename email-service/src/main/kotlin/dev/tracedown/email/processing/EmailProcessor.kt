@@ -116,7 +116,7 @@ open class EmailProcessor(
             // Branding first, then the sender's variables: the brand rows are our
             // own markup, the variables are escaped text, and doing it in this
             // order means a variable value can never be read as a brand key.
-            htmlBody = renderTemplate(applyBranding(templateHtml), vars)
+            htmlBody = renderTemplate(applyBranding(templateHtml, footerFontSizePx = 8), vars)
         } else {
             // Body mode: wrap pre-baked content in layout
             val body = envelope["body"]?.jsonPrimitive?.content
@@ -154,8 +154,8 @@ open class EmailProcessor(
      * layout. Both placeholders are always resolved — the footer to an empty
      * string when there is no small print — so a rendered mail never shows one.
      */
-    private fun applyBranding(html: String): String =
-        branding.placeholders().entries.fold(html) { acc, (key, value) -> acc.replace("{{$key}}", value) }
+    private fun applyBranding(html: String, footerFontSizePx: Int = 8): String =
+        branding.placeholders(footerFontSizePx).entries.fold(html) { acc, (key, value) -> acc.replace("{{$key}}", value) }
 
     /**
      * Wraps a pre-baked body in the shared layout.
@@ -167,7 +167,7 @@ open class EmailProcessor(
      * an empty bordered strip.
      */
     private fun applyLayout(body: String, footer: String?): String {
-        val withContent = applyBranding(layoutHtml).replace("{{content}}", body)
+        val withContent = applyBranding(layoutHtml, footerFontSizePx = 8).replace("{{content}}", body)
         return if (footer.isNullOrBlank()) {
             withContent.replace(FOOTER_BLOCK, "")
         } else {
