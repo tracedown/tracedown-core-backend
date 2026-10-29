@@ -72,4 +72,10 @@ class TemplateRendererTest {
         val result = TemplateRenderer.renderHtml("a < b", emptyMap())
         assertTrue(result.contains("&lt;"))
     }
+
+    @Test
+    fun `renderHtml keeps line breaks between messages`() {
+        val result = TemplateRenderer.renderHtml("first message\nsecond message", emptyMap())
+        assertEquals("first message<br>\nsecond message", result)
+    }
 }

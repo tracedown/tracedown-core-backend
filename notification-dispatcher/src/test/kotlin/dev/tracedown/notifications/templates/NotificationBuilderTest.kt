@@ -310,8 +310,10 @@ class NotificationBuilderTest {
                         putJsonObject("notification") {
                             put("tag", "structured")
                             putJsonObject("data") {
-                                put("expected", "true")
-                                put("actual", "false")
+                                put("kind", "expect")
+                                put("expression", "this.body.ok eq true")
+                                put("actualLhs", false)
+                                put("actualRhs", true)
                             }
                         }
                     }
@@ -329,10 +331,73 @@ class NotificationBuilderTest {
         val second = result.find { it.callIndex == 1 }!!
         assertEquals("assert", second.trigger)
         assertTrue(second.text.contains("https://api.example.com/second"))
-        // Assert template: ${s.name} in ${w.name}.${p.name} call to ${url} assertion failed: expected ${expected}, got ${actual}
+        // Assert template: ${s.name} in ${w.name}.${p.name} call to ${url} assertion failed: ${conditions}
         assertEquals(
-            "API Health in Production.Core call to https://api.example.com/second assertion failed: expected true, got false",
+            "API Health in Production.Core call to https://api.example.com/second assertion failed: " +
+                "[this.body.ok eq true (left: false, right: true)]",
             second.text,
+        )
+    }
+
+    @Test
+    fun `failed assert conditions name their expression and operands`() {
+        // A 520 from a proxy: the status expect fails, and every assert on the
+        // body resolves its left operand to null.
+        fun assertEvent(index: Int, expression: String) = buildJsonObject {
+            put("callIndex", 0)
+            put("trigger", "assert")
+            put("conditionIndex", index)
+            putJsonObject("notification") {
+                put("tag", "structured")
+                putJsonObject("data") {
+                    put("kind", "expect")
+                    put("expression", expression)
+                    put("actualLhs", JsonNull)
+                    put("actualRhs", 1)
+                }
+            }
+        }
+        val rawResult = buildJsonObject {
+            put("outcome", "failure")
+            put("elapsedMs", 900)
+            putJsonArray("calls") {
+                addJsonObject {
+                    putJsonObject("request") { put("url", "https://api.example.com/workspaces?page=1") }
+                    putJsonObject("response") { put("status", 520); put("responseTimeMs", 850) }
+                }
+            }
+            putJsonObject("actions") {
+                putJsonArray("notifications") {
+                    addJsonObject {
+                        put("callIndex", 0)
+                        put("trigger", "expect")
+                        put("scope", "status")
+                        putJsonObject("notification") {
+                            put("tag", "structured")
+                            putJsonObject("data") {
+                                put("op", "eq")
+                                put("scope", "status")
+                                put("actual", 520)
+                                put("expected", 200)
+                            }
+                        }
+                    }
+                    add(assertEvent(0, "this.body.page eq 1"))
+                    add(assertEvent(1, "this.body.pageSize eq 1"))
+                }
+            }
+        }
+
+        val result = NotificationBuilder.buildNotifications(rawResult, staticVars, orgId, projectId)
+
+        assertEquals(
+            listOf(
+                "API Health in Production.Core call to https://api.example.com/workspaces?page=1 has \"expect\": " +
+                    "[status: expected 200, got 520]",
+                "API Health in Production.Core call to https://api.example.com/workspaces?page=1 assertion failed: " +
+                    "[this.body.page eq 1 (left: null, right: 1); this.body.pageSize eq 1 (left: null, right: 1)]",
+            ),
+            result.map { it.text },
         )
     }
 

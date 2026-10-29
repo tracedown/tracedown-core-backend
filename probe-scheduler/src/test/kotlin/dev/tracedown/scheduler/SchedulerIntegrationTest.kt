@@ -69,7 +69,7 @@ class SchedulerIntegrationTest {
         /**
          * Probe agent container. Uses the pre-built ``test-agent`` image.
          * Build it before running tests:
-         *   cd tracedown && docker build -f core/backend/probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent .
+         *   cd tracedown-core-backend && docker build -f probe-scheduler/src/test/resources/Dockerfile.agent -t test-agent .
          */
         @Container
         @JvmStatic
